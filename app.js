@@ -1,0 +1,5116 @@
+/* NetMap3D — 3D network map designer prototype
+   Units: inches. Rack U = 1.75", 19" rail width, 42U racks. */
+'use strict';
+
+//////////////////// Constants & catalog ////////////////////
+
+const U = 1.75;
+const RACK_UNITS = 42;
+const RACK_W = 19;          // rail-to-rail
+const RACK_OUTER_W = 23;
+const RACK_D = 30;
+const RACK_BASE = 2;        // floor to bottom of U1
+const RACK_H = RACK_BASE + RACK_UNITS * U + 1;
+
+const DEVICE_TYPES = {
+  switch48: { label: '48-Port Switch',      uh: 1, ports: 48, rows: 2, depth: 14, color: 0x2f3b4d,
+    portLayout: [{ type: 'rj', cols: 24, rows: 2 }] },
+  switch24: { label: '24-Port Switch',      uh: 1, ports: 24, rows: 1, depth: 12, color: 0x33445a,
+    portLayout: [{ type: 'rj', cols: 24, rows: 1 }] },
+  patch24:  { label: '24-Port Patch Panel', uh: 1, ports: 24, rows: 1, depth: 4,  color: 0x1c1f26, passthrough: true,
+    portLayout: [{ type: 'rj', cols: 6 }, { type: 'rj', cols: 6, gapBefore: 0.3 }, { type: 'rj', cols: 6, gapBefore: 0.3 }, { type: 'rj', cols: 6, gapBefore: 0.3 }] },
+  router:   { label: 'Router',              uh: 1, ports: 8,  rows: 1, depth: 12, color: 0x3d3550, wan: 1,
+    portLayout: [{ type: 'rj', cols: 1 }, { type: 'rj', cols: 7, gapBefore: 0.45 }] },
+  firewall: { label: 'Firewall',            uh: 1, ports: 6,  rows: 1, depth: 12, color: 0x50333a, wan: 1,
+    portLayout: [{ type: 'rj', cols: 1 }, { type: 'rj', cols: 5, gapBefore: 0.45 }] },
+  server:   { label: 'Server',              uh: 2, ports: 4,  rows: 1, depth: 26, color: 0x3a4148,
+    portLayout: [{ type: 'rj', cols: 4, rows: 1 }] },
+  ups:      { label: 'UPS',                 uh: 2, ports: 0,  rows: 0, depth: 24, color: 0x22262c, powerDevice: true, outlets: 8 },
+  hcm:      { label: 'Horiz. Cable Manager',uh: 1, ports: 0,  rows: 0, depth: 5,  color: 0x15181d, manager: true },
+  vcm:      { label: 'Vert. Cable Manager', uh: 0, ports: 0,  rows: 0, depth: 5,  color: 0x15181d, manager: true, vertical: true },
+  ap:       { label: 'Access Point',        uh: 0, ports: 1,  rows: 1, depth: 0,  color: 0xe8ebef, field: true, mountH: 96, mounts: ['ceiling', 'wall'], shape: 'disc' },
+  camera:   { label: 'IP Camera',           uh: 0, ports: 1,  rows: 1, depth: 0,  color: 0xdfe3e8, field: true, mountH: 96, mounts: ['ceiling', 'wall'], shape: 'bullet' },
+  person:   { label: 'Reference Person (5\'10")', short: 'Person', uh: 0, ports: 0, rows: 0, depth: 0, color: 0x3a4148, field: true, mounts: ['desk'], shape: 'person' }
+};
+for (const k of Object.keys(DEVICE_TYPES)) DEVICE_TYPES[k].cat = 'Generic';
+
+// UniFi product catalog. Representative current lineup; mounts reflect how each
+// product is actually installed (wall-only intercoms, ceiling APs, rack gear...).
+const UI_SILVER = 0xd9dce1;
+const F = (label, short, mounts, shape, ports = 1, extra = {}) =>
+  ({ label, short, uh: 0, ports, rows: 1, depth: 0, color: 0xe8ebef, field: true, mountH: 96, mounts, shape, ...extra });
+const R = (label, short, ports, rows = 1, uh = 1, depth = 14, extra = {}) =>
+  ({ label, short, uh, ports, rows, depth, color: UI_SILVER, ...extra });
+const UNIFI_CATALOG = {
+  // Gateways
+  // UDM family, true front panel: 2×4 RJ45 LAN block · RJ45 WAN · stacked SFP+ pair · touchscreen right
+  u_udmpromax: { ...R('UDM Pro Max', 'UDMPM', 11, 2, 1, 17, {
+    sfp: 2, roleMap: { 9: 'WAN', 10: 'WAN' }, faceInsetL: 3, faceInsetR: 3.4, display: { side: 'R', w: 2.1, h: 1.1 },
+    portLayout: [{ type: 'rj', cols: 4, rows: 2 }, { type: 'rj', cols: 1, rows: 1, gapBefore: 0.5 }, { type: 'sfp', cols: 1, rows: 2, gapBefore: 0.5 }]
+  }), cat: 'UniFi Gateways' },
+  u_udmse:     { ...R('UDM SE', 'UDMSE', 11, 2, 1, 17, {
+    sfp: 2, roleMap: { 9: 'WAN', 10: 'WAN' }, faceInsetL: 3, faceInsetR: 3.4, display: { side: 'R', w: 2.1, h: 1.1 },
+    portLayout: [{ type: 'rj', cols: 4, rows: 2 }, { type: 'rj', cols: 1, rows: 1, gapBefore: 0.5 }, { type: 'sfp', cols: 1, rows: 2, gapBefore: 0.5 }]
+  }), cat: 'UniFi Gateways' },
+  // UXG Pro: RJ45 LAN · RJ45 WAN · SFP+ LAN · SFP+ WAN in one row, no display
+  u_uxgpro:    { ...R('UXG Pro', 'UXG', 4, 1, 1, 12, {
+    sfp: 2, roleMap: { 2: 'WAN', 4: 'WAN' },
+    portLayout: [{ type: 'rj', cols: 1 }, { type: 'rj', cols: 1, gapBefore: 0.4 }, { type: 'sfp', cols: 2, gapBefore: 0.5 }]
+  }), cat: 'UniFi Gateways' },
+  u_dr7:       { ...F('Dream Router 7', 'DR7', ['desk'], 'tower', 5, { wan: 1 }), cat: 'UniFi Gateways' },
+  u_ucgultra:  { ...F('Cloud Gateway Ultra', 'UCG', ['desk'], 'deskbox', 5, { wan: 1 }), cat: 'UniFi Gateways' },
+  u_ucgmax:    { ...F('Cloud Gateway Max', 'UCGMax', ['desk'], 'deskbox', 5, { wan: 1 }), cat: 'UniFi Gateways' },
+  u_ucgfiber:  { ...F('Cloud Gateway Fiber', 'UCGF', ['desk'], 'deskbox', 6, { sfp: 2, roleMap: { 6: 'WAN' } }), cat: 'UniFi Gateways' },
+  u_express7:  { ...F('Express 7', 'EX7', ['desk', 'wall'], 'deskbox', 2, { wan: 1 }), cat: 'UniFi Gateways' },
+  u_cgindustrial: { ...F('Cloud Gateway Industrial', 'CGI', ['wall'], 'box', 9, { wan: 1 }), cat: 'UniFi Gateways' },
+  // Switches
+  // UniFi switches: one continuous RJ45 block (no Cisco-style gaps) + stacked SFP+ at right
+  u_promax48:  { ...R('Pro Max 48 PoE', 'PM48', 52, 2, 1, 16, { sfp: 4, faceInsetL: 2.6, display: { side: 'L', w: 1.6, h: 1.2 },
+    portLayout: [{ type: 'rj', cols: 24, rows: 2 }, { type: 'sfp', cols: 2, rows: 2, gapBefore: 0.6 }] }), cat: 'UniFi Switches' },
+  u_promax24:  { ...R('Pro Max 24 PoE', 'PM24', 26, 2, 1, 16, { sfp: 2, faceInsetL: 2.6, display: { side: 'L', w: 1.6, h: 1.2 },
+    portLayout: [{ type: 'rj', cols: 12, rows: 2 }, { type: 'sfp', cols: 1, rows: 2, gapBefore: 0.6 }] }), cat: 'UniFi Switches' },
+  u_pro48:     { ...R('Pro 48 PoE', 'Pro48', 52, 2, 1, 16, { sfp: 4, faceInsetL: 2.2, display: { side: 'L', w: 1.4, h: 1.0 },
+    portLayout: [{ type: 'rj', cols: 24, rows: 2 }, { type: 'sfp', cols: 2, rows: 2, gapBefore: 0.6 }] }), cat: 'UniFi Switches' },
+  u_pro24:     { ...R('Pro 24 PoE', 'Pro24', 26, 2, 1, 16, { sfp: 2, faceInsetL: 2.2, display: { side: 'L', w: 1.4, h: 1.0 },
+    portLayout: [{ type: 'rj', cols: 12, rows: 2 }, { type: 'sfp', cols: 1, rows: 2, gapBefore: 0.6 }] }), cat: 'UniFi Switches' },
+  u_agg:       { ...R('Aggregation (8 SFP+)', 'Agg', 8, 1, 1, 10, { sfp: 8,
+    portLayout: [{ type: 'sfp', cols: 8, rows: 1 }] }), cat: 'UniFi Switches' },
+  u_proagg:    { ...R('Pro Aggregation', 'ProAgg', 32, 2, 1, 14, { sfp: 32, faceInsetL: 2.2, display: { side: 'L', w: 1.4, h: 1.0 },
+    portLayout: [{ type: 'sfp', cols: 14, rows: 2 }, { type: 'sfp', cols: 2, rows: 2, gapBefore: 0.6 }] }), cat: 'UniFi Switches' },
+  u_ultra8:    { ...F('Switch Ultra (8 PoE)', 'Ultra8', ['desk', 'wall'], 'deskbox', 8), cat: 'UniFi Switches' },
+  u_flex25g8:  { ...F('Flex 2.5G 8 PoE', 'Flex8', ['desk', 'wall'], 'deskbox', 9, { sfp: 1 }), cat: 'UniFi Switches' },
+  u_flexmini:  { ...F('Flex Mini 2.5G', 'FlexM', ['desk', 'wall'], 'deskbox', 5), cat: 'UniFi Switches' },
+  // Access points
+  u_u7pro:     { ...F('U7 Pro', 'U7Pro', ['ceiling', 'wall'], 'disc'), cat: 'UniFi APs' },
+  u_u7promax:  { ...F('U7 Pro Max', 'U7PMax', ['ceiling', 'wall'], 'disc'), cat: 'UniFi APs' },
+  u_u7proxgs:  { ...F('U7 Pro XGS', 'U7XGS', ['ceiling', 'wall'], 'disc'), cat: 'UniFi APs' },
+  u_e7:        { ...F('E7 (Enterprise WiFi 7)', 'E7', ['ceiling', 'wall'], 'disc'), cat: 'UniFi APs' },
+  u_u6pro:     { ...F('U6 Pro', 'U6Pro', ['ceiling', 'wall'], 'disc'), cat: 'UniFi APs' },
+  u_u7prowall: { ...F('U7 Pro Wall', 'U7Wall', ['wall'], 'wallap'), cat: 'UniFi APs' },
+  u_u6iw:      { ...F('U6 In-Wall', 'U6IW', ['wall'], 'wallap', 5), cat: 'UniFi APs' },
+  u_u6mesh:    { ...F('U6 Mesh', 'U6Mesh', ['desk', 'wall', 'ceiling'], 'tower'), cat: 'UniFi APs' },
+  u_u7outdoor: { ...F('U7 Outdoor', 'U7Out', ['wall'], 'box'), cat: 'UniFi APs' },
+  // Protect cameras
+  u_g6bullet:  { ...F('G6 Bullet', 'G6Blt', ['wall', 'ceiling'], 'bullet'), cat: 'UniFi Cameras' },
+  u_g6turret:  { ...F('G6 Turret', 'G6Trt', ['wall', 'ceiling'], 'turret'), cat: 'UniFi Cameras' },
+  u_g6dome:    { ...F('G6 Dome', 'G6Dom', ['ceiling', 'wall'], 'dome'), cat: 'UniFi Cameras' },
+  u_g6ptz:     { ...F('G6 PTZ', 'G6PTZ', ['wall', 'ceiling'], 'ptz'), cat: 'UniFi Cameras' },
+  u_aipro:     { ...F('AI Pro', 'AIPro', ['wall', 'ceiling'], 'bullet'), cat: 'UniFi Cameras' },
+  u_ai360:     { ...F('AI 360', 'AI360', ['ceiling'], 'dome'), cat: 'UniFi Cameras' },
+  u_g5flex:    { ...F('G5 Flex', 'G5Flx', ['wall', 'desk'], 'turret'), cat: 'UniFi Cameras' },
+  u_g6instant: { ...F('G6 Instant', 'G6Ins', ['desk', 'wall'], 'box'), cat: 'UniFi Cameras' },
+  // Door access (wall-mounted, as installed in real life)
+  u_g6entry:    { ...F('G6 Entry (Doorbell)', 'G6Ent', ['wall'], 'doorbell'), cat: 'UniFi Door Access' },
+  u_g6proentry: { ...F('G6 Pro Entry', 'G6PEnt', ['wall'], 'doorbellpro'), cat: 'UniFi Door Access' },
+  u_g4doorbell: { ...F('G4 Doorbell Pro', 'G4DB', ['wall'], 'doorbell'), cat: 'UniFi Door Access' },
+  u_readerg3:   { ...F('Access Reader G3 Pro', 'RdrG3', ['wall'], 'reader'), cat: 'UniFi Door Access' },
+  u_intercomview: { ...F('Intercom Viewer', 'IView', ['wall'], 'panel'), cat: 'UniFi Door Access' },
+  u_accesshub:  { ...F('Access Hub', 'AHub', ['wall'], 'box', 4), cat: 'UniFi Door Access' },
+  // Storage & power
+  u_unvr:     { ...R('UNVR', 'UNVR', 2, 1, 1, 20, { sfp: 1, bays: 4, faceInsetL: 12 }), cat: 'UniFi Storage & Power' },
+  u_unvrpro:  { ...R('UNVR Pro', 'UNVRP', 2, 1, 2, 20, { sfp: 1, bays: 7, faceInsetL: 12 }), cat: 'UniFi Storage & Power' },
+  u_unaspro:  { ...R('UNAS Pro', 'UNAS', 2, 1, 2, 20, { sfp: 1, bays: 7, faceInsetL: 12, display: { side: 'L', w: 1.6, h: 1.0 } }), cat: 'UniFi Storage & Power' },
+  u_pdupro:   { ...R('USP PDU Pro', 'PDU', 0, 0, 1, 10, { faceInsetR: 3, display: { side: 'R', w: 1.6, h: 0.9 }, powerDevice: true, outlets: 8 }), cat: 'UniFi Storage & Power' },
+  u_unas2:    { ...F('UNAS 2', 'UNAS2', ['desk'], 'box', 1), cat: 'UniFi Storage & Power' }
+};
+Object.assign(DEVICE_TYPES, UNIFI_CATALOG);
+
+// Office & furniture — computers connect to the network like any other device
+const OFFICE_CATALOG = {
+  o_ws:      { ...F('Workstation (desk + PC)', 'WS', ['desk'], 'workstation', 1), cat: 'Office & Furniture' },
+  o_desk:    { ...F('Office Desk (60")', 'Desk', ['desk'], 'table', 0), cat: 'Office & Furniture' },
+  o_chair:   { ...F('Office Chair', 'Chair', ['desk'], 'chair', 0), cat: 'Office & Furniture' },
+  o_pc:      { ...F('PC Tower', 'PC', ['desk'], 'pctower', 2), cat: 'Office & Furniture' },
+  o_printer: { ...F('Office Printer', 'Printer', ['desk'], 'printer', 1), cat: 'Office & Furniture' },
+  o_tv:      { ...F('Wall TV 55"', 'TV', ['wall'], 'tv', 1), cat: 'Office & Furniture' }
+};
+Object.assign(DEVICE_TYPES, OFFICE_CATALOG);
+const FLOOR_SHAPES = new Set(['person', 'table', 'workstation', 'chair', 'pctower', 'printer']);
+
+// Starter multi-brand pack — the assistant can add anything else on demand
+const BRAND_PACK = {
+  b_c9200:   { ...R('Cisco Catalyst 9200L-24P', 'C9200', 26, 2, 1, 16, { sfp: 2,
+    portLayout: [{ type: 'rj', cols: 6, rows: 2 }, { type: 'rj', cols: 6, rows: 2, gapBefore: 0.3 }, { type: 'sfp', cols: 1, rows: 2, gapBefore: 0.5 }] }), cat: 'Cisco & Meraki' },
+  b_c9300:   { ...R('Cisco Catalyst 9300-48P', 'C9300', 52, 2, 1, 17, { sfp: 4,
+    portLayout: [{ type: 'rj', cols: 6, rows: 2 }, { type: 'rj', cols: 6, rows: 2, gapBefore: 0.3 }, { type: 'rj', cols: 6, rows: 2, gapBefore: 0.3 }, { type: 'rj', cols: 6, rows: 2, gapBefore: 0.3 }, { type: 'sfp', cols: 2, rows: 2, gapBefore: 0.5 }] }), cat: 'Cisco & Meraki' },
+  b_mx85:    { ...R('Meraki MX85', 'MX85', 10, 1, 1, 14, { wan: 2,
+    portLayout: [{ type: 'rj', cols: 2 }, { type: 'rj', cols: 8, gapBefore: 0.5 }] }), cat: 'Cisco & Meraki' },
+  b_mr46:    { ...F('Meraki MR46', 'MR46', ['ceiling', 'wall'], 'disc'), cat: 'Cisco & Meraki' },
+  b_a6300:   { ...R('Aruba 6300M 48G PoE', 'A6300', 52, 2, 1, 17, { sfp: 4,
+    portLayout: [{ type: 'rj', cols: 12, rows: 2 }, { type: 'rj', cols: 12, rows: 2, gapBefore: 0.35 }, { type: 'sfp', cols: 2, rows: 2, gapBefore: 0.5 }] }), cat: 'Aruba / HPE' },
+  b_a1930:   { ...R('Aruba Instant On 1930 24G', 'A1930', 28, 2, 1, 12, { sfp: 4,
+    portLayout: [{ type: 'rj', cols: 12, rows: 2 }, { type: 'sfp', cols: 2, rows: 2, gapBefore: 0.5 }] }), cat: 'Aruba / HPE' },
+  b_ap655:   { ...F('Aruba AP-655', 'AP655', ['ceiling', 'wall'], 'disc'), cat: 'Aruba / HPE' },
+  b_gs728:   { ...R('Netgear GS728TPP', 'GS728', 28, 2, 1, 12, { sfp: 4,
+    portLayout: [{ type: 'rj', cols: 12, rows: 2 }, { type: 'sfp', cols: 2, rows: 2, gapBefore: 0.5 }] }), cat: 'Netgear' },
+  b_wax630:  { ...F('Netgear WAX630', 'WAX630', ['ceiling', 'wall'], 'disc'), cat: 'Netgear' },
+  b_er8411:  { ...R('Omada ER8411 Router', 'ER8411', 10, 1, 1, 14, { wan: 2, sfp: 2,
+    portLayout: [{ type: 'sfp', cols: 1 }, { type: 'rj', cols: 1, gapBefore: 0.25 }, { type: 'rj', cols: 6, gapBefore: 0.5 }, { type: 'sfp', cols: 2, gapBefore: 0.5 }] }), cat: 'TP-Link Omada' },
+  b_sg3452:  { ...R('Omada SG3452P', 'SG3452', 52, 2, 1, 17, { sfp: 4,
+    portLayout: [{ type: 'rj', cols: 24, rows: 2 }, { type: 'sfp', cols: 2, rows: 2, gapBefore: 0.6 }] }), cat: 'TP-Link Omada' },
+  b_eap670:  { ...F('Omada EAP670', 'EAP670', ['ceiling', 'wall'], 'disc'), cat: 'TP-Link Omada' },
+  b_ccr2004: { ...R('MikroTik CCR2004-16G-2S+', 'CCR2004', 18, 2, 1, 12, { wan: 1, sfp: 2,
+    portLayout: [{ type: 'rj', cols: 8, rows: 2 }, { type: 'sfp', cols: 2, rows: 1, gapBefore: 0.5 }] }), cat: 'MikroTik' },
+  b_crs326:  { ...R('MikroTik CRS326-24G-2S+', 'CRS326', 26, 2, 1, 11, { sfp: 2,
+    portLayout: [{ type: 'rj', cols: 12, rows: 2 }, { type: 'sfp', cols: 2, rows: 1, gapBefore: 0.5 }] }), cat: 'MikroTik' }
+};
+Object.assign(DEVICE_TYPES, BRAND_PACK);
+
+const CABLE_COLOR_NAMES = {
+  '#3b82f6': 'Blue', '#ef4444': 'Red', '#22c55e': 'Green', '#eab308': 'Yellow',
+  '#f97316': 'Orange', '#a855f7': 'Purple', '#e5e7eb': 'White', '#111827': 'Black'
+};
+
+//////////////////// State ////////////////////
+
+let state = { racks: [], devices: [], cables: [], walls: [], holes: [], links: [], ties: [], measures: [], slabs: [], customTypes: {} };
+
+// Everything is real-scale: 1 unit = 1 inch. Floor grid squares are 1 ft.
+function fmtLen(inches) {
+  const ft = Math.floor(inches / 12), rem = Math.round(inches % 12);
+  return rem === 0 ? `${ft}'` : `${ft}' ${rem}"`;
+}
+const WALL_H = 114, WALL_T = 4;  // 9'6" walls — tops meet the next level's slab (120" spacing, 6" slab)
+const LEVEL_H = 120;
+
+// Undo (Ctrl/Cmd+Z) — snapshot before every mutating action
+const undoStack = [];
+function undoPush(snap) {
+  undoStack.push(snap || serialize());
+  if (undoStack.length > 60) undoStack.shift();
+}
+let nextId = 1;
+const uid = () => nextId++;
+
+let mode = 'select';            // select | cable | delete | rack | place
+let pendingType = null;         // device type while placing
+let cableDraft = null;          // {a:{deviceId,port}, waypoints:[{x,y,z}]}
+let selected = null;            // {kind:'device'|'cable'|'rack', id}
+
+// three.js object registries
+const rackGroups = new Map();    // rackId -> Group
+const deviceGroups = new Map();  // deviceId -> Group
+const cableMeshes = new Map();   // cableId -> Mesh
+const portMeshes = [];           // flat list of port hitboxes
+const portLeds = [];             // per-port link LEDs (light in cable color)
+const rackPlanes = [];           // invisible placement planes
+const rackFrames = [];           // clickable rack frame meshes
+const managerMeshes = [];        // cable-manager meshes (waypoint targets)
+const wallMeshes = new Map();    // wallId -> Mesh
+const holeGroups = new Map();    // holeId -> Group
+const holeMeshes = [];           // raycast targets for drill holes
+const tieGroups = new Map();     // tieId -> Group
+const tieMeshes = [];            // raycast targets for ties
+const slabMeshes = new Map();    // slabId -> Mesh (upper-floor slabs)
+const measureGroups = new Map(); // measureId -> Group
+const measureHits = [];          // raycast targets for measurements
+let measureStart = null;
+let slabStart = null;
+let roomStart = null;
+
+//////////////////// Scene setup ////////////////////
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x14181f);
+scene.fog = new THREE.Fog(0x14181f, 400, 900);
+
+const camera = new THREE.PerspectiveCamera(50, innerWidth / innerHeight, 0.5, 2000);
+camera.position.set(85, 70, 115);
+
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setSize(innerWidth, innerHeight);
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.outputEncoding = THREE.sRGBEncoding;
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.12;
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+document.body.appendChild(renderer.domElement);
+
+// Image-based lighting: gives metals/plastics realistic reflections
+const pmrem = new THREE.PMREMGenerator(renderer);
+scene.environment = pmrem.fromScene(new THREE.RoomEnvironment(), 0.04).texture;
+
+// Post-processing: ambient occlusion + LED bloom + FXAA.
+// Fully guarded — any failure falls straight back to plain rendering.
+//
+// The composer MUST own a multisampled target. Left to its default it allocates
+// a plain render target, which silently bypasses the `antialias: true` on the
+// canvas — every pass after RenderPass then works on jagged input. That is what
+// made a 4" baseboard shimmer into a row of teeth at range and turned the cat6
+// runs into dotted hairlines: the geometry was right, the sampling wasn't.
+// HalfFloat keeps tone mapping and bloom from banding on the smooth wall areas.
+let composer = null, fxaaPass = null;
+try {
+  const dbs = renderer.getDrawingBufferSize(new THREE.Vector2());
+  const rt = new THREE.WebGLRenderTarget(dbs.x, dbs.y, {
+    type: THREE.HalfFloatType,
+    samples: renderer.capabilities.isWebGL2 ? 4 : 0
+  });
+  composer = new THREE.EffectComposer(renderer, rt);
+  composer.addPass(new THREE.RenderPass(scene, camera));
+  const sao = new THREE.SAOPass(scene, camera, false, true);
+  sao.params.saoIntensity = 0.012;
+  sao.params.saoScale = 120;
+  sao.params.saoKernelRadius = 40;
+  sao.params.saoBlur = true;
+  composer.addPass(sao);
+  const bloom = new THREE.UnrealBloomPass(new THREE.Vector2(innerWidth, innerHeight), 0.3, 0.55, 0.88);
+  composer.addPass(bloom);
+  fxaaPass = new THREE.ShaderPass(THREE.FXAAShader);
+  fxaaPass.material.uniforms.resolution.value.set(1 / innerWidth, 1 / innerHeight);
+  composer.addPass(fxaaPass);
+  composer.setSize(innerWidth, innerHeight);
+} catch (e) { composer = null; }
+
+const controls = new THREE.OrbitControls(camera, renderer.domElement);
+controls.target.set(0, 32, 0);
+controls.enableDamping = true;
+controls.dampingFactor = 0.08;
+controls.maxPolarAngle = Math.PI * 0.495;
+controls.update();
+
+const hemi = new THREE.HemisphereLight(0xbfd4ff, 0x30281e, 0.35);
+scene.add(hemi);
+const sun = new THREE.DirectionalLight(0xfff2e0, 0.85);
+sun.position.set(120, 180, 90);
+sun.castShadow = true;
+// 4k map over a frustum sized to a building bay, not the whole 100 ft ground
+// plane: ~0.07 in of shadow texel at room scale, which is what makes a rack leg
+// meet the floor instead of hovering over a smear.
+sun.shadow.mapSize.set(4096, 4096);
+sun.shadow.bias = -0.00022;
+sun.shadow.normalBias = 0.035;
+sun.shadow.radius = 1.6;
+const rim = new THREE.DirectionalLight(0x5b7cff, 0.3);
+rim.position.set(-100, 60, -120);
+scene.add(rim);
+const sc = sun.shadow.camera;
+sc.left = -150; sc.right = 150; sc.top = 150; sc.bottom = -150; sc.near = 20; sc.far = 520;
+scene.add(sun);
+// Bounce: a room's floor and walls throw a lot of light back up under desks and
+// into rack bays. Without it, every underside crushes to flat black.
+const bounce = new THREE.DirectionalLight(0xd8e2f0, 0.16);
+bounce.position.set(-40, -120, 60);
+scene.add(bounce);
+
+//////////////////// PBR texture helpers ////////////////////
+// Everything in this app is drawn procedurally on canvases (no asset downloads,
+// so the portable build stays a single folder). These turn those canvases into
+// the *other* PBR channels — surfaces read as real materials only once light
+// catches their micro-relief, not just their color.
+
+// Scratch canvas -> 2D context, sized once.
+function canvas2d(size) {
+  const c = document.createElement('canvas');
+  c.width = c.height = size;
+  return c;
+}
+
+// Tangent-space normal map from a grayscale height canvas (Sobel on luminance).
+// `strength` is the bump depth: ~0.5 for drywall orange-peel, ~3 for tile grout.
+function normalFromHeight(src, strength = 1) {
+  const w = src.width, h = src.height;
+  const s = src.getContext('2d').getImageData(0, 0, w, h).data;
+  const out = canvas2d(w);
+  const og = out.getContext('2d');
+  const img = og.createImageData(w, h);
+  const at = (x, y) => s[((((y % h) + h) % h) * w + (((x % w) + w) % w)) * 4] / 255;
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      // central differences; tiled lookups keep the map seamless like the source
+      const dx = (at(x + 1, y) - at(x - 1, y)) * strength;
+      const dy = (at(x, y + 1) - at(x, y - 1)) * strength;
+      const len = Math.hypot(dx, dy, 1);
+      const i = (y * w + x) * 4;
+      img.data[i]     = ((-dx / len) * 0.5 + 0.5) * 255;
+      img.data[i + 1] = ((-dy / len) * 0.5 + 0.5) * 255;
+      img.data[i + 2] = ((1 / len) * 0.5 + 0.5) * 255;
+      img.data[i + 3] = 255;
+    }
+  }
+  og.putImageData(img, 0, 0);
+  const t = new THREE.CanvasTexture(out);
+  t.wrapS = t.wrapT = THREE.RepeatWrapping;   // normal/roughness stay linear — never sRGB
+  t.anisotropy = 8;
+  return t;
+}
+
+// Data map (roughness / metalness / AO). Same rule: linear, never sRGB.
+function dataTexture(src) {
+  const t = new THREE.CanvasTexture(src);
+  t.wrapS = t.wrapT = THREE.RepeatWrapping;
+  t.anisotropy = 8;
+  return t;
+}
+
+// Value noise smoothed over `cell` px — the base for drywall, concrete and carpet
+// grain. Returns a canvas of gray values usable as height or roughness directly.
+function noiseCanvas(size, cell, lo = 0.35, hi = 0.65) {
+  const c = canvas2d(size), g = c.getContext('2d');
+  const n = Math.max(2, Math.round(size / cell));
+  const v = [];
+  for (let i = 0; i < n * n; i++) v.push(Math.random());
+  // bilinear upsample of the low-res lattice, wrapping so the tile is seamless
+  const img = g.createImageData(size, size);
+  for (let y = 0; y < size; y++) {
+    const fy = (y / size) * n, y0 = Math.floor(fy), ty = fy - y0;
+    for (let x = 0; x < size; x++) {
+      const fx = (x / size) * n, x0 = Math.floor(fx), tx = fx - x0;
+      const a = v[(y0 % n) * n + (x0 % n)], b = v[(y0 % n) * n + ((x0 + 1) % n)];
+      const cc = v[((y0 + 1) % n) * n + (x0 % n)], d = v[((y0 + 1) % n) * n + ((x0 + 1) % n)];
+      const sx = tx * tx * (3 - 2 * tx), sy = ty * ty * (3 - 2 * ty);   // smoothstep
+      const val = (a + (b - a) * sx) * (1 - sy) + (cc + (d - cc) * sx) * sy;
+      const px = (lo + val * (hi - lo)) * 255;
+      const i = (y * size + x) * 4;
+      img.data[i] = img.data[i + 1] = img.data[i + 2] = px;
+      img.data[i + 3] = 255;
+    }
+  }
+  g.putImageData(img, 0, 0);
+  return c;
+}
+
+// Stacks several noise octaves for grain that reads at both close and far range.
+function fbmCanvas(size, cells, lo = 0.3, hi = 0.7) {
+  const c = canvas2d(size), g = c.getContext('2d');
+  g.fillStyle = '#808080'; g.fillRect(0, 0, size, size);
+  g.globalCompositeOperation = 'overlay';
+  let amp = 1;
+  for (const cell of cells) {
+    g.globalAlpha = amp;
+    g.drawImage(noiseCanvas(size, cell, lo, hi), 0, 0, size, size);
+    amp *= 0.55;
+  }
+  g.globalAlpha = 1;
+  g.globalCompositeOperation = 'source-over';
+  return c;
+}
+
+// Deterministic RNG — albedo, height and roughness must agree on which tile got
+// which jitter, or the seams drift apart between channels.
+function seeded(seed) {
+  return () => {
+    seed = (seed + 0x6D2B79F5) | 0;
+    let t = Math.imul(seed ^ (seed >>> 15), 1 | seed);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+// Floor: 12" commercial VCT laid in a 4×4 patch that repeats across the slab.
+// Real 12" tiles means the seams *are* the 1-ft scale grid the whole app runs on
+// (GridHelper's 100 divisions over 1200" land on the same lines), so the floor
+// reads as a real surface and as a ruler at the same time.
+const FLOOR_TILE_IN = 12;
+const FLOOR_TEX_TILES = 4;                              // 48" of floor per repeat
+const FLOOR_REPEAT = 1200 / (FLOOR_TILE_IN * FLOOR_TEX_TILES);
+
+function floorCanvas(p, mode) {
+  const S = 1024, n = FLOOR_TEX_TILES, cell = S / n;
+  const c = canvas2d(S), g = c.getContext('2d');
+  const rnd = seeded(0x5eed);
+  g.fillStyle = mode === 'albedo' ? p[1] : mode === 'height' ? '#c0c0c0' : '#707070';
+  g.fillRect(0, 0, S, S);
+  for (let ty = 0; ty < n; ty++) {
+    for (let tx = 0; tx < n; tx++) {
+      const j = rnd(), x = tx * cell, y = ty * cell;
+      if (mode === 'albedo') {
+        // each tile pulls toward one end of the palette — no two read identical
+        g.fillStyle = j < 0.34 ? p[0] : j < 0.67 ? p[1] : p[2];
+      } else if (mode === 'rough') {
+        // uneven buffing: some tiles hold a polish, others are worn flat
+        const v = Math.round(88 + j * 54);
+        g.fillStyle = `rgb(${v},${v},${v})`;
+      } else {
+        g.fillStyle = '#c0c0c0';
+      }
+      g.fillRect(x, y, cell, cell);
+    }
+  }
+  // VCT chips — fine mineral speckle, the thing that stops a floor looking painted
+  const chips = mode === 'albedo' ? 5200 : 2600;
+  for (let i = 0; i < chips; i++) {
+    const x = rnd() * S, y = rnd() * S, r = 0.6 + rnd() * 1.9;
+    const light = rnd() > 0.5;
+    g.fillStyle = mode === 'albedo'
+      ? (light ? 'rgba(255,255,255,0.10)' : 'rgba(0,0,0,0.10)')
+      : mode === 'rough' ? (light ? 'rgba(255,255,255,0.16)' : 'rgba(0,0,0,0.12)')
+      : (light ? 'rgba(255,255,255,0.28)' : 'rgba(0,0,0,0.22)');
+    g.beginPath(); g.arc(x, y, r, 0, Math.PI * 2); g.fill();
+  }
+  // tile seams: a recessed, unpolished groove between tiles
+  g.lineWidth = 2.5;
+  g.strokeStyle = mode === 'albedo' ? p[3] : mode === 'rough' ? 'rgba(255,255,255,0.55)' : 'rgba(0,0,0,0.75)';
+  for (let i = 0; i <= n; i++) {
+    const o = i * cell;
+    g.beginPath(); g.moveTo(o, 0); g.lineTo(o, S); g.stroke();
+    g.beginPath(); g.moveTo(0, o); g.lineTo(S, o); g.stroke();
+  }
+  return c;
+}
+
+function makeFloorTexture(p) {
+  p = p || ['#242b37', '#1a202a', '#11151c', 'rgba(0,0,0,0.35)'];
+  const t = new THREE.CanvasTexture(floorCanvas(p, 'albedo'));
+  t.encoding = THREE.sRGBEncoding;
+  t.wrapS = t.wrapT = THREE.RepeatWrapping;
+  t.repeat.set(FLOOR_REPEAT, FLOOR_REPEAT);
+  t.anisotropy = 16;
+  return t;
+}
+// Relief and wear don't change with the color theme — build them once.
+function makeFloorMaps(p) {
+  const nrm = normalFromHeight(floorCanvas(p, 'height'), 2.2);
+  const rgh = dataTexture(floorCanvas(p, 'rough'));
+  for (const t of [nrm, rgh]) { t.repeat.set(FLOOR_REPEAT, FLOOR_REPEAT); t.anisotropy = 16; }
+  return { nrm, rgh };
+}
+const _floorMaps = makeFloorMaps(['#242b37', '#1a202a', '#11151c', 'rgba(0,0,0,0.35)']);
+const floorMesh = new THREE.Mesh(
+  new THREE.PlaneGeometry(1200, 1200),
+  new THREE.MeshStandardMaterial({
+    map: makeFloorTexture(),
+    normalMap: _floorMaps.nrm, normalScale: new THREE.Vector2(0.45, 0.45),
+    roughnessMap: _floorMaps.rgh,
+    roughness: 1, metalness: 0.06, envMapIntensity: 0.4
+  })
+);
+floorMesh.rotation.x = -Math.PI / 2;
+floorMesh.receiveShadow = true;
+floorMesh.userData.isFloor = true;
+scene.add(floorMesh);
+
+let grid = new THREE.GridHelper(1200, 100, 0x2c3646, 0x222a36);
+grid.position.y = 0.02;
+scene.add(grid);
+
+//////////////////// Geometry builders ////////////////////
+
+const matCache = new Map();
+function mat(color, opts = {}) {
+  const key = color + JSON.stringify(opts);
+  if (!matCache.has(key)) {
+    matCache.set(key, new THREE.MeshStandardMaterial({ color, roughness: 0.6, metalness: 0.35, envMapIntensity: 0.9, ...opts }));
+  }
+  return matCache.get(key);
+}
+
+//////////////////// Walls & drill holes ////////////////////
+
+// Painted drywall. The give-away on a fake wall is that it's perfectly flat —
+// real board has a rolled orange-peel stipple that catches grazing light, plus
+// taped seams every 48". Both live in the normal map; the albedo stays near-flat
+// because paint genuinely is.
+const WALL_TEX_IN = 96;                     // one texture tile covers 8 ft of wall
+function wallCanvas(mode) {
+  const S = 512, c = canvas2d(S), g = c.getContext('2d');
+  if (mode === 'albedo') {
+    g.fillStyle = '#b6bcc4'; g.fillRect(0, 0, S, S);
+    const img = g.getImageData(0, 0, S, S);
+    for (let i = 0; i < img.data.length; i += 4) {
+      const n = (Math.random() - 0.5) * 7;
+      img.data[i] += n; img.data[i + 1] += n; img.data[i + 2] += n;
+    }
+    g.putImageData(img, 0, 0);
+  } else {
+    // stipple: fine overlapping blobs are what orange-peel roller texture is
+    g.drawImage(fbmCanvas(S, [7, 3], 0.44, 0.56), 0, 0);
+  }
+  // taped-and-mudded butt joints — a shallow rise, not a scored line
+  const seam = mode === 'albedo' ? 'rgba(0,0,0,0.035)' : 'rgba(255,255,255,0.5)';
+  g.strokeStyle = seam;
+  g.lineWidth = mode === 'albedo' ? 1 : 7;
+  for (const x of [0, S / 2]) { g.beginPath(); g.moveTo(x, 0); g.lineTo(x, S); g.stroke(); }
+  return c;
+}
+const wallNormal = normalFromHeight(wallCanvas('height'), 0.7);
+function makeWallTexture() {
+  const t = new THREE.CanvasTexture(wallCanvas('albedo'));
+  t.encoding = THREE.sRGBEncoding;
+  t.wrapS = t.wrapT = THREE.RepeatWrapping;
+  t.anisotropy = 8;
+  return t;
+}
+const wallMat = new THREE.MeshStandardMaterial({
+  color: 0xcfd4db, map: makeWallTexture(),
+  normalMap: wallNormal, normalScale: new THREE.Vector2(0.32, 0.32),
+  roughness: 0.94, metalness: 0, envMapIntensity: 0.3, transparent: true, opacity: 1
+});
+// Vinyl-wrapped MDF base — every commercial interior has it, and its absence is
+// one of those things you feel before you can name it.
+// Kept deliberately matte with almost no environment response. The top edge of a
+// 4" base is a sliver a few pixels tall from across a room, and a tight specular
+// highlight on a sliver that size aliases into a row of teeth that MSAA cannot
+// fix — MSAA resolves coverage, not shading. Real vinyl base is a low-sheen
+// extrusion, so matte is both the accurate answer and the stable one.
+// 4" tall × 1/8" thick — actual vinyl cove base dimensions. The thickness matters
+// beyond pedantry: a thick base presents a wide horizontal top ledge that catches
+// light and shimmers from across the room. At 1/8" there is barely a ledge to
+// alias, which is exactly why the real product is that thin.
+const BASE_H = 4, BASE_T = 0.125;
+const baseboardMat = new THREE.MeshStandardMaterial({
+  color: 0xe6e2da, roughness: 0.88, metalness: 0, envMapIntensity: 0.1,
+  transparent: true, opacity: 1
+});
+// Each wall gets its own material so texture repeat can follow its real size —
+// an 8 ft and a 30 ft wall must show the same size stipple, not one stretched.
+// wallMat above stays the template; these are the live instances X-ray drives.
+const wallMats = new Set();
+function makeWallMaterial(len, h) {
+  const m = wallMat.clone();
+  m.map = wallMat.map.clone(); m.map.needsUpdate = true;
+  m.normalMap = wallMat.normalMap.clone(); m.normalMap.needsUpdate = true;
+  for (const t of [m.map, m.normalMap]) t.repeat.set(len / WALL_TEX_IN, h / WALL_TEX_IN);
+  m.opacity = xrayOn ? 0.22 : 1;
+  m.depthWrite = !xrayOn;
+  wallMats.add(m);
+  return m;
+}
+
+let xrayOn = false;
+function setXray(on) {
+  xrayOn = on;
+  for (const m of wallMats) { m.opacity = on ? 0.22 : 1; m.depthWrite = !on; }
+  baseboardMat.opacity = on ? 0.22 : 1;
+  baseboardMat.depthWrite = !on;
+  document.getElementById('btn-xray').classList.toggle('active', on);
+}
+
+function buildWall(w) {
+  const dx = w.x2 - w.x1, dz = w.z2 - w.z1;
+  const len = Math.hypot(dx, dz);
+  const h = w.h || WALL_H;
+  const m = new THREE.Mesh(new THREE.BoxGeometry(len, h, WALL_T), makeWallMaterial(len, h));
+  m.position.set((w.x1 + w.x2) / 2, (w.y0 || 0) + h / 2, (w.z1 + w.z2) / 2);
+  m.rotation.y = Math.atan2(-dz, dx);
+  m.castShadow = true;
+  m.receiveShadow = true;
+  m.userData = { isWall: true, wallId: w.id };
+  // built-to-scale: every wall carries its length label
+  const lbl = makeTextSprite(fmtLen(len), '#cfe0ff');
+  lbl.position.set(0, h / 2 + 5, 0);
+  m.add(lbl);
+  // Baseboard down both faces, standing proud of the drywall like the real thing.
+  // It deliberately neither casts nor receives: a 4" strip pressed flat against a
+  // shadow-casting wall sits inside that wall's own depth range, and the shadow
+  // map resolves it as a comb of acne. Trim this size contributes no meaningful
+  // shadow of its own, so opting out costs nothing and removes the artifact.
+  for (const s of [1, -1]) {
+    const bb = new THREE.Mesh(new THREE.BoxGeometry(len, BASE_H, BASE_T), baseboardMat);
+    bb.position.set(0, -h / 2 + BASE_H / 2, s * (WALL_T / 2 + BASE_T / 2));
+    bb.castShadow = false; bb.receiveShadow = false;
+    m.add(bb);
+  }
+  scene.add(m);
+  wallMeshes.set(w.id, m);
+  scheduleReroute();
+  return m;
+}
+
+function buildHole(h) {
+  const g = new THREE.Group();
+  g.position.set(h.x, h.y, h.z);
+  const n = new THREE.Vector3(h.nx || 0, h.ny || 0, h.nz || 0).normalize();
+  g.quaternion.setFromUnitVectors(new THREE.Vector3(0, 0, 1), n);
+  const r = h.r || 0.9, t = h.t || WALL_T;
+  const bore = new THREE.Mesh(new THREE.CylinderGeometry(r, r, t + 1.6, 18), mat(0x05070a, { roughness: 0.9 }));
+  bore.rotation.x = Math.PI / 2;
+  bore.userData = { isHole: true, holeId: h.id };
+  g.add(bore); holeMeshes.push(bore);
+  for (const s of [1, -1]) {
+    const ring = new THREE.Mesh(new THREE.TorusGeometry(r + 0.25, 0.14, 8, 26),
+      new THREE.MeshStandardMaterial({ color: 0xeab308, emissive: 0x8a6a05, emissiveIntensity: 0.6, roughness: 0.4 }));
+    ring.position.z = s * (t / 2 + 0.5);
+    ring.userData = { isHole: true, holeId: h.id };
+    g.add(ring); holeMeshes.push(ring);
+  }
+  scene.add(g);
+  holeGroups.set(h.id, g);
+  scheduleReroute();
+  return g;
+}
+
+function deleteHole(id) {
+  const g = holeGroups.get(id);
+  if (g) { scene.remove(g); holeGroups.delete(id); }
+  removeFromArr(holeMeshes, m => m.userData.holeId === id);
+  removeFromArr(state.holes, h => h.id === id);
+  scheduleReroute();
+}
+
+function deleteWall(id) {
+  for (const h of state.holes.filter(h => h.wallId === id)) deleteHole(h.id);
+  const m = wallMeshes.get(id);
+  if (m) {
+    scene.remove(m);
+    m.geometry.dispose();
+    wallMats.delete(m.material);
+    if (m.material.map) m.material.map.dispose();
+    if (m.material.normalMap) m.material.normalMap.dispose();
+    m.material.dispose();
+    wallMeshes.delete(id);
+  }
+  removeFromArr(state.walls, w => w.id === id);
+  scheduleReroute();
+}
+
+//////////////////// Floors (slabs), measurements, text labels ////////////////////
+
+function makeTextSprite(text, color = '#ffd23e') {
+  const c = document.createElement('canvas');
+  let g = c.getContext('2d');
+  g.font = '600 48px -apple-system, "Segoe UI", sans-serif';
+  const w = Math.ceil(g.measureText(text).width) + 36;
+  c.width = w; c.height = 72;
+  g = c.getContext('2d');
+  g.font = '600 48px -apple-system, "Segoe UI", sans-serif';
+  g.fillStyle = 'rgba(10,13,18,0.82)';
+  g.beginPath();
+  g.roundRect ? g.roundRect(0, 0, w, 72, 18) : g.rect(0, 0, w, 72);
+  g.fill();
+  g.fillStyle = color;
+  g.textBaseline = 'middle';
+  g.fillText(text, 18, 39);
+  const t = new THREE.CanvasTexture(c);
+  t.encoding = THREE.sRGBEncoding;
+  const s = new THREE.Sprite(new THREE.SpriteMaterial({ map: t, depthTest: false }));
+  s.scale.set(w / 11, 6.5, 1);
+  return s;
+}
+
+function makeSlabTexture() {
+  const c = document.createElement('canvas'); c.width = c.height = 512;
+  const g = c.getContext('2d');
+  g.fillStyle = '#8d939c'; g.fillRect(0, 0, 512, 512);
+  const img = g.getImageData(0, 0, 512, 512);
+  for (let i = 0; i < img.data.length; i += 4) {
+    const n = (Math.random() - 0.5) * 16;
+    img.data[i] += n; img.data[i + 1] += n; img.data[i + 2] += n;
+  }
+  g.putImageData(img, 0, 0);
+  g.strokeStyle = 'rgba(0,0,0,0.10)'; // concrete control joints
+  for (let i = 0; i <= 512; i += 256) {
+    g.beginPath(); g.moveTo(i, 0); g.lineTo(i, 512); g.stroke();
+    g.beginPath(); g.moveTo(0, i); g.lineTo(512, i); g.stroke();
+  }
+  const t = new THREE.CanvasTexture(c);
+  t.encoding = THREE.sRGBEncoding;
+  t.wrapS = t.wrapT = THREE.RepeatWrapping;
+  t.repeat.set(2, 2);
+  return t;
+}
+const slabMat = new THREE.MeshStandardMaterial({ color: 0xb9bec7, map: makeSlabTexture(), roughness: 0.93, metalness: 0.02, envMapIntensity: 0.3 });
+
+// The underside of a slab is a room's ceiling, and in every commercial building
+// that means a 24"×24" lay-in grid — fissured mineral tile in a white tee bar.
+// Modelling it is what stops the "floating concrete lid" look from below.
+const CEIL_TILE_IN = 24;
+function ceilingCanvas(mode) {
+  const S = 512, n = 2, cell = S / n;             // 2×2 tiles = 48" per repeat
+  const c = canvas2d(S), g = c.getContext('2d');
+  if (mode === 'albedo') {
+    g.fillStyle = '#eceae4'; g.fillRect(0, 0, S, S);
+    g.globalAlpha = 0.5; g.drawImage(fbmCanvas(S, [5, 2], 0.42, 0.58), 0, 0); g.globalAlpha = 1;
+    // fissures — the irregular pinholes and worm tracks pressed into mineral tile
+    for (let i = 0; i < 2600; i++) {
+      g.fillStyle = `rgba(150,148,140,${0.10 + Math.random() * 0.18})`;
+      g.beginPath();
+      g.ellipse(Math.random() * S, Math.random() * S, 0.6 + Math.random() * 2.4,
+        0.5 + Math.random(), Math.random() * Math.PI, 0, Math.PI * 2);
+      g.fill();
+    }
+  } else {
+    g.fillStyle = '#b4b4b4'; g.fillRect(0, 0, S, S);
+    g.globalAlpha = 0.6; g.drawImage(fbmCanvas(S, [5, 2], 0.4, 0.6), 0, 0); g.globalAlpha = 1;
+  }
+  // tee-bar grid: tiles sit recessed below the rails, so the grid is the high line
+  g.strokeStyle = mode === 'albedo' ? '#f6f6f4' : '#ffffff';
+  g.lineWidth = mode === 'albedo' ? 5 : 6;
+  for (let i = 0; i <= n; i++) {
+    const o = i * cell;
+    g.beginPath(); g.moveTo(o, 0); g.lineTo(o, S); g.stroke();
+    g.beginPath(); g.moveTo(0, o); g.lineTo(S, o); g.stroke();
+  }
+  return c;
+}
+let _ceilMat = null;
+function ceilingMaterial() {
+  if (_ceilMat) return _ceilMat;
+  const alb = new THREE.CanvasTexture(ceilingCanvas('albedo'));
+  alb.encoding = THREE.sRGBEncoding;
+  alb.wrapS = alb.wrapT = THREE.RepeatWrapping;
+  alb.anisotropy = 8;
+  const nrm = normalFromHeight(ceilingCanvas('height'), 1.6);
+  _ceilMat = new THREE.MeshStandardMaterial({
+    color: 0xffffff, map: alb, normalMap: nrm, normalScale: new THREE.Vector2(0.5, 0.5),
+    roughness: 0.97, metalness: 0, envMapIntensity: 0.25
+  });
+  return _ceilMat;
+}
+
+function buildSlab(s) {
+  const wX = Math.abs(s.x2 - s.x1), wZ = Math.abs(s.z2 - s.z1);
+  // BoxGeometry material order is +x,-x,+y,-y,+z,-z — index 3 is the underside,
+  // the face people actually stand under and look at
+  const ceil = ceilingMaterial().clone();
+  ceil.map = ceilingMaterial().map.clone();
+  ceil.normalMap = ceilingMaterial().normalMap.clone();
+  for (const t of [ceil.map, ceil.normalMap]) {
+    t.needsUpdate = true;
+    t.repeat.set(Math.max(wX, 1) / (CEIL_TILE_IN * 2), Math.max(wZ, 1) / (CEIL_TILE_IN * 2));
+  }
+  const faces = [slabMat, slabMat, slabMat, ceil, slabMat, slabMat];
+  const m = new THREE.Mesh(new THREE.BoxGeometry(Math.max(wX, 1), 6, Math.max(wZ, 1)), faces);
+  m.position.set((s.x1 + s.x2) / 2, s.y - 3, (s.z1 + s.z2) / 2);
+  m.castShadow = true;
+  m.receiveShadow = true;
+  m.userData = { isSlab: true, slabId: s.id, topY: s.y };
+  scene.add(m);
+  slabMeshes.set(s.id, m);
+  scheduleReroute();
+  return m;
+}
+function buildRoom(x1, z1, x2, z2, y0) {
+  undoPush();
+  const corners = [[x1, z1], [x2, z1], [x2, z2], [x1, z2], [x1, z1]];
+  for (let i = 0; i < 4; i++) {
+    const w = { id: uid(), x1: corners[i][0], z1: corners[i][1], x2: corners[i + 1][0], z2: corners[i + 1][1], h: WALL_H, y0 };
+    state.walls.push(w);
+    buildWall(w);
+  }
+  // the ceiling IS the next level's floor slab — wall tops meet it exactly
+  const ceil = { id: uid(), x1, z1, x2, z2, y: y0 + LEVEL_H };
+  state.slabs.push(ceil);
+  buildSlab(ceil);
+  setStatus(`Room built: ${fmtLen(Math.abs(x2 - x1))} × ${fmtLen(Math.abs(z2 - z1))} with ceiling. X-ray (X) sees inside; the ceiling doubles as the floor above (Delete removes it if unwanted).`);
+}
+
+function deleteSlab(id) {
+  const m = slabMeshes.get(id);
+  if (m) { scene.remove(m); m.geometry.dispose(); slabMeshes.delete(id); }
+  removeFromArr(state.slabs, s => s.id === id);
+  scheduleReroute();
+}
+function groundTargets() { return [floorMesh, ...slabMeshes.values()]; }
+function groundYFromHit(hit) { return hit.object.userData.isSlab ? hit.object.userData.topY : 0; }
+function groundAt(x, z, belowY) {
+  let g = 0;
+  for (const s of state.slabs || []) {
+    const x1 = Math.min(s.x1, s.x2) - 2, x2 = Math.max(s.x1, s.x2) + 2;
+    const z1 = Math.min(s.z1, s.z2) - 2, z2 = Math.max(s.z1, s.z2) + 2;
+    if (x >= x1 && x <= x2 && z >= z1 && z <= z2 && s.y <= belowY && s.y > g) g = s.y;
+  }
+  return g;
+}
+
+function buildMeasure(m) {
+  const g = new THREE.Group();
+  const a = new THREE.Vector3(m.ax, m.ay, m.az), b = new THREE.Vector3(m.bx, m.by, m.bz);
+  const dotGeo = new THREE.SphereGeometry(0.9, 10, 10);
+  const dotMat = new THREE.MeshBasicMaterial({ color: 0xffd23e });
+  for (const p of [a, b]) {
+    const d = new THREE.Mesh(dotGeo, dotMat);
+    d.position.copy(p);
+    d.userData = { isMeasure: true, measureId: m.id };
+    g.add(d); measureHits.push(d);
+  }
+  const line = new THREE.Line(
+    new THREE.BufferGeometry().setFromPoints([a, b]),
+    new THREE.LineDashedMaterial({ color: 0xffd23e, dashSize: 2.2, gapSize: 1.1 }));
+  line.computeLineDistances();
+  g.add(line);
+  const lbl = makeTextSprite(fmtLen(a.distanceTo(b)));
+  lbl.position.copy(a).lerp(b, 0.5);
+  lbl.position.y += 4;
+  lbl.userData = { isMeasure: true, measureId: m.id };
+  g.add(lbl); measureHits.push(lbl);
+  scene.add(g);
+  measureGroups.set(m.id, g);
+  return g;
+}
+function deleteMeasure(id) {
+  const g = measureGroups.get(id);
+  if (g) { scene.remove(g); measureGroups.delete(id); }
+  removeFromArr(measureHits, o => o.userData.measureId === id);
+  removeFromArr(state.measures, mm => mm.id === id);
+}
+
+let measureLine = null;
+function updatePreviewMeasure(p) {
+  const geo = new THREE.BufferGeometry().setFromPoints([measureStart, p]);
+  if (measureLine) { measureLine.geometry.dispose(); measureLine.geometry = geo; }
+  else {
+    measureLine = new THREE.Line(geo, new THREE.LineDashedMaterial({ color: 0xffd23e, dashSize: 2, gapSize: 1 }));
+    scene.add(measureLine);
+  }
+  measureLine.computeLineDistances();
+}
+function clearMeasurePreview() {
+  if (measureLine) { scene.remove(measureLine); measureLine.geometry.dispose(); measureLine = null; }
+}
+
+let _railTex = null;
+function getRailTexture() {
+  if (_railTex) return _railTex;
+  const c = document.createElement('canvas'); c.width = 64; c.height = 64;
+  const g2 = c.getContext('2d');
+  const grad = g2.createLinearGradient(0, 0, 64, 0);
+  grad.addColorStop(0, '#1d232d'); grad.addColorStop(0.5, '#2b3442'); grad.addColorStop(1, '#1d232d');
+  g2.fillStyle = grad; g2.fillRect(0, 0, 64, 64);
+  g2.fillStyle = '#07090d';
+  for (const y of [4, 25, 46]) g2.fillRect(23, y, 18, 14); // 3 square holes per U
+  _railTex = new THREE.CanvasTexture(c);
+  _railTex.wrapS = _railTex.wrapT = THREE.RepeatWrapping;
+  _railTex.repeat.set(1, RACK_UNITS);
+  _railTex.encoding = THREE.sRGBEncoding;
+  return _railTex;
+}
+
+function buildRackGroup(rack) {
+  const g = new THREE.Group();
+  g.position.set(rack.x, rack.y0 || 0, rack.z);
+  g.rotation.y = rack.rotY || 0;
+  const frameMat = mat(0x161b23, { roughness: 0.4, metalness: 0.65 });
+
+  const postGeo = new THREE.BoxGeometry(2, RACK_H, 3);
+  for (const [px, pz] of [[-1, 1], [1, 1], [-1, -1], [1, -1]]) {
+    const post = new THREE.Mesh(postGeo, frameMat);
+    post.position.set(px * (RACK_OUTER_W / 2 - 1), RACK_H / 2, pz * (RACK_D / 2 - 1.5));
+    post.castShadow = true;
+    post.userData = { isRackFrame: true, rackId: rack.id };
+    g.add(post); rackFrames.push(post);
+  }
+  for (const y of [1, RACK_H - 0.5]) {
+    const bar = new THREE.Mesh(new THREE.BoxGeometry(RACK_OUTER_W, y === 1 ? 2 : 1, RACK_D), frameMat);
+    bar.position.y = y;
+    bar.castShadow = true;
+    bar.userData = { isRackFrame: true, rackId: rack.id };
+    g.add(bar); rackFrames.push(bar);
+  }
+
+  // 19" mounting rails with square holes
+  const railGeo = new THREE.BoxGeometry(1.4, RACK_UNITS * U, 0.5);
+  const railMat = new THREE.MeshStandardMaterial({ map: getRailTexture(), roughness: 0.45, metalness: 0.55, envMapIntensity: 0.8 });
+  for (const [rx, rz] of [[-1, 1], [1, 1], [-1, -1], [1, -1]]) {
+    const rail = new THREE.Mesh(railGeo, railMat);
+    rail.position.set(rx * (RACK_W / 2 + 0.8), RACK_BASE + RACK_UNITS * U / 2, rz * (RACK_D / 2 - 1.3));
+    rail.userData = { isRackFrame: true, rackId: rack.id };
+    g.add(rail); rackFrames.push(rail);
+  }
+
+  // Invisible plane used for U-slot placement raycasts
+  const plane = new THREE.Mesh(
+    new THREE.PlaneGeometry(RACK_W + 6, RACK_UNITS * U),
+    new THREE.MeshBasicMaterial({ visible: false })
+  );
+  plane.position.set(0, RACK_BASE + RACK_UNITS * U / 2, RACK_D / 2);
+  plane.userData = { isRackPlane: true, rackId: rack.id };
+  g.add(plane); rackPlanes.push(plane);
+
+  // U markings every 5U on the left post
+  for (let u = 5; u <= RACK_UNITS; u += 5) {
+    const tick = new THREE.Mesh(new THREE.BoxGeometry(0.3, 0.12, 0.12), mat(0x4da3ff));
+    tick.position.set(-(RACK_OUTER_W / 2 - 1) + 1.2, RACK_BASE + (u - 0.5) * U, RACK_D / 2 - 1.4);
+    g.add(tick);
+  }
+
+  scene.add(g);
+  rackGroups.set(rack.id, g);
+  collidersDirty = true;
+  return g;
+}
+
+function portGrid(def) {
+  // Real-world port layout: column-major numbering (port 1 ABOVE port 2, like
+  // actual switches), RJ45s grouped in blocks of 6 columns with gaps, SFP+
+  // cages wider/shorter at the far right, WAN ports offset on gateways.
+  const pts = [];
+  if (!def.ports) return pts;
+  // Explicit per-SKU port map: blocks of {type, cols, rows, gapBefore} laid out
+  // exactly as on the real faceplate. Column-major numbering inside each block.
+  if (def.portLayout) {
+    const cellW = 0.66, sfpW = 0.8;
+    let total2 = 0;
+    for (const b of def.portLayout) total2 += (b.gapBefore || 0) + b.cols * (b.type === 'sfp' ? sfpW : cellW);
+    const offX = ((def.faceInsetL || 0) - (def.faceInsetR || 0)) / 2;
+    let x = -total2 / 2 + offX, port = 1;
+    for (const b of def.portLayout) {
+      x += b.gapBefore || 0;
+      const w = b.type === 'sfp' ? sfpW : cellW;
+      let p = b.start || port;
+      for (let c = 0; c < b.cols; c++) {
+        const cx = x + w / 2;
+        const rows = b.rows || 1;
+        for (let r = 0; r < rows; r++) {
+          pts.push({ x: cx, y: rows === 2 ? (r === 0 ? 0.44 : -0.44) : (b.y || 0), port: p++, kind: b.type });
+        }
+        x += w;
+      }
+      port = Math.max(port, p);
+    }
+    return pts;
+  }
+  const total = def.ports;
+  const sfp = Math.min(def.sfp || 0, total);
+  const rj = total - sfp;
+  const rows = def.rows === 2 ? 2 : 1;
+  const cellW = 0.66, groupCols = 6, groupGap = 0.3, sfpW = 0.8;
+  const rowY = r => rows === 2 ? (r === 0 ? 0.44 : -0.44) : 0;
+  const rjCols = rows === 2 ? Math.ceil(rj / 2) : rj;
+  const nGroups = rjCols ? Math.ceil(rjCols / groupCols) : 0;
+  const wanGap = (def.wan && rows === 1) ? 0.55 : 0;
+  const sfpCols = sfp ? (rows === 2 ? Math.ceil(sfp / 2) : sfp) : 0;
+  const sfpLead = (sfp && rj) ? 0.6 : 0;
+  const totalW = rjCols * cellW + Math.max(0, nGroups - 1) * groupGap + wanGap + sfpLead + sfpCols * sfpW;
+  // per-SKU face insets (touchscreens, displays) shift the port block to its true position
+  const offX = ((def.faceInsetL || 0) - (def.faceInsetR || 0)) / 2;
+  let x = -totalW / 2 + offX, port = 1;
+  for (let c = 0; c < rjCols; c++) {
+    if (c > 0 && c % groupCols === 0) x += groupGap;
+    if (wanGap && c === def.wan) x += wanGap;
+    if (def.gapsAfter && def.gapsAfter[c]) x += def.gapsAfter[c]; // per-SKU spacing
+    const cx = x + cellW / 2;
+    for (let r = 0; r < rows && port <= rj; r++) pts.push({ x: cx, y: rowY(r), port: port++, kind: 'rj' });
+    x += cellW;
+  }
+  if (sfp) {
+    x += sfpLead;
+    for (let c = 0; c < sfpCols; c++) {
+      const cx = x + sfpW / 2;
+      for (let r = 0; r < rows && port <= total; r++) pts.push({ x: cx, y: rowY(r), port: port++, kind: 'sfp' });
+      x += sfpW;
+    }
+  }
+  return pts;
+}
+
+// shared jack geometry/materials — every rack port is a real modeled jack
+const GEO_RJ_BEZEL = new THREE.BoxGeometry(0.6, 0.7, 0.08);
+const GEO_RJ_HIT = new THREE.BoxGeometry(0.5, 0.56, 0.3);
+const GEO_SFP_BEZEL = new THREE.BoxGeometry(0.76, 0.5, 0.08);
+const GEO_SFP_HIT = new THREE.BoxGeometry(0.66, 0.36, 0.3);
+const GEO_GOLD = new THREE.BoxGeometry(0.3, 0.05, 0.02);
+const GEO_LED = new THREE.BoxGeometry(0.09, 0.09, 0.03);
+
+function shade(hex, f) {
+  const col = new THREE.Color(hex).multiplyScalar(f);
+  col.r = Math.min(1, col.r); col.g = Math.min(1, col.g); col.b = Math.min(1, col.b);
+  return '#' + col.getHexString();
+}
+
+function makeFaceplateTexture(dev, def) {
+  const fw = RACK_W + 2, fh = def.uh * U - 0.18;
+  const W = 1024, H = Math.max(64, Math.round(W * fh / fw));
+  const c = document.createElement('canvas'); c.width = W; c.height = H;
+  const g = c.getContext('2d');
+  const px = v => (v + fw / 2) / fw * W;
+  const py = v => (fh / 2 - v) / fh * H;
+  // brushed metal base
+  const cc = '#' + new THREE.Color(def.color).getHexString();
+  const grad = g.createLinearGradient(0, 0, 0, H);
+  grad.addColorStop(0, shade(cc, 1.35)); grad.addColorStop(0.5, cc); grad.addColorStop(1, shade(cc, 0.65));
+  g.fillStyle = grad; g.fillRect(0, 0, W, H);
+  g.globalAlpha = 0.06;
+  for (let i = 0; i < 70; i++) { g.fillStyle = i % 2 ? '#ffffff' : '#000000'; g.fillRect(0, Math.random() * H, W, 1); }
+  g.globalAlpha = 1;
+  // rack screws
+  g.fillStyle = '#0b0e13';
+  for (const sx of [16, W - 16]) { g.beginPath(); g.arc(sx, H / 2, 7, 0, 7); g.fill(); }
+  // ink color adapts to faceplate brightness — UniFi gear is silver
+  const lum = new THREE.Color(def.color);
+  const ink = (lum.r * 0.299 + lum.g * 0.587 + lum.b * 0.114) > 0.45
+    ? 'rgba(26,32,42,0.92)' : 'rgba(232,240,252,0.95)';
+  // brand identity: accent stripe + wordmark, readable at a glance
+  const BRAND = {
+    'Cisco & Meraki': { accent: '#049fd9', brand: 'CISCO' },
+    'Aruba / HPE': { accent: '#ff8300', brand: 'ARUBA' },
+    'Netgear': { accent: '#f7c325', brand: 'NETGEAR' },
+    'TP-Link Omada': { accent: '#00c2b3', brand: 'OMADA' },
+    'MikroTik': { accent: '#d9232e', brand: 'MikroTik' }
+  };
+  const bs = BRAND[def.cat] || (String(def.cat || '').startsWith('UniFi') ? { accent: '#4da3ff', brand: 'UniFi' } : null);
+  if (bs) {
+    g.fillStyle = bs.accent;
+    g.fillRect(30, H - Math.max(4, H * 0.05), W - 60, Math.max(3, H * 0.035)); // accent bar along the bottom
+  }
+  // port cutouts + silkscreened numbers + role ticks (jacks are real 3D geometry)
+  if (def.ports) {
+    const rows2 = def.rows === 2;
+    g.textAlign = 'center';
+    for (const p of portGrid(def)) {
+      const sfp = p.kind === 'sfp';
+      const role = portRole(def, p.port);
+      const cw = (sfp ? 0.82 : 0.64) / fw * W, chh = (sfp ? 0.54 : 0.74) / fh * H;
+      g.fillStyle = 'rgba(0,0,0,0.5)';
+      g.fillRect(px(p.x) - cw / 2, py(p.y) - chh / 2, cw, chh);
+      if (role !== 'LAN') {
+        g.fillStyle = role === 'WAN' ? '#e8a33d' : '#7c9dd8';
+        g.fillRect(px(p.x) - cw / 2, py(p.y) + (rows2 && p.y > 0 ? -chh / 2 - Math.max(2, H * 0.02) : chh / 2 + Math.max(1, H * 0.006)), cw, Math.max(2, H * 0.016));
+      }
+      g.fillStyle = ink;
+      g.font = `500 ${Math.max(9, Math.round(H * 0.085))}px -apple-system, "Segoe UI", sans-serif`;
+      const isTop = rows2 && p.y > 0;
+      g.fillText(String(p.port), px(p.x), isTop ? py(p.y) - chh / 2 - H * 0.045 : py(p.y) + chh / 2 + H * 0.09);
+    }
+    g.textAlign = 'left';
+  }
+  // drive bays (UNVR / UNAS) with latch handles
+  if (def.bays) {
+    const bx0 = 30 + ((def.display && def.display.side === 'L') ? (1.4 + def.display.w) * W / fw : 10);
+    const bx1 = W * 0.68;
+    const bw = (bx1 - bx0) / def.bays;
+    for (let i = 0; i < def.bays; i++) {
+      g.fillStyle = 'rgba(0,0,0,0.5)';
+      g.fillRect(bx0 + i * bw + 3, H * 0.16, bw - 6, H * 0.68);
+      g.fillStyle = 'rgba(255,255,255,0.16)';
+      g.fillRect(bx0 + i * bw + 8, H * 0.68, bw - 16, Math.max(2, H * 0.06));
+      g.fillStyle = '#38e07d';
+      g.fillRect(bx0 + i * bw + 8, H * 0.22, Math.max(2, W * 0.003), Math.max(3, H * 0.08));
+    }
+  }
+  // vents when there is empty faceplate area
+  if (!def.ports && !def.manager && !def.bays) {
+    g.fillStyle = 'rgba(0,0,0,0.45)';
+    for (let i = 0; i < 26; i++) g.fillRect(W * 0.3 + i * W * 0.017, H * 0.3, W * 0.006, H * 0.4);
+  }
+  // brand wordmark + device name + model — readable without hovering
+  g.textBaseline = 'middle';
+  g.fillStyle = ink;
+  const nameX = (def.display && def.display.side === 'L') ? (1.4 + def.display.w) * W / fw + 16 : 34;
+  const nameMax = def.display && def.display.side === 'L' ? 90 : 150;
+  if (bs) {
+    g.font = `700 ${Math.max(11, Math.round(H * 0.13))}px -apple-system, "Segoe UI", sans-serif`;
+    g.fillText(bs.brand, nameX, def.rows === 2 ? H * 0.2 : H * 0.14, nameMax);
+  }
+  g.font = `700 ${Math.min(34, Math.round(H * 0.26))}px -apple-system, "Segoe UI", sans-serif`;
+  g.fillText(dev.name, nameX, def.rows === 2 ? H * 0.5 : H * 0.34, nameMax);
+  g.font = `500 ${Math.max(10, Math.round(H * 0.11))}px -apple-system, "Segoe UI", sans-serif`;
+  g.globalAlpha = 0.75;
+  g.fillText(def.label, nameX, def.rows === 2 ? H * 0.8 : H * 0.54, nameMax);
+  g.globalAlpha = 1;
+  // status LED
+  g.fillStyle = '#38e07d';
+  g.beginPath(); g.arc(W - 40, H * 0.24, 5, 0, 7); g.fill();
+  const t = new THREE.CanvasTexture(c);
+  t.encoding = THREE.sRGBEncoding;
+  t.anisotropy = 8;
+  return t;
+}
+
+function makeScreenTexture(dev) {
+  const c = document.createElement('canvas');
+  c.width = 256; c.height = 128;
+  const g = c.getContext('2d');
+  const grad = g.createLinearGradient(0, 0, 0, 128);
+  grad.addColorStop(0, '#0d2246');
+  grad.addColorStop(1, '#081226');
+  g.fillStyle = grad;
+  g.fillRect(0, 0, 256, 128);
+  g.fillStyle = '#eaf2ff';
+  g.font = '700 34px -apple-system, "Segoe UI", sans-serif';
+  g.textBaseline = 'middle';
+  g.fillText(dev.name, 16, 46, 224);
+  g.fillStyle = '#7fb0ff';
+  g.font = '500 22px -apple-system, "Segoe UI", sans-serif';
+  g.fillText(dev.ip || DEVICE_TYPES[dev.type].label, 16, 88, 224);
+  const t = new THREE.CanvasTexture(c);
+  t.encoding = THREE.sRGBEncoding;
+  return t;
+}
+
+function updateDeviceFaceplate(devId) {
+  const dev = deviceById(devId);
+  const g = dev && deviceGroups.get(devId);
+  if (!g) return;
+  if (g.userData.faceMesh) {
+    const m = g.userData.faceMesh.material;
+    if (m.map) m.map.dispose();
+    m.map = makeFaceplateTexture(dev, DEVICE_TYPES[dev.type]);
+    m.needsUpdate = true;
+  }
+  if (g.userData.screenMesh) {
+    const sm = g.userData.screenMesh.material;
+    if (sm.map) sm.map.dispose();
+    const st = makeScreenTexture(dev);
+    sm.map = st;
+    sm.emissiveMap = st;
+    sm.needsUpdate = true;
+  }
+}
+
+function isPlaced(dev) {
+  const def = DEVICE_TYPES[dev.type];
+  if (def.field) return dev.mount === 'wall' || dev.x !== undefined;
+  return dev.rackId !== undefined && dev.rackId !== null;
+}
+
+function buildDeviceGroup(dev) {
+  if (!isPlaced(dev)) return null; // logical-only device from the 2D plan
+  const def = DEVICE_TYPES[dev.type];
+  const g = new THREE.Group();
+
+  if (def.field) {
+    // default mount comes from how the product actually installs
+    const mountKind = dev.mount === 'wall' ? 'wall'
+      : dev.mount === 'desk' ? 'desk'
+      : (def.mounts && !def.mounts.includes('ceiling') && def.mounts.includes('desk')) ? 'desk'
+      : 'pole';
+    const shape = def.shape || (dev.type === 'camera' ? 'bullet' : 'disc');
+    const tag = o => { o.userData = { isDeviceBody: true, deviceId: dev.id }; o.castShadow = true; return o; };
+    const white = mat(0xe9edf2, { roughness: 0.3, metalness: 0.05 });
+    const dark = mat(0x14181f, { roughness: 0.4 });
+    const lensM = mat(0x070a0f, { roughness: 0.12, metalness: 0.3 });
+    const metal = mat(0x2a313c, { metalness: 0.6, roughness: 0.45 });
+    const mkRing = () => new THREE.Mesh(new THREE.TorusGeometry(2.4, 0.15, 8, 40),
+      new THREE.MeshStandardMaterial({ color: 0x4da3ff, emissive: 0x2f7fe0, emissiveIntensity: 1.6 }));
+
+    // builds the product body facing +Z (wall orientation), centered at origin
+    function buildHead() {
+      const h = new THREE.Group();
+      if (shape === 'disc') {
+        const d = tag(new THREE.Mesh(new THREE.CylinderGeometry(4.2, 4.6, 1.5, 28), white));
+        d.rotation.x = Math.PI / 2; h.add(d);
+        const r = mkRing(); r.position.z = 0.85; h.add(r);
+      } else if (shape === 'bullet') {
+        // real G-series bullets are cylinders with a sun hood, not boxes
+        const arm = tag(new THREE.Mesh(new THREE.CylinderGeometry(0.5, 0.5, 3.5, 10), metal));
+        arm.rotation.x = Math.PI / 2; arm.position.z = 1.2; h.add(arm);
+        const body = tag(new THREE.Mesh(new THREE.CylinderGeometry(1.55, 1.7, 7, 20), white));
+        body.rotation.x = Math.PI / 2 + 0.3; body.position.set(0, -0.6, 5.2); h.add(body);
+        const hood = tag(new THREE.Mesh(new THREE.CylinderGeometry(1.85, 1.85, 2.2, 20, 1, true),
+          new THREE.MeshStandardMaterial({ color: 0xe9edf2, roughness: 0.35, side: THREE.DoubleSide })));
+        hood.rotation.x = Math.PI / 2 + 0.3; hood.position.set(0, -1.35, 7.6); h.add(hood);
+        const lens = tag(new THREE.Mesh(new THREE.CylinderGeometry(1.15, 1.35, 1, 20), lensM));
+        lens.rotation.x = Math.PI / 2 + 0.3; lens.position.set(0, -1.7, 8.3); h.add(lens);
+        const ir = new THREE.Mesh(new THREE.TorusGeometry(0.9, 0.12, 6, 20),
+          new THREE.MeshStandardMaterial({ color: 0x14181f, emissive: 0x330b0b, emissiveIntensity: 0.4 }));
+        ir.rotation.x = 0.3; ir.position.set(0, -1.78, 8.55); h.add(ir);
+      } else if (shape === 'wallap') {
+        // U7 Pro Wall / In-Wall: white rounded square panel, LED bar at bottom
+        const body = tag(new THREE.Mesh(new THREE.RoundedBoxGeometry(5.6, 5.6, 1.1, 2, 0.45), white));
+        body.position.z = 0.55; h.add(body);
+        const bar = new THREE.Mesh(new THREE.BoxGeometry(2.4, 0.16, 0.06),
+          new THREE.MeshStandardMaterial({ color: 0x4da3ff, emissive: 0x2f7fe0, emissiveIntensity: 1.6 }));
+        bar.position.set(0, -2.2, 1.13); h.add(bar);
+      } else if (shape === 'doorbellpro') {
+        // G6 Pro Entry: taller unit with camera up top and a touchscreen
+        const body = tag(new THREE.Mesh(new THREE.RoundedBoxGeometry(2.8, 7.2, 1.2, 2, 0.5), white));
+        body.position.z = 0.6; h.add(body);
+        const cam = tag(new THREE.Mesh(new THREE.CylinderGeometry(0.8, 0.8, 0.4, 16), lensM));
+        cam.rotation.x = Math.PI / 2; cam.position.set(0, 2.5, 1.25); h.add(cam);
+        const scr = new THREE.Mesh(new THREE.PlaneGeometry(2.2, 3),
+          new THREE.MeshStandardMaterial({ color: 0x0d1b33, emissive: 0x1d4a85, emissiveIntensity: 1.0, roughness: 0.15 }));
+        scr.position.set(0, -0.9, 1.22); h.add(scr);
+      } else if (shape === 'turret' || shape === 'ptz') {
+        const base = tag(new THREE.Mesh(new THREE.CylinderGeometry(2.6, 2.9, 1.2, 22), white));
+        base.rotation.x = Math.PI / 2; base.position.z = 0.6; h.add(base);
+        const ball = tag(new THREE.Mesh(new THREE.SphereGeometry(shape === 'ptz' ? 2.8 : 2.1, 20, 16), white));
+        ball.position.z = shape === 'ptz' ? 3.4 : 2.4; h.add(ball);
+        const eye = tag(new THREE.Mesh(new THREE.CylinderGeometry(0.9, 1.1, 0.8, 16), lensM));
+        eye.rotation.x = Math.PI / 2; eye.position.z = (shape === 'ptz' ? 5.6 : 4.1); h.add(eye);
+      } else if (shape === 'dome') {
+        const base = tag(new THREE.Mesh(new THREE.CylinderGeometry(2.9, 3.1, 1, 24), white));
+        base.rotation.x = Math.PI / 2; base.position.z = 0.5; h.add(base);
+        const dome = tag(new THREE.Mesh(new THREE.SphereGeometry(2.3, 20, 14, 0, Math.PI * 2, 0, Math.PI / 2),
+          new THREE.MeshPhysicalMaterial({ color: 0x0a0d12, roughness: 0.05, transparent: true, opacity: 0.85, clearcoat: 1 })));
+        dome.rotation.x = Math.PI / 2; dome.position.z = 1; h.add(dome);
+      } else if (shape === 'doorbell' || shape === 'reader') {
+        const s = shape === 'reader' ? 0.8 : 1;
+        const body = tag(new THREE.Mesh(new THREE.RoundedBoxGeometry(2.4 * s, 6 * s, 1.1, 2, 0.4), white));
+        body.position.z = 0.55; h.add(body);
+        const cam = tag(new THREE.Mesh(new THREE.CylinderGeometry(0.7 * s, 0.7 * s, 0.4, 14), lensM));
+        cam.rotation.x = Math.PI / 2; cam.position.set(0, 1.8 * s, 1.15); h.add(cam);
+        const btn = new THREE.Mesh(new THREE.CylinderGeometry(0.55 * s, 0.55 * s, 0.3, 14),
+          new THREE.MeshStandardMaterial({ color: 0x4da3ff, emissive: 0x2f7fe0, emissiveIntensity: 1.3 }));
+        btn.rotation.x = Math.PI / 2; btn.position.set(0, -1.7 * s, 1.15); h.add(btn);
+      } else if (shape === 'panel') {
+        const body = tag(new THREE.Mesh(new THREE.RoundedBoxGeometry(4.6, 7, 0.9, 2, 0.3), dark));
+        body.position.z = 0.45; h.add(body);
+        const screen = new THREE.Mesh(new THREE.PlaneGeometry(3.9, 6.1),
+          new THREE.MeshStandardMaterial({ color: 0x0d1b33, emissive: 0x16345e, emissiveIntensity: 0.9, roughness: 0.2 }));
+        screen.position.z = 0.92; h.add(screen);
+      } else if (shape === 'tower') {
+        const body = tag(new THREE.Mesh(new THREE.CylinderGeometry(2.3, 2.3, 7.5, 26), white));
+        body.position.set(0, 0, 0); h.add(body);
+        const r = mkRing(); r.rotation.x = Math.PI / 2; r.position.y = -3.4; h.add(r);
+      } else if (shape === 'table' || shape === 'workstation') {
+        // 60"×30" desk at the standard 29" working height
+        const wood = mat(0x9a7856, { roughness: 0.52, metalness: 0 });
+        const edge = mat(0x6b543c, { roughness: 0.6, metalness: 0 });
+        const legM = mat(0x2b3038, { metalness: 0.55, roughness: 0.42 });
+        const top = tag(new THREE.Mesh(new THREE.BoxGeometry(60, 1.2, 30), wood));
+        top.position.y = 29.4; h.add(top);
+        // banded edge — laminate desks always have a contrasting edge strip
+        const band = tag(new THREE.Mesh(new THREE.BoxGeometry(60.4, 0.5, 30.4), edge));
+        band.position.y = 28.7; h.add(band);
+        for (const s of [-1, 1]) {
+          // C-leg frame instead of four sticks: foot, upright, top rail
+          const foot = tag(new THREE.Mesh(new THREE.BoxGeometry(2.4, 1.4, 26), legM));
+          foot.position.set(s * 27, 0.7, 0); h.add(foot);
+          const post = tag(new THREE.Mesh(new THREE.BoxGeometry(2.2, 27, 2.6), legM));
+          post.position.set(s * 27, 14.5, 0); h.add(post);
+          const rail = tag(new THREE.Mesh(new THREE.BoxGeometry(2.2, 1.2, 24), legM));
+          rail.position.set(s * 27, 28, 0); h.add(rail);
+        }
+        // modesty panel — and the thing that hides cable drops on a real desk
+        const modesty = tag(new THREE.Mesh(new THREE.BoxGeometry(50, 11, 0.8), legM));
+        modesty.position.set(0, 21, -12.6); h.add(modesty);
+        if (shape === 'workstation') {
+          // slim-bezel monitor on a proper arm-and-foot stand
+          const bezel = tag(new THREE.Mesh(new THREE.BoxGeometry(23.5, 13.8, 0.7), mat(0x15181d, { roughness: 0.35 })));
+          bezel.position.set(0, 39.6, -8.6); h.add(bezel);
+          const scr = new THREE.Mesh(new THREE.PlaneGeometry(22.8, 13),
+            new THREE.MeshStandardMaterial({ color: 0x16375f, emissive: 0x1f5399, emissiveIntensity: 0.85, roughness: 0.18 }));
+          scr.position.set(0, 39.6, -8.22); h.add(scr);
+          const neck2 = tag(new THREE.Mesh(new THREE.BoxGeometry(1.8, 8.5, 1.6), mat(0x3c424b, { metalness: 0.5, roughness: 0.4 })));
+          neck2.position.set(0, 34.2, -9.4); h.add(neck2);
+          const foot2 = tag(new THREE.Mesh(new THREE.CylinderGeometry(4.2, 4.6, 0.7, 20), mat(0x3c424b, { metalness: 0.5, roughness: 0.4 })));
+          foot2.position.set(0, 30.3, -9.4); h.add(foot2);
+          const kb = tag(new THREE.Mesh(new THREE.BoxGeometry(17, 0.7, 5.6), mat(0x22262e, { roughness: 0.6 })));
+          kb.position.set(-1, 30.4, 2); kb.rotation.x = -0.03; h.add(kb);
+          const mouse = tag(new THREE.Mesh(new THREE.SphereGeometry(1.5, 12, 10), mat(0x22262e, { roughness: 0.55 })));
+          mouse.scale.set(0.7, 0.42, 1.1); mouse.position.set(11, 30.4, 2.4); h.add(mouse);
+          const pc = tag(new THREE.Mesh(new THREE.BoxGeometry(7, 16.5, 15.5), mat(0x1a1e26, { roughness: 0.45 })));
+          pc.position.set(-23, 8.3, 2); h.add(pc);
+        }
+      } else if (shape === 'chair') {
+        // Task chair: 5-star caster base, gas cylinder, contoured mesh back and
+        // armrests. The five-spoke base is the single most recognisable office
+        // silhouette there is — a disc on a post reads as a bar stool.
+        const fabric = mat(0x262b34, { roughness: 0.92, metalness: 0 });
+        const nylon = mat(0x1b1f26, { roughness: 0.55, metalness: 0.1 });
+        const chrome = mat(0x9aa3ad, { metalness: 0.85, roughness: 0.3 });
+        const seat = tag(new THREE.Mesh(new THREE.CylinderGeometry(9.4, 9.0, 3.2, 22), fabric));
+        seat.scale.z = 0.96; seat.position.y = 18.4; h.add(seat);
+        // back leans, as every chair does
+        const back = tag(new THREE.Mesh(new THREE.BoxGeometry(16.5, 21, 2.2), fabric));
+        back.position.set(0, 31.5, -8.4); back.rotation.x = -0.13; h.add(back);
+        const lumbar = tag(new THREE.Mesh(new THREE.CylinderGeometry(1.1, 1.1, 15, 10), nylon));
+        lumbar.rotation.z = Math.PI / 2; lumbar.position.set(0, 23.4, -7.6); h.add(lumbar);
+        for (const s of [-1, 1]) {
+          const arm = tag(new THREE.Mesh(new THREE.BoxGeometry(1.8, 1.5, 9), nylon));
+          arm.position.set(s * 9.2, 26.5, -1); h.add(arm);
+          const armPost = tag(new THREE.Mesh(new THREE.BoxGeometry(1.3, 8, 1.6), nylon));
+          armPost.position.set(s * 9.2, 22.2, -2.4); h.add(armPost);
+        }
+        const cyl = tag(new THREE.Mesh(new THREE.CylinderGeometry(1.15, 1.5, 10.5, 14), chrome));
+        cyl.position.y = 11.6; h.add(cyl);
+        const hub = tag(new THREE.Mesh(new THREE.CylinderGeometry(2.2, 2.2, 1.4, 14), nylon));
+        hub.position.y = 6.1; h.add(hub);
+        for (let i = 0; i < 5; i++) {
+          const a2 = (i / 5) * Math.PI * 2;
+          const spoke = tag(new THREE.Mesh(new THREE.BoxGeometry(11, 1.3, 2.1), nylon));
+          spoke.position.set(Math.cos(a2) * 5.5, 5.6, Math.sin(a2) * 5.5);
+          spoke.rotation.y = -a2; h.add(spoke);
+          const caster = tag(new THREE.Mesh(new THREE.CylinderGeometry(1.5, 1.5, 1, 12), nylon));
+          caster.rotation.x = Math.PI / 2;
+          caster.position.set(Math.cos(a2) * 10.6, 1.5, Math.sin(a2) * 10.6);
+          h.add(caster);
+        }
+      } else if (shape === 'pctower') {
+        const pc = tag(new THREE.Mesh(new THREE.BoxGeometry(7.5, 17, 16), mat(0x1a1e26, { roughness: 0.45 })));
+        pc.position.y = 8.5; h.add(pc);
+        const led2 = new THREE.Mesh(new THREE.CircleGeometry(0.4, 10),
+          new THREE.MeshStandardMaterial({ color: 0x4da3ff, emissive: 0x2f7fe0, emissiveIntensity: 1.4 }));
+        led2.position.set(0, 14, 8.05); h.add(led2);
+      } else if (shape === 'printer') {
+        const bd = tag(new THREE.Mesh(new THREE.BoxGeometry(26, 38, 25), mat(0xd8dbe0, { roughness: 0.5 })));
+        bd.position.y = 19; h.add(bd);
+        const tray = tag(new THREE.Mesh(new THREE.BoxGeometry(20, 1, 12), mat(0x9aa1ab)));
+        tray.position.set(0, 39, 2); h.add(tray);
+        const pnl = new THREE.Mesh(new THREE.PlaneGeometry(8, 4),
+          new THREE.MeshStandardMaterial({ color: 0x14335e, emissive: 0x1d4a85, emissiveIntensity: 0.7 }));
+        pnl.position.set(4, 36.5, 12.6); pnl.rotation.x = -0.4; h.add(pnl);
+      } else if (shape === 'tv') {
+        const bd = tag(new THREE.Mesh(new THREE.BoxGeometry(50, 29, 2.4), mat(0x0b0e13, { roughness: 0.3 })));
+        bd.position.z = 1.2; h.add(bd);
+        const scr = new THREE.Mesh(new THREE.PlaneGeometry(47.5, 26.5),
+          new THREE.MeshStandardMaterial({ color: 0x101d33, emissive: 0x16345e, emissiveIntensity: 0.7, roughness: 0.2 }));
+        scr.position.z = 2.45; h.add(scr);
+      } else if (shape === 'person') {
+        // 5'10" (70") scale reference, built on real proportions — about 7.5 head
+        // heights, 18" shoulders, legs just under half of total height. This is
+        // the object everything else in the room gets judged against, so a
+        // two-shape blob quietly makes every other dimension look wrong too.
+        const skin = mat(0xc99a72, { roughness: 0.75, metalness: 0 });
+        const shirt = mat(0x4a5a72, { roughness: 0.82, metalness: 0 });
+        const pants = mat(0x2f3742, { roughness: 0.88, metalness: 0 });
+        const shoe = mat(0x1a1d23, { roughness: 0.6, metalness: 0 });
+        const cap = (r1, r2, len, m2) => new THREE.Mesh(new THREE.CapsuleGeometry(r1, len, 6, 14), m2);
+
+        const head = tag(new THREE.Mesh(new THREE.SphereGeometry(3.9, 20, 16), skin));
+        head.scale.set(0.86, 1.08, 0.94);        // a head is not a ball
+        head.position.y = 65.2; h.add(head);
+        const neck = tag(cap(1.5, 0, 1.6, skin)); neck.position.y = 59.8; h.add(neck);
+
+        // torso: chest tapering to waist, then hips
+        const chest = tag(new THREE.Mesh(new THREE.CylinderGeometry(6.4, 5.3, 15, 18), shirt));
+        chest.scale.z = 0.62; chest.position.y = 50.5; h.add(chest);
+        const waist = tag(new THREE.Mesh(new THREE.CylinderGeometry(5.3, 5.6, 8, 18), shirt));
+        waist.scale.z = 0.66; waist.position.y = 39.5; h.add(waist);
+        const hips = tag(new THREE.Mesh(new THREE.CylinderGeometry(5.6, 5.2, 6, 18), pants));
+        hips.scale.z = 0.7; hips.position.y = 33.5; h.add(hips);
+        // shoulders squared off across the top of the chest
+        const shoulders = tag(cap(3.0, 0, 12.4, shirt));
+        shoulders.rotation.z = Math.PI / 2; shoulders.position.y = 56.4; h.add(shoulders);
+
+        for (const s of [-1, 1]) {
+          const upper = tag(cap(1.75, 0, 10.5, shirt));
+          upper.position.set(s * 8.1, 50.4, 0); upper.rotation.z = s * 0.07; h.add(upper);
+          const fore = tag(cap(1.5, 0, 10, skin));
+          fore.position.set(s * 8.9, 39.4, 0.4); fore.rotation.z = s * 0.05; h.add(fore);
+          const hand = tag(new THREE.Mesh(new THREE.SphereGeometry(1.6, 12, 10), skin));
+          hand.scale.set(0.75, 1.15, 0.5); hand.position.set(s * 9.3, 32.6, 0.6); h.add(hand);
+          // legs: thigh and calf are separate, and the gap between them is most
+          // of what makes a figure read as a person at a glance
+          const thigh = tag(cap(2.55, 0, 13.5, pants));
+          thigh.position.set(s * 2.9, 24.5, 0); h.add(thigh);
+          const calf = tag(cap(2.0, 0, 13, pants));
+          calf.position.set(s * 3.1, 9.5, 0.2); h.add(calf);
+          const foot = tag(new THREE.Mesh(new THREE.BoxGeometry(3.4, 2.2, 9.2), shoe));
+          foot.position.set(s * 3.1, 1.1, 2.1); h.add(foot);
+        }
+      } else { // 'box' / 'deskbox'
+        const body = tag(new THREE.Mesh(new THREE.RoundedBoxGeometry(6.5, shape === 'box' ? 7.5 : 1.8, shape === 'box' ? 2 : 6.5, 2, 0.3), white));
+        body.position.z = shape === 'box' ? 1 : 0; h.add(body);
+        const led = new THREE.Mesh(new THREE.CircleGeometry(0.35, 12),
+          new THREE.MeshStandardMaterial({ color: 0x4da3ff, emissive: 0x2f7fe0, emissiveIntensity: 1.5 }));
+        led.position.set(2.4, shape === 'box' ? 2.6 : 1, shape === 'box' ? 2.05 : 2.4);
+        if (shape !== 'box') led.rotation.x = -Math.PI / 2;
+        h.add(led);
+      }
+      return h;
+    }
+
+    let portPos;
+    if (mountKind === 'wall') {
+      g.position.set(dev.x, dev.y, dev.z);
+      g.rotation.y = dev.rotY || 0;
+      const bracket = tag(new THREE.Mesh(new THREE.BoxGeometry(3.2, 4.2, 0.9), metal));
+      bracket.position.z = 0.4;
+      g.add(bracket);
+      const head = buildHead();
+      head.position.z = 0.9;
+      g.add(head);
+      portPos = new THREE.Vector3(0, -3.6, 0.6);
+    } else if (mountKind === 'desk') {
+      g.position.set(dev.x, dev.y0 || 0, dev.z);
+      g.rotation.y = dev.rotY || 0;
+      const head = buildHead();
+      if (shape === 'tower') head.position.y = 3.8;
+      else if (shape === 'box') { head.rotation.x = -Math.PI / 2; head.position.y = 2.2; }
+      else if (FLOOR_SHAPES.has(shape)) head.position.y = 0;
+      else head.position.y = 1;
+      g.add(head);
+      if (shape === 'workstation') portPos = new THREE.Vector3(-24, 8, -6);
+      else if (shape === 'pctower') portPos = new THREE.Vector3(0, 8, -8.3);
+      else if (shape === 'printer') portPos = new THREE.Vector3(0, 10, -12.8);
+      else portPos = new THREE.Vector3(0, 1.2, shape === 'tower' ? -2.5 : -3.4);
+    } else {
+      // ceiling-height pole mount
+      const poleH = def.mountH || 96;
+      g.position.set(dev.x, dev.y0 || 0, dev.z);
+      const pole = tag(new THREE.Mesh(new THREE.CylinderGeometry(0.5, 0.5, poleH, 10), metal));
+      pole.position.y = poleH / 2;
+      g.add(pole);
+      const base = tag(new THREE.Mesh(new THREE.CylinderGeometry(3, 3.8, 1, 18), mat(0x20262f, { metalness: 0.6, roughness: 0.4 })));
+      base.position.y = 0.5;
+      g.add(base);
+      const head = buildHead();
+      if (shape === 'disc') { head.rotation.x = -Math.PI / 2; head.position.y = poleH + 0.8; }
+      else { head.rotation.x = Math.PI / 2.6; head.position.y = poleH - 0.5; }
+      g.add(head);
+      portPos = new THREE.Vector3(0, poleH - 3, 0.75);
+    }
+    if (def.ports) {
+      const pm = new THREE.Mesh(new THREE.BoxGeometry(0.7, 0.6, 0.5), mat(0x0a0c10, { roughness: 0.4 }));
+      pm.position.copy(portPos);
+      pm.userData = { isPort: true, deviceId: dev.id, port: 1, side: FRONT };
+      g.add(pm); portMeshes.push(pm);
+    }
+    scene.add(g);
+    deviceGroups.set(dev.id, g);
+    refreshPortTints();
+    return g;
+  }
+
+  const rackG = rackGroups.get(dev.rackId);
+
+  if (def.vertical) {
+    // Vertical cable manager mounted on the side of the rack
+    const h = RACK_UNITS * U;
+    const body = new THREE.Mesh(new THREE.BoxGeometry(3.2, h, 6), mat(def.color, { roughness: 0.85 }));
+    body.castShadow = true;
+    body.userData = { isManager: true, deviceId: dev.id, isDeviceBody: true };
+    g.add(body); managerMeshes.push(body);
+    // finger slots
+    for (let i = 0; i < 14; i++) {
+      const fin = new THREE.Mesh(new THREE.BoxGeometry(3.4, 0.5, 6.2), mat(0x0c0e12));
+      fin.position.y = -h / 2 + (i + 0.5) * (h / 14);
+      g.add(fin);
+    }
+    const sideX = (dev.side === 'L' ? -1 : 1) * (RACK_OUTER_W / 2 + 1.8);
+    g.position.set(sideX, RACK_BASE + h / 2, RACK_D / 2 - 3);
+  } else {
+    const h = def.uh * U - 0.18;
+    const body = new THREE.Mesh(new THREE.BoxGeometry(RACK_W, h, def.depth), mat(def.color));
+    body.position.z = -def.depth / 2 + 0.5;
+    body.castShadow = true;
+    body.userData = { isDeviceBody: true, deviceId: dev.id, isManager: !!def.manager };
+    g.add(body);
+    if (def.manager) managerMeshes.push(body);
+
+    // faceplate with painted label, bezels, vents
+    const face = new THREE.Mesh(
+      new THREE.RoundedBoxGeometry(RACK_W + 2, h, 0.55, 2, 0.12),
+      new THREE.MeshStandardMaterial({
+        map: makeFaceplateTexture(dev, def), roughness: 0.42, metalness: 0.45, envMapIntensity: 1.0
+      })
+    );
+    face.position.z = 0.7;
+    face.castShadow = true;
+    face.userData = { isDeviceBody: true, deviceId: dev.id, isManager: !!def.manager };
+    g.add(face);
+    g.userData.faceMesh = face;
+
+    // per-SKU front display — and like the real thing, it SHOWS the device's
+    // name and IP, so you know what it is from across the room
+    if (def.display) {
+      const dw = def.display.w, dh2 = def.display.h;
+      const dx = def.display.side === 'L'
+        ? -(RACK_W + 2) / 2 + 1.1 + dw / 2
+        : (RACK_W + 2) / 2 - 1.1 - dw / 2;
+      const st = makeScreenTexture(dev);
+      const screen = new THREE.Mesh(
+        new THREE.BoxGeometry(dw, dh2, 0.06),
+        new THREE.MeshStandardMaterial({
+          map: st, emissiveMap: st, emissive: 0xffffff, emissiveIntensity: 0.6,
+          color: 0xffffff, roughness: 0.15, metalness: 0.1
+        }));
+      screen.position.set(dx, 0, 1.0);
+      screen.userData = { isDeviceBody: true, deviceId: dev.id };
+      g.userData.screenMesh = screen;
+      g.add(screen);
+    }
+    if (def.manager) {
+      managerMeshes.push(face);
+      // finger ducts on horizontal managers
+      for (let i = 0; i < 10; i++) {
+        const fin = new THREE.Mesh(new THREE.BoxGeometry(1.1, h + 0.7, 1.6), mat(0x0c0e12));
+        fin.position.set(-RACK_W / 2 + 1.5 + i * (RACK_W - 3) / 9, 0, 1.4);
+        g.add(fin);
+      }
+    }
+
+    // ports
+    // real modeled jacks: metal bezel, recessed opening, gold contacts, link LED
+    const rows2 = def.rows === 2;
+    const MAT_BEZEL = mat(0x9299a2, { metalness: 0.75, roughness: 0.35 });
+    const MAT_SFP_BEZEL = mat(0x6b7480, { metalness: 0.85, roughness: 0.3 });
+    for (const p of portGrid(def)) {
+      const sfp = p.kind === 'sfp';
+      const bezel = new THREE.Mesh(sfp ? GEO_SFP_BEZEL : GEO_RJ_BEZEL, sfp ? MAT_SFP_BEZEL : MAT_BEZEL);
+      bezel.position.set(p.x, p.y, 0.99);
+      g.add(bezel);
+      const jack = new THREE.Mesh(sfp ? GEO_SFP_HIT : GEO_RJ_HIT, mat(0x07090d, { roughness: 0.3 }));
+      jack.position.set(p.x, p.y, 1.05);
+      jack.userData = { isPort: true, deviceId: dev.id, port: p.port, side: FRONT };
+      g.add(jack); portMeshes.push(jack);
+      if (!sfp) {
+        const gold = new THREE.Mesh(GEO_GOLD, mat(0xc9a227, { metalness: 1, roughness: 0.3 }));
+        gold.position.set(p.x, p.y + 0.16, 1.14);
+        g.add(gold);
+      }
+      // Patch panels are passive copper — no PHY, so no link LEDs. Painting them
+      // with lit ports is the tell that gives away a fake rack elevation.
+      if (!def.passthrough) {
+        const led = new THREE.Mesh(GEO_LED, mat(0x141a20, { roughness: 0.4 }));
+        const topRow = rows2 && p.y > 0;
+        led.position.set(p.x - (sfp ? 0.3 : 0.22), p.y + ((topRow || !rows2) ? 0.42 : -0.42), 1.04);
+        led.userData = { portLed: true, deviceId: dev.id, port: p.port, side: FRONT };
+        g.add(led); portLeds.push(led);
+      }
+    }
+
+    // ---- rear panel: no blank backs ----
+    const rearZ = 0.5 - def.depth;
+    const metalDark = mat(0x171a1f, { roughness: 0.5, metalness: 0.55 });
+    if (!def.manager) {
+      const plate = new THREE.Mesh(new THREE.BoxGeometry(RACK_W, h, 0.12), metalDark);
+      plate.position.z = rearZ + 0.06;
+      plate.userData = { isDeviceBody: true, deviceId: dev.id };
+      g.add(plate);
+    }
+    if (def.passthrough) {
+      // patch panel rear: the keystone punchdown row — rear cables land here
+      for (const p of portGrid(def)) {
+        const bz = new THREE.Mesh(GEO_RJ_BEZEL, mat(0x3a4148, { roughness: 0.5 }));
+        bz.position.set(p.x, p.y, rearZ - 0.02);
+        g.add(bz);
+        const jk = new THREE.Mesh(GEO_RJ_HIT, mat(0x07090d, { roughness: 0.3 }));
+        jk.position.set(p.x, p.y, rearZ - 0.08);
+        jk.userData = { isPort: true, deviceId: dev.id, port: p.port, outward: -1, side: REAR };
+        g.add(jk); portMeshes.push(jk);
+      }
+    } else if (!def.manager) {
+      if (def.powerDevice && def.outlets) {
+        // UPS / PDU rear: bank of IEC outlets, each a live power port
+        const n = def.outlets, ow = 1.35;
+        for (let i = 0; i < n; i++) {
+          const ox = -((n - 1) / 2) * (ow + 0.5) + i * (ow + 0.5);
+          const frame = new THREE.Mesh(new THREE.BoxGeometry(ow, 1.05, 0.14), mat(0x22262c, { roughness: 0.5 }));
+          frame.position.set(ox, 0, rearZ - 0.05);
+          g.add(frame);
+          const sock = new THREE.Mesh(new THREE.BoxGeometry(0.95, 0.75, 0.24), mat(0x05070a, { roughness: 0.35 }));
+          sock.position.set(ox, 0, rearZ - 0.1);
+          sock.userData = { isPort: true, deviceId: dev.id, port: i + 1, outward: -1, side: REAR };
+          g.add(sock); portMeshes.push(sock);
+        }
+        const breaker = new THREE.Mesh(new THREE.BoxGeometry(1.2, 0.9, 0.3), mat(0x8f959d, { metalness: 0.6, roughness: 0.4 }));
+        breaker.position.set(RACK_W / 2 - 1.6, 0, rearZ - 0.12);
+        g.add(breaker);
+      } else {
+        // IEC C14 power inlet — a real connectable port (cable it to a UPS/PDU)
+        const inletX = RACK_W / 2 - 1.9;
+        const inlet = new THREE.Mesh(new THREE.BoxGeometry(1.35, 1.0, 0.2), mat(0x0a0c10, { roughness: 0.4 }));
+        inlet.position.set(inletX, 0, rearZ - 0.08);
+        inlet.userData = { isPort: true, deviceId: dev.id, port: 'PWR', outward: -1, side: REAR };
+        g.add(inlet); portMeshes.push(inlet);
+        const inletFrame = new THREE.Mesh(new THREE.BoxGeometry(1.6, 1.25, 0.1), metalDark);
+        inletFrame.position.set(inletX, 0, rearZ - 0.03);
+        g.add(inletFrame);
+        for (let pin = 0; pin < 3; pin++) {
+          const pn = new THREE.Mesh(new THREE.BoxGeometry(0.08, 0.26, 0.1), mat(0x8f959d, { metalness: 0.9, roughness: 0.3 }));
+          pn.position.set(inletX - 0.3 + pin * 0.3, pin === 1 ? 0.14 : -0.08, rearZ - 0.16);
+          g.add(pn);
+        }
+        // fan grille(s)
+        const fans = def.uh >= 2 ? 2 : 1;
+        for (let f = 0; f < fans; f++) {
+          const fx = -RACK_W / 2 + 2.6 + f * 3.4;
+          const ring = new THREE.Mesh(new THREE.TorusGeometry(h * 0.32, 0.09, 6, 24), mat(0x2b3038, { metalness: 0.6, roughness: 0.4 }));
+          ring.position.set(fx, 0, rearZ - 0.06);
+          g.add(ring);
+          const hub = new THREE.Mesh(new THREE.CylinderGeometry(h * 0.3, h * 0.3, 0.1, 20), mat(0x05070a, { roughness: 0.6 }));
+          hub.rotation.x = Math.PI / 2;
+          hub.position.set(fx, 0, rearZ + 0.02);
+          g.add(hub);
+          for (let s = 0; s < 3; s++) {
+            const spoke = new THREE.Mesh(new THREE.BoxGeometry(h * 0.6, 0.07, 0.06), mat(0x2b3038, { metalness: 0.5 }));
+            spoke.rotation.z = s * Math.PI / 3;
+            spoke.position.set(fx, 0, rearZ - 0.04);
+            g.add(spoke);
+          }
+        }
+        // vent slots + serial label
+        for (let v = 0; v < 6; v++) {
+          const slot = new THREE.Mesh(new THREE.BoxGeometry(0.14, h * 0.55, 0.06), mat(0x05070a));
+          slot.position.set(1.2 + v * 0.42, 0, rearZ - 0.03);
+          g.add(slot);
+        }
+        const label2 = new THREE.Mesh(new THREE.BoxGeometry(1.7, 0.7, 0.03), mat(0xd8dbe0, { roughness: 0.8 }));
+        label2.position.set(4.6, -h * 0.18, rearZ - 0.03);
+        g.add(label2);
+      }
+    }
+
+    g.position.set(0, RACK_BASE + (dev.u - 1) * U + (def.uh * U) / 2, RACK_D / 2 - 1);
+  }
+
+  rackG.add(g);
+  deviceGroups.set(dev.id, g);
+  refreshPortTints();
+  collidersDirty = true;
+  return g;
+}
+
+//////////////////// Cables ////////////////////
+
+// A cable endpoint is (device, port number, side) — not just (device, port).
+// Patch panels are why: port 7 exists twice, as the front RJ45 you patch into and
+// as the rear punchdown the permanent run terminates on, and those are different
+// places in space. Without a side, traverse() simply kept whichever mesh was added
+// last — the rear — so every front patch cable silently jumped to the back of the
+// panel. Sides also give each face its own capacity, which is what makes a patch
+// panel behave like a real 1:1 passthrough instead of a 2-cable port.
+const FRONT = 'front', REAR = 'rear';
+function epSide(ep) { return ep && ep.side === REAR ? REAR : FRONT; }
+function meshSide(o) { return (o.userData && o.userData.side) || FRONT; }
+
+function getPortWorld(deviceId, port, side) {
+  const g = deviceGroups.get(deviceId);
+  if (!g) return null;
+  const want = side === REAR ? REAR : FRONT;
+  let mesh = null, fallback = null;
+  g.traverse(o => {
+    const u = o.userData;
+    if (!u || !u.isPort || u.port !== port) return;
+    if (meshSide(o) === want) { if (!mesh) mesh = o; }
+    else if (!fallback) fallback = o;
+  });
+  // gear that only exposes the port on one face (UPS outlets, rear power inlets)
+  mesh = mesh || fallback;
+  if (!mesh) return null;
+  const pos = new THREE.Vector3();
+  mesh.getWorldPosition(pos);
+  const normal = new THREE.Vector3(0, 0, 1);
+  const q = new THREE.Quaternion();
+  g.getWorldQuaternion(q);
+  normal.applyQuaternion(q);
+  if (mesh.userData.outward === -1) normal.negate(); // rear-panel ports exit backwards
+  return { pos, normal };
+}
+
+// ---- Cat6 cable geometry (true to spec) ----
+// Real Cat6 outer jacket ≈ 0.23" Ø → 0.115" radius. A hair thicker reads better
+// on screen without looking like garden hose.
+const CABLE_R = 0.125;
+const CABLE_RADIAL = 12;          // round cross-section, no visible facets
+const CONN_LEN = 1.05;            // molded RJ45 plug + strain-relief boot
+const _cv = new THREE.Vector3();
+
+function ensureColliders() { if (collidersDirty) rebuildRopeColliders(); }
+
+function cablePorts(cable) {
+  const a = getPortWorld(cable.a.deviceId, cable.a.port, epSide(cable.a));
+  const b = getPortWorld(cable.b.deviceId, cable.b.port, epSide(cable.b));
+  return (a && b) ? { a, b } : null;
+}
+
+function isPowerPort(deviceId, port) {
+  if (port === 'PWR') return true;
+  const d = deviceById(deviceId);
+  return !!(d && DEVICE_TYPES[d.type].powerDevice);
+}
+
+// Guide → dense even polyline, remembering which samples are hard supports
+// (the two connector lead-outs at each end + every routed waypoint). Supports
+// get pinned so the cable leaves each jack dead-straight through its boot and is
+// held wherever the tech routed it.
+function resampleGuide(guide) {
+  const pts = [guide[0].clone()];
+  const pins = new Set([0]);
+  for (let s = 0; s < guide.length - 1; s++) {
+    const p0 = guide[s], p1 = guide[s + 1];
+    const steps = Math.max(2, Math.round(p0.distanceTo(p1) / 3));
+    for (let k = 1; k <= steps; k++) pts.push(p0.clone().lerp(p1, k / steps));
+    pins.add(pts.length - 1);
+  }
+  return { pts, pins };
+}
+
+// ---- cable-vs-cable separation ----
+// Two jackets cannot occupy the same space. The settled polyline of every cable
+// is kept here so each new route can be pushed clear of the ones already run —
+// which is what turns a pile of intersecting lines into a bundle a tech can
+// actually trace by eye.
+const cableRoutes = new Map();                 // cableId -> settled points
+const CABLE_SEP = CABLE_R * 2 + 0.06;          // jackets touch, never merge
+const _sep = new THREE.Vector3();
+
+function buildRouteHash(excludeId) {
+  const cell = CABLE_SEP * 2;
+  const map = new Map();
+  for (const [id, pts] of cableRoutes) {
+    if (id === excludeId) continue;
+    for (const p of pts) {
+      const k = `${Math.floor(p.x / cell)},${Math.floor(p.y / cell)},${Math.floor(p.z / cell)}`;
+      let a = map.get(k);
+      if (!a) map.set(k, a = []);
+      a.push(p);
+    }
+  }
+  return { map, cell };
+}
+
+// Push one sample out of every other cable's jacket. Only our own points move —
+// routes already laid stay put, so results are stable and order-deterministic.
+function separateFromRoutes(p, hash) {
+  const { map, cell } = hash;
+  const bx = Math.floor(p.x / cell), by = Math.floor(p.y / cell), bz = Math.floor(p.z / cell);
+  for (let dx = -1; dx <= 1; dx++) {
+    for (let dy = -1; dy <= 1; dy++) {
+      for (let dz = -1; dz <= 1; dz++) {
+        const a = map.get(`${bx + dx},${by + dy},${bz + dz}`);
+        if (!a) continue;
+        for (const q of a) {
+          _sep.subVectors(p, q);
+          const d = _sep.length();
+          if (d >= CABLE_SEP) continue;
+          // exactly coincident: nudge along a fixed axis so the push is defined
+          if (d < 1e-4) _sep.set(0.001, CABLE_SEP, 0); else _sep.multiplyScalar((CABLE_SEP - d) / d);
+          p.add(_sep);
+        }
+      }
+    }
+  }
+}
+
+// ---- cable ties ----
+// A real tie cinches its cables into one packed bundle and holds them there,
+// permanently, whether or not anything is moving. The old implementation only
+// existed inside the physics loop, so with physics off (the default) placing a
+// tie drew a strap and changed nothing — the cables carried on running wherever
+// they liked straight through the band. Ties are a routing constraint first and
+// a physics constraint second.
+
+// Cables in a strap pack hexagonally. Radius of a bundle of n jackets, plus the
+// strap's own thickness — this is what a real bundle's diameter actually is, so
+// it drives both the geometry and the band we draw around it.
+function bundleRadius(n) {
+  return CABLE_R * (1 + 1.08 * Math.sqrt(Math.max(1, n) - 1)) + 0.06;
+}
+
+// Deterministic hex-ish packing slot for member i of n, in the plane normal to
+// the run. Deterministic ordering matters: the same cable must land in the same
+// slot on every rebuild or the bundle shuffles every time you touch the scene.
+function bundleSlot(i, n) {
+  if (n <= 1) return [0, 0];
+  if (n <= 7) {                                  // centre + one ring of six
+    if (i === 0) return [0, 0];
+    const a = ((i - 1) / Math.min(n - 1, 6)) * Math.PI * 2;
+    const r = CABLE_R * 2.05;
+    return [Math.cos(a) * r, Math.sin(a) * r];
+  }
+  // larger bundles: concentric rings, each holding ~6r/CABLE_R cables
+  let idx = i, ring = 0, cap = 1;
+  while (idx >= cap) { idx -= cap; ring++; cap = ring * 6; }
+  const a = (idx / cap) * Math.PI * 2;
+  const r = CABLE_R * 2.05 * ring;
+  return [Math.cos(a) * r, Math.sin(a) * r];
+}
+
+// Every tie this cable belongs to, resolved to a world target for its slot.
+function tieTargetsFor(cableId) {
+  const out = [];
+  for (const tie of state.ties || []) {
+    if (!tie.members) continue;
+    const order = tie.members.map(m => m.cableId).slice().sort();  // stable slots
+    const idx = order.indexOf(cableId);
+    if (idx < 0) continue;
+    const centre = new THREE.Vector3(tie.x, tie.y, tie.z);
+    const tan = new THREE.Vector3(tie.tx || 1, tie.ty || 0, tie.tz || 0).normalize();
+    // any two vectors perpendicular to the run give the packing plane
+    const u = new THREE.Vector3(0, 1, 0);
+    if (Math.abs(tan.dot(u)) > 0.9) u.set(1, 0, 0);
+    const ax = new THREE.Vector3().crossVectors(tan, u).normalize();
+    const ay = new THREE.Vector3().crossVectors(tan, ax).normalize();
+    const [sx, sy] = bundleSlot(idx, order.length);
+    out.push({
+      tieId: tie.id,
+      pos: centre.clone().addScaledVector(ax, sx).addScaledVector(ay, sy),
+      centre
+    });
+  }
+  return out;
+}
+
+// Deterministic settle: analytic catenary-style droop between supports, then a
+// few relaxation passes that push every free sample out of walls / racks / gear
+// and away from other cables, smoothing kinks as it goes. No simulation, no
+// jitter — same collider set the live physics uses, so a static cable and a
+// physics cable agree and neither clips.
+function settleCable(pts, pins, cable) {
+  const N = pts.length;
+  if (N < 3) return;
+  const slack = (cable.slack === undefined ? 2 : cable.slack) / 100;
+  const supports = [...pins].sort((a, b) => a - b);
+  for (let s = 0; s < supports.length - 1; s++) {
+    const i0 = supports[s], i1 = supports[s + 1];
+    if (i1 - i0 < 2) continue;
+    const p0 = pts[i0], p1 = pts[i1];
+    const run = Math.hypot(p1.x - p0.x, p1.z - p0.z);
+    const rise = Math.abs(p1.y - p0.y);
+    const horiz = run / (run + rise + 1e-3);          // vertical drops don't belly
+    const depth = Math.min(run * (0.03 + slack * 0.55), 9) * horiz;
+    if (depth < 0.02) continue;
+    for (let i = i0 + 1; i < i1; i++) {
+      const f = (i - i0) / (i1 - i0);
+      pts[i].y -= 4 * f * (1 - f) * depth;            // parabolic hang
+    }
+  }
+  ensureColliders();
+  const hash = buildRouteHash(cable.id);
+
+  // Claim the sample nearest each tie and hold it in that tie's packing slot.
+  // Neighbours within a few samples get drawn in proportionally so the cable
+  // funnels into the strap and back out, rather than kinking at a single point.
+  const ties = tieTargetsFor(cable.id);
+  const tied = new Map();                              // sample index -> target
+  for (const t of ties) {
+    let best = -1, bd = Infinity;
+    for (let i = 1; i < N - 1; i++) {
+      const d = pts[i].distanceToSquared(t.centre);
+      if (d < bd) { bd = d; best = i; }
+    }
+    if (best >= 0) tied.set(best, t.pos);
+  }
+  const applyTies = () => {
+    for (const [i, target] of tied) {
+      pts[i].copy(target);
+      for (let k = 1; k <= 3; k++) {                   // funnel in and out
+        const w = 1 - k / 4;
+        for (const j of [i - k, i + k]) {
+          if (j > 0 && j < N - 1 && !pins.has(j) && !tied.has(j)) pts[j].lerp(target, w * 0.45);
+        }
+      }
+    }
+  };
+
+  for (let it = 0; it < 10; it++) {
+    for (let i = 1; i < N - 1; i++) {
+      if (pins.has(i) || tied.has(i)) continue;
+      _cv.copy(pts[i - 1]).add(pts[i + 1]).multiplyScalar(0.5);
+      pts[i].lerp(_cv, 0.12);                          // relax kinks (min bend radius)
+      if (pts[i].y < CABLE_R) pts[i].y = CABLE_R;
+    }
+    for (let i = 1; i < N - 1; i++) {
+      // Interior pins are waypoints — a cable manager finger or a wall bore that
+      // several runs share. Those must be allowed to shift a fraction of an inch
+      // sideways, or ten cables through one manager all stack on the exact same
+      // coordinate. Only the two port pins are truly immovable.
+      //
+      // Tied samples are exempt from separation outright: inside a strap the
+      // cables are *supposed* to be touching, and the generic keep-apart rule
+      // would fight the tie forever and win.
+      if (!tied.has(i)) separateFromRoutes(pts[i], hash);
+      if (!pins.has(i) && !tied.has(i)) collidePoint(pts[i]);
+    }
+    applyTies();                                       // the strap has the last word
+  }
+  cableRoutes.set(cable.id, pts.map(p => p.clone()));
+}
+
+// Horizontal runs do not fly diagonally across a room — nobody pulls cable that
+// way and no inspector would pass it. A real run leaves the rack, climbs to the
+// plenum above the ceiling grid, crosses at that height on J-hooks or tray, and
+// drops to the device. Anything short enough to be a patch lead stays direct.
+// Returns the intermediate guide points; empty means "run it straight".
+const PLENUM_MIN_SPAN = 60;        // 5 ft — below this it's a jumper, not a run
+function plenumRoute(a, b) {
+  if (a.pos.distanceTo(b.pos) < PLENUM_MIN_SPAN) return [];
+  const mid = a.pos.clone().add(b.pos).multiplyScalar(0.5);
+  // the lowest ceiling slab spanning the midpoint sets the plenum; with no slab
+  // modeled yet, ride just under the top of the walls
+  let deck = null;
+  for (const s of state.slabs || []) {
+    const x1 = Math.min(s.x1, s.x2), x2 = Math.max(s.x1, s.x2);
+    const z1 = Math.min(s.z1, s.z2), z2 = Math.max(s.z1, s.z2);
+    if (mid.x < x1 || mid.x > x2 || mid.z < z1 || mid.z > z2) continue;
+    const bottom = s.y - 6;
+    if (deck === null || bottom < deck) deck = bottom;
+  }
+  const y = (deck !== null ? deck : WALL_H) - 4;
+  // both ends already up at height? then a straight cross is the real path
+  if (y <= Math.max(a.pos.y, b.pos.y) + 3) return [];
+  return [
+    new THREE.Vector3(a.pos.x, y, a.pos.z),
+    new THREE.Vector3(b.pos.x, y, b.pos.z)
+  ];
+}
+
+function cableCurve(cable) {
+  const ep = cablePorts(cable);
+  if (!ep) return null;
+  const { a, b } = ep;
+  const span = a.pos.distanceTo(b.pos);
+  // lead-out clears the connector boot but shrinks on short jumpers so adjacent
+  // switch↔patch runs make a clean staple instead of overshooting into a loop.
+  const lead = Math.min(2.6, Math.max(CONN_LEN, span * 0.32));
+  const guide = [a.pos.clone(), a.pos.clone().addScaledVector(a.normal, lead)];
+  // hand-placed waypoints always win — auto-routing only fills in the default
+  if (cable.waypoints.length) {
+    for (const w of cable.waypoints) guide.push(new THREE.Vector3(w.x, w.y, w.z));
+  } else if (cable.autoRoute !== false) {
+    for (const w of plenumRoute(a, b)) guide.push(w);
+  }
+  // Short same-facing direct jumper (switch↔patch sandwich): give it the little
+  // forward-and-down service loop a real slack patch cable makes, instead of a
+  // cramped boot-to-boot stub.
+  if (cable.waypoints.length === 0 && span < 16 && a.normal.dot(b.normal) > 0.55) {
+    const mid = a.pos.clone().add(b.pos).multiplyScalar(0.5);
+    const outN = a.normal.clone().add(b.normal).normalize();
+    mid.addScaledVector(outN, Math.max(1.6, span * 0.42));
+    mid.y -= Math.min(span * 0.5, 2.4);
+    guide.push(mid);
+  }
+  guide.push(b.pos.clone().addScaledVector(b.normal, lead), b.pos.clone());
+  const { pts, pins } = resampleGuide(guide);
+  settleCable(pts, pins, cable);
+  // centripetal Catmull-Rom never cusps or self-loops on uneven spacing —
+  // this is what kills the old glitchy short-cable knots.
+  return new THREE.CatmullRomCurve3(pts, false, 'centripetal', 0.5);
+}
+
+// Molded RJ45 plug (frosty polycarbonate) + colored strain-relief boot, aimed
+// down the port normal so it sits plugged into the jack 1:1.
+function buildConnector(port, color, isPower) {
+  const g = new THREE.Group();
+  g.position.copy(port.pos);
+  g.quaternion.setFromUnitVectors(new THREE.Vector3(0, 0, 1), port.normal.clone().normalize());
+  if (isPower) {
+    const body = new THREE.Mesh(new THREE.RoundedBoxGeometry(0.66, 0.52, 0.95, 2, 0.06),
+      new THREE.MeshStandardMaterial({ color: 0x0b0d10, roughness: 0.62, metalness: 0.12 }));
+    body.position.z = 0.42;
+    g.add(body);
+  } else {
+    const plug = new THREE.Mesh(new THREE.RoundedBoxGeometry(0.5, 0.42, 0.64, 2, 0.05),
+      new THREE.MeshPhysicalMaterial({
+        color: 0xe9eff3, roughness: 0.16, metalness: 0,
+        clearcoat: 1, clearcoatRoughness: 0.12, transparent: true, opacity: 0.7, envMapIntensity: 1
+      }));
+    plug.position.z = 0.29;                            // front edge nudged into the jack
+    g.add(plug);
+    // 8 gold contacts through the clear housing, and the latch tab angled back
+    // over the boot — the two details that say "RJ45" the instant you zoom in.
+    const gold = new THREE.MeshStandardMaterial({ color: 0xd4af37, metalness: 1, roughness: 0.28 });
+    const pinGeo = new THREE.BoxGeometry(0.035, 0.012, 0.3);
+    for (let i = 0; i < 8; i++) {
+      const pin = new THREE.Mesh(pinGeo, gold);
+      pin.position.set(-0.157 + i * 0.045, 0.2, 0.2);
+      g.add(pin);
+    }
+    const latch = new THREE.Mesh(new THREE.BoxGeometry(0.2, 0.05, 0.42),
+      new THREE.MeshPhysicalMaterial({
+        color: 0xe9eff3, roughness: 0.16, metalness: 0,
+        clearcoat: 1, transparent: true, opacity: 0.7
+      }));
+    latch.position.set(0, -0.25, 0.52);
+    latch.rotation.x = -0.42;                          // springs up away from the body
+    g.add(latch);
+    const boot = new THREE.Mesh(new THREE.CylinderGeometry(0.15, 0.25, 0.52, 14),
+      new THREE.MeshStandardMaterial({ color, roughness: 0.5, metalness: 0 }));
+    boot.rotation.x = Math.PI / 2;
+    boot.position.z = 0.72;                            // slips over the plug tail
+    g.add(boot);
+  }
+  g.traverse(o => { o.castShadow = true; });
+  return g;
+}
+
+function buildCableMesh(cable) {
+  const curve = cableCurve(cable);
+  if (!curve) return;
+  const pts = curve.points;
+  const segs = Math.max(24, Math.min(240, pts.length * 3));
+  const geo = new THREE.TubeGeometry(curve, segs, CABLE_R, CABLE_RADIAL, false);
+  const col = new THREE.Color(cable.color);
+  // PVC jacket: matte-satin, faint sheen — not the wet-noodle clearcoat it was.
+  const m = new THREE.Mesh(geo, new THREE.MeshPhysicalMaterial({
+    color: col, roughness: 0.52, metalness: 0,
+    clearcoat: 0.16, clearcoatRoughness: 0.5,
+    sheen: 0.35, sheenColor: col.clone().multiplyScalar(0.5), sheenRoughness: 0.85,
+    envMapIntensity: 0.7
+  }));
+  m.castShadow = true;
+  m.userData = { isCable: true, cableId: cable.id, curve };
+  const ep = cablePorts(cable);
+  if (ep) {
+    m.add(buildConnector(ep.a, col, isPowerPort(cable.a.deviceId, cable.a.port)));
+    m.add(buildConnector(ep.b, col, isPowerPort(cable.b.deviceId, cable.b.port)));
+  }
+  scene.add(m);
+  cableMeshes.set(cable.id, m);
+  cable.lengthIn = curve.getLength();
+  refreshPortTints();
+}
+
+// Every material/geometry under a cable mesh is unique (no shared cache) so the
+// whole subtree can be disposed safely.
+function disposeCableObj(m) {
+  scene.remove(m);
+  m.traverse(o => {
+    if (o.geometry) o.geometry.dispose();
+    if (o.material) (Array.isArray(o.material) ? o.material : [o.material]).forEach(x => x.dispose && x.dispose());
+  });
+}
+
+function rebuildCable(cable) {
+  const old = cableMeshes.get(cable.id);
+  if (old) { disposeCableObj(old); cableMeshes.delete(cable.id); }
+  buildCableMesh(cable);
+}
+
+// Structural edits (a drilled hole, a new/removed wall or slab) change what
+// cables must avoid. Re-settle every existing cable so routes stay 1:1 with the
+// building — coalesced to one pass per tick so a 4-wall room is one reroute, and
+// skipped entirely during bulk load (cables are built last, already correct).
+// Two passes: the first lays each cable clear of the ones before it, the second
+// lets the early cables see the late ones, so separation ends up mutual instead
+// of "whoever was routed last has to dodge everybody".
+let _rerouteQueued = false;
+function rerouteAll() {
+  collidersDirty = true;
+  for (let pass = 0; pass < 2; pass++) {
+    for (const c of state.cables) rebuildCable(c);
+  }
+  if (physOn) for (const c of state.cables) buildRope(c);
+}
+function scheduleReroute() {
+  collidersDirty = true;
+  if (_rerouteQueued || !(state.cables && state.cables.length)) return;
+  _rerouteQueued = true;
+  Promise.resolve().then(() => {
+    _rerouteQueued = false;
+    if (!(state.cables && state.cables.length)) return;
+    rerouteAll();
+  });
+}
+
+function portLabel(dev, port) {
+  if (port === 'PWR') return 'Power inlet';
+  if (dev && DEVICE_TYPES[dev.type].powerDevice) return `Outlet ${port}`;
+  return `Port ${port}`;
+}
+
+function portRole(def, port) {
+  if (port === 'PWR') return 'PWR';
+  if (def.powerDevice) return 'PWR';
+  if (def.roleMap && def.roleMap[port]) return def.roleMap[port]; // per-SKU truth
+  if (def.wan && port <= def.wan) return 'WAN';
+  if (def.sfp && def.ports && port > def.ports - def.sfp) return 'SFP+';
+  return 'LAN';
+}
+
+//////////////////// Functional VLAN engine ////////////////////
+// Ports carry an untagged/access VLAN (default 1) plus optional tagged trunks.
+// Patch panels are true 1:1 passthroughs: front and rear share a port number.
+// A VLAN crosses a cable only when BOTH endpoint ports carry it.
+
+function carriedVlans(dev, port) {
+  const def = DEVICE_TYPES[dev.type];
+  if (port === 'PWR' || def.powerDevice) return new Set(); // power carries no data
+  if (def.passthrough) return 'ALL';
+  const cfg = (dev.portCfg && dev.portCfg[port]) || {};
+  const s = new Set([parseInt(cfg.vlan, 10) || 1]);
+  if (cfg.tagged) {
+    for (const t of String(cfg.tagged).split(/[\s,]+/)) {
+      const n = parseInt(t, 10);
+      if (n) s.add(n);
+    }
+  }
+  return s;
+}
+function portCarries(dev, port, v) {
+  const c = carriedVlans(dev, port);
+  return c === 'ALL' || c.has(v);
+}
+function sharedVlans(da, pa, db, pb) {
+  const A = carriedVlans(da, pa), B = carriedVlans(db, pb);
+  if (A === 'ALL' && B === 'ALL') return 'ALL';
+  if (A === 'ALL') return B;
+  if (B === 'ALL') return A;
+  return new Set([...A].filter(v => B.has(v)));
+}
+
+function traceVlan(deviceId, port, v, side) {
+  const seenPorts = new Set();   // "devId:port" — what the UI highlights
+  const seenJacks = new Set();   // "devId:port:side" — what the walk actually visits
+  const cables = new Set();
+  const devices = new Set();
+  const stack = [[deviceId, port, side === REAR ? REAR : FRONT]];
+  while (stack.length) {
+    const [dId, p, sd] = stack.pop();
+    const jack = dId + ':' + p + ':' + sd;
+    if (seenJacks.has(jack)) continue;
+    const dev = deviceById(dId);
+    if (!dev || !portCarries(dev, p, v)) continue;
+    seenJacks.add(jack);
+    seenPorts.add(dId + ':' + p);
+    devices.add(dId);
+    const def = DEVICE_TYPES[dev.type];
+    // hop across the cable plugged into this specific jack
+    for (const c of state.cables) {
+      let other = null;
+      if (c.a.deviceId === dId && c.a.port === p && epSide(c.a) === sd) other = c.b;
+      else if (c.b.deviceId === dId && c.b.port === p && epSide(c.b) === sd) other = c.a;
+      if (!other) continue;
+      const od = deviceById(other.deviceId);
+      if (od && portCarries(od, other.port, v)) {
+        cables.add(c.id);
+        stack.push([other.deviceId, other.port, epSide(other)]);
+      }
+    }
+    if (def.passthrough) {
+      // a patch port is a straight-through copper pair: front jack and rear
+      // punchdown are the same electrical circuit, and it bridges nothing else
+      stack.push([dId, p, sd === REAR ? FRONT : REAR]);
+    } else if (def.ports > 1) {
+      // switch fabric bridges every port carrying v
+      for (let q = 1; q <= def.ports; q++) {
+        if (q !== p && portCarries(dev, q, v)) stack.push([dId, q, FRONT]);
+      }
+    }
+  }
+  return { vlan: v, cables, devices, ports: seenPorts };
+}
+
+let vlanFocus = null;
+function vlanColor(v) {
+  return new THREE.Color().setHSL(((v * 47) % 360) / 360, 0.8, 0.55);
+}
+function setVlanFocus(f) {
+  vlanFocus = f;
+  for (const [id, m] of cableMeshes) {
+    const inSet = !f || f.cables.has(id);
+    m.material.transparent = !inSet;
+    m.material.opacity = inSet ? 1 : 0.07;
+    m.material.needsUpdate = true;
+  }
+  // pulses respawn with the right VLAN color
+  for (const p of pulses.values()) scene.remove(p.mesh);
+  pulses.clear();
+  refreshPortTints();
+}
+
+// `side` is optional: omit it to ask "is anything plugged into this port at all",
+// pass it to ask about one specific face of a patch panel.
+function portConnection(deviceId, port, side) {
+  const hit = (ep) => ep.deviceId === deviceId && ep.port === port &&
+    (side === undefined || epSide(ep) === side);
+  return state.cables.find(c => hit(c.a) || hit(c.b));
+}
+
+function portBaseMat(pm) {
+  // jacks stay realistically dark — the link LED carries the connection state
+  return mat(0x07090d, { roughness: 0.3 });
+}
+function refreshPortTints() {
+  for (const pm of portMeshes) {
+    if (pm === hoverPort && PORT_GLOW) { pm.material = PORT_GLOW; continue; }
+    if (vlanFocus && vlanFocus.ports.has(pm.userData.deviceId + ':' + pm.userData.port)) {
+      const vc = vlanColor(vlanFocus.vlan);
+      pm.material = mat(vc.getHex(), { emissive: vc.clone().multiplyScalar(0.45).getHex(), roughness: 0.35 });
+      continue;
+    }
+    pm.material = portBaseMat(pm);
+  }
+  for (const led of portLeds) {
+    const key = led.userData.deviceId + ':' + led.userData.port;
+    if (vlanFocus && vlanFocus.ports.has(key)) {
+      const vc = vlanColor(vlanFocus.vlan);
+      led.material = mat(vc.getHex(), { emissive: vc.getHex(), emissiveIntensity: 1.8, roughness: 0.3 });
+      continue;
+    }
+    const conn = portConnection(led.userData.deviceId, led.userData.port);
+    led.material = conn
+      ? mat(new THREE.Color(conn.color).getHex(), { emissive: new THREE.Color(conn.color).getHex(), emissiveIntensity: 1.8, roughness: 0.3 })
+      : mat(0x141a20, { roughness: 0.4 });
+  }
+}
+
+// One cable per physical jack, always. A patch panel port isn't "a port that
+// takes two cables" — it's two jacks that share a number, and each holds exactly
+// one plug, same as every other RJ45 in the building.
+function portFull(deviceId, port, side) {
+  return !!portConnection(deviceId, port, side === REAR ? REAR : FRONT);
+}
+let hoverPort = null;
+let PORT_GLOW = null; // lazily created glow material for the hovered port
+
+// Forgiving port picking: exact raycast first, then nearest port within a few
+// screen pixels — no pixel-hunting tiny jacks.
+const _pv = new THREE.Vector3();
+function pickPort(px, py) {
+  const direct = firstHit(portMeshes);
+  if (direct) return direct.object;
+  let best = null, bd = 16;
+  for (const pm of portMeshes) {
+    pm.getWorldPosition(_pv);
+    _pv.project(camera);
+    if (_pv.z > 1 || _pv.z < -1) continue;
+    const sx = (_pv.x + 1) / 2 * innerWidth, sy = (-_pv.y + 1) / 2 * innerHeight;
+    const d = Math.hypot(sx - px, sy - py);
+    if (d < bd) { bd = d; best = pm; }
+  }
+  return best;
+}
+
+//////////////////// Removal ////////////////////
+
+function removeFromArr(arr, pred) {
+  for (let i = arr.length - 1; i >= 0; i--) if (pred(arr[i])) arr.splice(i, 1);
+}
+
+//////////////////// Zip ties / velcro wraps ////////////////////
+
+function nearestOnCurve(curve, p, samples = 140) {
+  let bt = 0, bd = Infinity, bp = null;
+  for (let i = 0; i <= samples; i++) {
+    const t = i / samples;
+    const q = curve.getPointAt(t);
+    const d = q.distanceToSquared(p);
+    if (d < bd) { bd = d; bt = t; bp = q; }
+  }
+  return { t: bt, point: bp, dist: Math.sqrt(bd) };
+}
+
+function buildTie(tie) {
+  const g = new THREE.Group();
+  g.position.set(tie.x, tie.y, tie.z);
+  const tangent = new THREE.Vector3(tie.tx || 1, tie.ty || 0, tie.tz || 0).normalize();
+  g.quaternion.setFromUnitVectors(new THREE.Vector3(0, 0, 1), tangent);
+  // the strap wraps the actual packed bundle, so its size is derived from the
+  // same radius the routing uses rather than an unrelated fudge factor
+  const r = bundleRadius(tie.count || 1) + 0.1;
+  const band = new THREE.Mesh(new THREE.TorusGeometry(r, 0.075, 8, 28),
+    mat(0x14171c, { roughness: 0.5, metalness: 0.1 }));
+  band.userData = { isTie: true, tieId: tie.id };
+  g.add(band); tieMeshes.push(band);
+  // the little ratchet head every zip tie has, sitting proud of the band
+  const head = new THREE.Mesh(new THREE.BoxGeometry(0.34, 0.34, 0.26),
+    mat(0x14171c, { roughness: 0.5 }));
+  head.position.set(0, r, 0);
+  head.userData = { isTie: true, tieId: tie.id };
+  g.add(head); tieMeshes.push(head);
+  const tail = new THREE.Mesh(new THREE.BoxGeometry(0.16, 0.9, 0.07),
+    mat(0x14171c, { roughness: 0.5 }));
+  tail.position.set(0, r + 0.6, 0);
+  tail.userData = { isTie: true, tieId: tie.id };
+  g.add(tail); tieMeshes.push(tail);
+  scene.add(g);
+  tieGroups.set(tie.id, g);
+  return g;
+}
+
+function placeTie(hitPoint) {
+  // A tie straps cables to EACH OTHER (not to a point in space). In physics
+  // mode the bundle hangs and swings together; the strap follows the bundle.
+  const p = hitPoint.clone();
+  const members = [];
+  const centroid = new THREE.Vector3();
+  let tangent = null;
+  for (const c of state.cables) {
+    const cm = cableMeshes.get(c.id);
+    if (!cm || !cm.userData.curve) continue;
+    const near = nearestOnCurve(cm.userData.curve, p);
+    if (near.dist < 4.5) {
+      members.push({ cableId: c.id, t: near.t });
+      centroid.add(near.point);
+      if (!tangent) tangent = cm.userData.curve.getTangentAt(near.t);
+    }
+  }
+  if (!members.length) return null;
+  centroid.multiplyScalar(1 / members.length);
+  const tie = {
+    id: uid(), members, x: centroid.x, y: centroid.y, z: centroid.z,
+    tx: tangent.x, ty: tangent.y, tz: tangent.z, count: members.length
+  };
+  state.ties.push(tie);
+  buildTie(tie);
+  // the strap only means something once its members have been pulled into it
+  for (const m of members) {
+    const c = state.cables.find(x => x.id === m.cableId);
+    if (c) rebuildCable(c);
+  }
+  return tie;
+}
+
+function deleteTie(id) {
+  const g = tieGroups.get(id);
+  if (g) { scene.remove(g); tieGroups.delete(id); }
+  removeFromArr(tieMeshes, m => m.userData.tieId === id);
+  // capture who was strapped before dropping the tie — cutting a tie has to
+  // release its bundle, and after the splice there is nothing left to ask
+  const tie = (state.ties || []).find(t => t.id === id);
+  const freed = tie && tie.members ? tie.members.map(m => m.cableId) : [];
+  removeFromArr(state.ties, t => t.id === id);
+  for (const c of state.cables) {
+    const before = c.waypoints.length;
+    removeFromArr(c.waypoints, w => w.tieId === id);
+    if (c.waypoints.length !== before || freed.includes(c.id)) {
+      rebuildCable(c);
+      if (physOn) buildRope(c);
+    }
+  }
+}
+
+function deleteCable(id) {
+  const m = cableMeshes.get(id);
+  if (m) { disposeCableObj(m); cableMeshes.delete(id); }
+  cableRoutes.delete(id);          // stop steering other cables around a gap
+  removeFromArr(state.cables, c => c.id === id);
+  refreshPortTints();
+}
+
+function deleteDevice(id) {
+  for (const c of state.cables.filter(c => c.a.deviceId === id || c.b.deviceId === id)) deleteCable(c.id);
+  const g = deviceGroups.get(id);
+  if (g) {
+    g.parent.remove(g);
+    deviceGroups.delete(id);
+    removeFromArr(portMeshes, pm => pm.userData.deviceId === id);
+    removeFromArr(portLeds, lm => lm.userData.deviceId === id);
+    removeFromArr(managerMeshes, mm => mm.userData.deviceId === id);
+  }
+  removeFromArr(state.devices, d => d.id === id);
+  removeFromArr(state.links, l => l.aId === id || l.bId === id);
+  collidersDirty = true;
+}
+
+function deleteRack(id) {
+  for (const d of state.devices.filter(d => d.rackId === id)) deleteDevice(d.id);
+  const g = rackGroups.get(id);
+  if (g) {
+    scene.remove(g);
+    rackGroups.delete(id);
+    removeFromArr(rackPlanes, p => p.userData.rackId === id);
+    removeFromArr(rackFrames, f => f.userData.rackId === id);
+  }
+  removeFromArr(state.racks, r => r.id === id);
+  collidersDirty = true;
+}
+
+//////////////////// Placement helpers ////////////////////
+
+function rackOccupied(rackId, u, uh, ignoreId) {
+  return state.devices.some(d => {
+    if (d.rackId !== rackId || d.id === ignoreId) return false;
+    const def = DEVICE_TYPES[d.type];
+    if (def.vertical) return false;
+    return u < d.u + def.uh && d.u < u + uh;
+  });
+}
+
+function deviceLabelCounter(type) {
+  const base = DEVICE_TYPES[type].short || { switch48: 'Switch', switch24: 'Switch', patch24: 'Patch', router: 'Router',
+    firewall: 'FW', server: 'Server', ups: 'UPS', hcm: 'HCM', vcm: 'VCM', ap: 'AP', camera: 'Cam' }[type] || 'Dev';
+  let n = 1;
+  while (state.devices.some(d => d.name === `${base}-${n}`)) n++;
+  return `${base}-${n}`;
+}
+
+//////////////////// Ghost (placement preview) ////////////////////
+
+let ghost = null;
+function clearGhost() {
+  if (ghost) { scene.remove(ghost); ghost = null; }
+}
+function makeGhost(w, h, d, ok) {
+  clearGhost();
+  ghost = new THREE.Mesh(new THREE.BoxGeometry(w, h, d),
+    new THREE.MeshBasicMaterial({ color: ok ? 0x22c55e : 0xef4444, transparent: true, opacity: 0.4, depthWrite: false }));
+  scene.add(ghost);
+}
+
+//////////////////// Raycasting & input ////////////////////
+
+const raycaster = new THREE.Raycaster();
+const mouseNDC = new THREE.Vector2();
+let downPos = null;
+let hoverInfo = null; // cached placement info from last mousemove
+
+function setMouse(e) {
+  mouseNDC.x = (e.clientX / innerWidth) * 2 - 1;
+  mouseNDC.y = -(e.clientY / innerHeight) * 2 + 1;
+  raycaster.setFromCamera(mouseNDC, camera);
+}
+
+function firstHit(objects) {
+  const hits = raycaster.intersectObjects(objects, false);
+  return hits.length ? hits[0] : null;
+}
+
+const tooltip = document.getElementById('tooltip');
+const statusBar = document.getElementById('status');
+
+function deviceById(id) { return state.devices.find(d => d.id === id); }
+function rackById(id) { return state.racks.find(r => r.id === id); }
+
+function setStatus(t) { statusBar.textContent = t; }
+
+//////////////////// Cable preview line ////////////////////
+
+let previewLine = null;
+function updatePreview(cursorPoint) {
+  if (!cableDraft) return;
+  const a = getPortWorld(cableDraft.a.deviceId, cableDraft.a.port, epSide(cableDraft.a));
+  if (!a) return;
+  const pts = [a.pos.clone(), a.pos.clone().addScaledVector(a.normal, 2.5)];
+  for (const w of cableDraft.waypoints) pts.push(new THREE.Vector3(w.x, w.y, w.z));
+  if (cursorPoint) pts.push(cursorPoint);
+  const curve = new THREE.CatmullRomCurve3(pts, false, 'catmullrom', 0.5);
+  const geo = new THREE.BufferGeometry().setFromPoints(curve.getPoints(60));
+  if (previewLine) { previewLine.geometry.dispose(); previewLine.geometry = geo; }
+  else {
+    previewLine = new THREE.Line(geo, new THREE.LineDashedMaterial({
+      color: document.getElementById('cable-color').value, dashSize: 1.2, gapSize: 0.6 }));
+    scene.add(previewLine);
+  }
+  previewLine.computeLineDistances();
+}
+function clearPreview() {
+  if (previewLine) { scene.remove(previewLine); previewLine.geometry.dispose(); previewLine = null; }
+}
+
+//////////////////// Mouse move ////////////////////
+
+const lastPtr = { x: innerWidth / 2, y: innerHeight / 2 };
+function updateHover(cx, cy) {
+  lastPtr.x = cx; lastPtr.y = cy;
+  hoverInfo = null;
+  tooltip.classList.add('hidden');
+
+  // Port hover: forgiving picking in cable mode, glow feedback in all modes
+  const directHit = firstHit(portMeshes);
+  const pobj = mode === 'cable' ? pickPort(cx, cy) : (directHit ? directHit.object : null);
+  if (hoverPort && hoverPort !== pobj) hoverPort.material = portBaseMat(hoverPort);
+  hoverPort = pobj || null;
+  if (hoverPort) {
+    PORT_GLOW = PORT_GLOW || mat(0x8cc4ff, { emissive: 0x2f7fe0, emissiveIntensity: 1.3, roughness: 0.3 });
+    hoverPort.material = PORT_GLOW;
+  }
+  const portHit = pobj ? { object: pobj, point: pobj.getWorldPosition(new THREE.Vector3()) } : null;
+  if (portHit) {
+    const { deviceId, port } = portHit.object.userData;
+    const side = meshSide(portHit.object);
+    const dev = deviceById(deviceId);
+    const conn = portConnection(deviceId, port, side);
+    const role = dev ? portRole(DEVICE_TYPES[dev.type], port) : 'LAN';
+    const pcfg = dev && dev.portCfg && dev.portCfg[port];
+    // on a patch panel the face is the whole point — say which one you're on
+    const face = dev && DEVICE_TYPES[dev.type].passthrough
+      ? (side === REAR ? ' · rear punchdown' : ' · front') : '';
+    let txt = `${dev ? dev.name : '?'}${dev && dev.ip ? ' (' + dev.ip + ')' : ''} · ${portLabel(dev, port)}${face}`
+      + (role !== 'LAN' && role !== 'PWR' ? ` (${role})` : '')
+      + (pcfg && pcfg.vlan ? ` · VLAN ${pcfg.vlan}` : '')
+      + (pcfg && pcfg.label ? ` · ${pcfg.label}` : '');
+    if (conn) {
+      const isA = conn.a.deviceId === deviceId && conn.a.port === port && epSide(conn.a) === side;
+      const other = isA ? conn.b : conn.a;
+      const od = deviceById(other.deviceId);
+      const oFace = od && DEVICE_TYPES[od.type].passthrough
+        ? (epSide(other) === REAR ? ' rear' : ' front') : '';
+      txt += `  →  ${od ? od.name : '?'}${od && od.ip ? ' (' + od.ip + ')' : ''} · Port ${other.port}${oFace}`;
+    } else if (dev && DEVICE_TYPES[dev.type].passthrough) {
+      // show the other face of this same port — that's the run it passes through to
+      const mate = portConnection(deviceId, port, side === REAR ? FRONT : REAR);
+      txt += mate ? `  ·  free (${side === REAR ? 'front' : 'rear'} is patched)` : '  ·  free';
+    }
+    tooltip.textContent = txt;
+    tooltip.style.left = (cx + 14) + 'px';
+    tooltip.style.top = (cy + 10) + 'px';
+    tooltip.classList.remove('hidden');
+  } else if (mode === 'select' || mode === 'cable' || walkActive) {
+    // whole-device tooltip so you always know what you're looking at
+    const dh = firstHit(collectDeviceBodies());
+    if (dh) {
+      const dev = deviceById(dh.object.userData.deviceId);
+      if (dev) {
+        tooltip.textContent = `${dev.name}${dev.ip ? ' (' + dev.ip + ')' : ''} — ${DEVICE_TYPES[dev.type].label}`;
+        tooltip.style.left = (cx + 14) + 'px';
+        tooltip.style.top = (cy + 10) + 'px';
+        tooltip.classList.remove('hidden');
+      }
+    }
+  }
+
+  if (mode === 'place' && pendingType) {
+    const def = DEVICE_TYPES[pendingType];
+    if (def.field) {
+      const mounts = def.mounts || ['ceiling'];
+      // wall mounting when pointing at a wall (only if this product wall-mounts)
+      if (mounts.includes('wall')) {
+        const wh = firstHit([...wallMeshes.values()]);
+        if (wh) {
+          const n = wh.face.normal.clone().transformDirection(wh.object.matrixWorld);
+          n.y = 0;
+          if (n.lengthSq() > 0.01) {
+            n.normalize();
+            const rotY = Math.atan2(n.x, n.z);
+            const wref = state.walls.find(w => w.id === wh.object.userData.wallId);
+            const wb = (wref && wref.y0) || 0;
+            const y = Math.max(wb + 12, Math.min(wb + ((wref && wref.h) || WALL_H) - 6, Math.round(wh.point.y)));
+            const p = wh.point.clone().addScaledVector(n, 0.3);
+            makeGhost(9, 9, 6, true);
+            ghost.position.set(p.x, y, p.z);
+            ghost.rotation.y = rotY;
+            hoverInfo = { mountKind: 'wall', x: p.x, y, z: p.z, rotY };
+            setStatus(`${def.label} — wall mount at ${(y / 12).toFixed(1)} ft. Click to place.`);
+            return;
+          }
+        }
+      }
+      const fh = firstHit(groundTargets());
+      if (fh) {
+        const x = Math.round(fh.point.x / 3) * 3, z = Math.round(fh.point.z / 3) * 3;
+        const y0 = groundYFromHit(fh);
+        if (mounts.includes('ceiling')) {
+          makeGhost(8, def.mountH + 2, 8, true);
+          ghost.position.set(x, y0 + (def.mountH + 2) / 2, z);
+          ghost.rotation.y = 0;
+          hoverInfo = { mountKind: 'pole', x, z, y0 };
+          setStatus(`${def.label} — ceiling-pole mount${mounts.includes('wall') ? ', or point at a wall' : ''}. Click to place.`);
+        } else if (mounts.includes('desk')) {
+          makeGhost(8, 8, 8, true);
+          ghost.position.set(x, y0 + 4, z);
+          ghost.rotation.y = 0;
+          hoverInfo = { mountKind: 'desk', x, z, y0 };
+          setStatus(`${def.label} — floor placement${mounts.includes('wall') ? ', or point at a wall' : ''}. Click to place.`);
+        } else {
+          // wall-only product (intercom, doorbell, reader...) — must go on a wall
+          makeGhost(9, 9, 6, false);
+          ghost.position.set(x, 48, z);
+          hoverInfo = null;
+          setStatus(`${def.label} mounts on a wall — point at a wall to place it (draw one with the Wall tool if needed).`);
+        }
+      } else { clearGhost(); hoverInfo = null; }
+      return;
+    }
+    const hit = firstHit(rackPlanes);
+    if (hit) {
+      const rackId = hit.object.userData.rackId;
+      const g = rackGroups.get(rackId);
+      const local = g.worldToLocal(hit.point.clone());
+      if (def.vertical) {
+        const side = local.x >= 0 ? 'R' : 'L';
+        const exists = state.devices.some(d => d.rackId === rackId && d.type === 'vcm' && d.side === side);
+        makeGhost(3.4, RACK_UNITS * U, 6, !exists);
+        const lp = new THREE.Vector3((side === 'L' ? -1 : 1) * (RACK_OUTER_W / 2 + 1.8), RACK_BASE + RACK_UNITS * U / 2, RACK_D / 2 - 3);
+        ghost.position.copy(g.localToWorld(lp));
+        ghost.quaternion.copy(g.quaternion);
+        hoverInfo = exists ? null : { rackId, side };
+        setStatus(`Vertical manager — ${side === 'L' ? 'left' : 'right'} side ${exists ? '(occupied)' : ''}`);
+      } else {
+        let u = Math.floor((local.y - RACK_BASE) / U) + 1;
+        u = Math.max(1, Math.min(RACK_UNITS - def.uh + 1, u));
+        const ok = !rackOccupied(rackId, u, def.uh);
+        makeGhost(RACK_W + 2, def.uh * U - 0.1, def.depth, ok);
+        const lp = new THREE.Vector3(0, RACK_BASE + (u - 1) * U + def.uh * U / 2, RACK_D / 2 - 1);
+        ghost.position.copy(g.localToWorld(lp));
+        ghost.quaternion.copy(g.quaternion);
+        hoverInfo = ok ? { rackId, u } : null;
+        setStatus(`${def.label} @ U${u}${def.uh > 1 ? '–U' + (u + def.uh - 1) : ''} ${ok ? '' : '(occupied)'}`);
+      }
+      return;
+    }
+    clearGhost();
+  }
+
+  if (mode === 'rack') {
+    const hit = firstHit(groundTargets());
+    if (hit) {
+      const x = Math.round(hit.point.x / 6) * 6, z = Math.round(hit.point.z / 6) * 6;
+      const y0 = groundYFromHit(hit);
+      makeGhost(RACK_OUTER_W, RACK_H, RACK_D, true);
+      ghost.position.set(x, y0 + RACK_H / 2, z);
+      ghost.rotation.y = pendingRackRot;
+      hoverInfo = { x, z, y0 };
+    }
+    return;
+  }
+
+  if (mode === 'wall') {
+    const hit = firstHit(groundTargets());
+    if (hit) {
+      const x = Math.round(hit.point.x / 6) * 6, z = Math.round(hit.point.z / 6) * 6;
+      const y0 = wallStart ? wallStart.y0 : groundYFromHit(hit);
+      hoverInfo = { x, z, y0 };
+      if (wallStart) {
+        const dx = x - wallStart.x, dz = z - wallStart.z;
+        const len = Math.hypot(dx, dz);
+        if (len > 1) {
+          makeGhost(len, WALL_H, WALL_T, true);
+          ghost.position.set((wallStart.x + x) / 2, y0 + WALL_H / 2, (wallStart.z + z) / 2);
+          ghost.rotation.y = Math.atan2(-dz, dx);
+          setStatus(`Wall: ${fmtLen(len)} — click to set the end. Esc finishes.`);
+        }
+      } else {
+        makeGhost(4, WALL_H, 4, true);
+        ghost.position.set(x, y0 + WALL_H / 2, z);
+        setStatus('Click the floor (or an upper floor slab) to start a wall.');
+      }
+    }
+    return;
+  }
+
+  if (mode === 'room') {
+    const hit = firstHit(groundTargets());
+    if (hit) {
+      const x = Math.round(hit.point.x / 6) * 6, z = Math.round(hit.point.z / 6) * 6;
+      const y0 = roomStart ? roomStart.y0 : groundYFromHit(hit);
+      const preset = document.getElementById('room-size').value;
+      if (preset !== 'drag') {
+        const [pw, pd] = preset.split(',').map(Number);
+        makeGhost(pw, WALL_H, pd, true);
+        ghost.position.set(x + pw / 2, y0 + WALL_H / 2, z + pd / 2);
+        ghost.rotation.y = 0;
+        hoverInfo = { x1: x, z1: z, x2: x + pw, z2: z + pd, y0 };
+        setStatus(`${fmtLen(pw)} × ${fmtLen(pd)} room — click to build it (corner at cursor).`);
+      } else if (roomStart) {
+        const wX = Math.abs(x - roomStart.x), wZ = Math.abs(z - roomStart.z);
+        if (wX > 12 && wZ > 12) {
+          makeGhost(wX, WALL_H, wZ, true);
+          ghost.position.set((roomStart.x + x) / 2, y0 + WALL_H / 2, (roomStart.z + z) / 2);
+          ghost.rotation.y = 0;
+          hoverInfo = { x1: roomStart.x, z1: roomStart.z, x2: x, z2: z, y0 };
+          setStatus(`Room: ${fmtLen(wX)} × ${fmtLen(wZ)} — click to build walls + ceiling.`);
+        }
+      } else {
+        makeGhost(6, WALL_H, 6, true);
+        ghost.position.set(x, y0 + WALL_H / 2, z);
+        hoverInfo = { x, z, y0, start: true };
+        setStatus('Click the first corner of the room (drag-size mode).');
+      }
+    }
+    return;
+  }
+
+  if (mode === 'slab') {
+    const hit = firstHit([floorMesh]);
+    if (hit) {
+      const x = Math.round(hit.point.x / 12) * 12, z = Math.round(hit.point.z / 12) * 12;
+      const elev = parseInt(document.getElementById('level-sel').value, 10);
+      hoverInfo = { x, z, y: elev };
+      if (slabStart) {
+        const wX = Math.abs(x - slabStart.x), wZ = Math.abs(z - slabStart.z);
+        if (wX > 6 && wZ > 6) {
+          makeGhost(wX, 6, wZ, true);
+          ghost.position.set((slabStart.x + x) / 2, elev - 3, (slabStart.z + z) / 2);
+          ghost.rotation.y = 0;
+          setStatus(`Floor slab: ${fmtLen(wX)} × ${fmtLen(wZ)} at level height ${fmtLen(elev)} — click to finish.`);
+        }
+      } else {
+        makeGhost(12, 6, 12, true);
+        ghost.position.set(x, elev - 3, z);
+        setStatus(`Click to set the first corner of the level-${Math.round(elev / 120) + 1} floor slab.`);
+      }
+    }
+    return;
+  }
+
+  if (mode === 'measure') {
+    const targets = [...groundTargets(), ...wallMeshes.values(), ...rackFrames, ...collectDeviceBodies(), ...cableMeshes.values()];
+    const hit = firstHit(targets);
+    if (hit) {
+      hoverInfo = { p: hit.point.clone() };
+      if (measureStart) {
+        updatePreviewMeasure(hit.point);
+        setStatus(`Distance: ${fmtLen(measureStart.distanceTo(hit.point))} — click to pin this measurement.`);
+      } else {
+        setStatus('Measure — click the first point (floors, walls, racks, devices, cables all work).');
+      }
+    }
+    return;
+  }
+
+  if (mode === 'drill') {
+    const dia = parseFloat(document.getElementById('hole-size').value) || 1;
+    const hr = dia / 2;
+    const wh = firstHit([...wallMeshes.values(), ...slabMeshes.values()]);
+    if (wh) {
+      const n = wh.face.normal.clone().transformDirection(wh.object.matrixWorld);
+      if (wh.object.userData.isSlab) {
+        // drilling through a floor/ceiling slab — vertical bore
+        const ny = n.y >= 0 ? 1 : -1;
+        const s = state.slabs.find(s2 => s2.id === wh.object.userData.slabId);
+        const cy = s ? s.y - 3 : wh.point.y - ny * 3;
+        makeGhost(dia + 1.4, 8, dia + 1.4, true);
+        ghost.position.set(wh.point.x, cy, wh.point.z);
+        ghost.rotation.y = 0;
+        hoverInfo = { slabId: wh.object.userData.slabId, x: wh.point.x, y: cy, z: wh.point.z, nx: 0, ny, nz: 0, t: 6, r: hr };
+        setStatus(`Drill Ø ${dia}" through the ${ny > 0 ? 'floor/ceiling slab' : 'ceiling'} — click to bore between levels.`);
+        return;
+      }
+      n.y = 0;
+      if (n.lengthSq() > 0.01) {
+        n.normalize();
+        const wref = state.walls.find(w => w.id === wh.object.userData.wallId);
+        const wb = (wref && wref.y0) || 0;
+        const y = Math.max(wb + 4, Math.min(wb + ((wref && wref.h) || WALL_H) - 4, Math.round(wh.point.y)));
+        const center = wh.point.clone().addScaledVector(n, -WALL_T / 2);
+        makeGhost(dia + 1.4, dia + 1.4, WALL_T + 2, true);
+        ghost.position.set(center.x, y, center.z);
+        ghost.rotation.y = Math.atan2(n.x, n.z);
+        hoverInfo = { wallId: wh.object.userData.wallId, x: center.x, y, z: center.z, nx: n.x, ny: 0, nz: n.z, t: WALL_T, r: hr };
+        setStatus(`Drill Ø ${dia}" at ${(y / 12).toFixed(1)} ft — click to drill.`);
+        return;
+      }
+    }
+    clearGhost(); hoverInfo = null;
+    setStatus('Drill — point at a wall, floor slab, or ceiling. Pick the bit size in the toolbar.');
+    return;
+  }
+
+  if (mode === 'cable' && cableDraft) {
+    // preview follows ports > managers > any surface
+    let pt = null;
+    if (portHit) pt = portHit.point;
+    else {
+      const mh = firstHit(managerMeshes);
+      if (mh) pt = mh.point.clone().addScaledVector(mh.face.normal.clone().transformDirection(mh.object.matrixWorld), 0.5);
+      else {
+        const fh = firstHit([floorMesh]);
+        if (fh) pt = fh.point;
+      }
+    }
+    updatePreview(pt);
+  }
+}
+
+renderer.domElement.addEventListener('pointermove', e => {
+  if (walkActive) return; // walking: hover runs per-frame from the crosshair
+  setMouse(e);
+  updateHover(e.clientX, e.clientY);
+});
+
+//////////////////// Click handling ////////////////////
+
+let pendingRackRot = 0;
+
+renderer.domElement.addEventListener('pointerdown', e => { downPos = { x: e.clientX, y: e.clientY }; camTween = null; });
+
+// double-click a device: fly to a face-on close-up. Double-click it again to
+// flip around to the rear panel (power, fans, punchdowns).
+let camTween = null;
+let inspectLast = null;
+renderer.domElement.addEventListener('dblclick', e => {
+  if (walkActive) return;
+  setMouse(e);
+  const dh = firstHit(collectDeviceBodies());
+  if (!dh) { inspectLast = null; return; }
+  const dev = deviceById(dh.object.userData.deviceId);
+  if (!dev) return;
+  const def = DEVICE_TYPES[dev.type];
+  let side = 1;
+  if (!def.field && inspectLast && inspectLast.id === dev.id) side = -inspectLast.side;
+  inspectLast = { id: dev.id, side };
+  const g = deviceGroups.get(dev.id);
+  const q = g.getWorldQuaternion(new THREE.Quaternion());
+  const n = new THREE.Vector3(0, 0, side).applyQuaternion(q);
+  const center = g.getWorldPosition(new THREE.Vector3());
+  if (def.field) {
+    if (dev.mount === 'desk') center.y += 18;
+    else if (dev.mount !== 'wall') center.y += (def.mountH || 96) - 2;
+  }
+  center.addScaledVector(n, 1.2);
+  const dist = def.field ? 20 : 26;
+  camTween = {
+    p0: camera.position.clone(), t0: controls.target.clone(),
+    p1: center.clone().addScaledVector(n, dist), t1: center, k: 0
+  };
+  setStatus(side === 1
+    ? `${dev.name} — front close-up. Double-click it again to flip to the rear (power inlet, fans).`
+    : `${dev.name} — rear panel. The power inlet is a live port: cable it to a UPS/PDU outlet.`);
+});
+
+const _centerNDC = new THREE.Vector2(0, 0);
+renderer.domElement.addEventListener('pointerup', e => {
+  if (walkActive) {
+    // Satisfactory-style: interact with whatever the crosshair is on
+    if (e.button !== 0) return;
+    raycaster.setFromCamera(_centerNDC, camera);
+    handleClick();
+    return;
+  }
+  if (!downPos) return;
+  const moved = Math.hypot(e.clientX - downPos.x, e.clientY - downPos.y);
+  downPos = null;
+  if (moved > 5) return; // was a drag/orbit, not a click
+  if (e.button === 2) {
+    // right-click steps back: cancel draft → finish wall/slab/measure → back to Select
+    if (cableDraft) { cableDraft = null; clearPreview(); setStatus('Cable cancelled.'); }
+    else if (wallStart) { wallStart = null; clearGhost(); setStatus('Wall finished.'); }
+    else if (measureStart) { measureStart = null; clearMeasurePreview(); setStatus('Measurement cancelled.'); }
+    else if (slabStart) { slabStart = null; clearGhost(); setStatus('Slab cancelled.'); }
+    else if (roomStart) { roomStart = null; clearGhost(); setStatus('Room cancelled.'); }
+    else if (mode !== 'select') setMode('select');
+    return;
+  }
+  if (e.button !== 0) return;
+  setMouse(e);
+  handleClick();
+});
+
+function handleClick() {
+  if (mode === 'place' && pendingType) {
+    if (!hoverInfo) return;
+    undoPush();
+    const def = DEVICE_TYPES[pendingType];
+    if (placeExistingId) {
+      // placing a logical device from the 2D plan into the physical map
+      const dev = deviceById(placeExistingId);
+      if (!dev) { placeExistingId = null; return; }
+      if (def.field && hoverInfo.mountKind === 'wall') Object.assign(dev, { mount: 'wall', x: hoverInfo.x, y: hoverInfo.y, z: hoverInfo.z, rotY: hoverInfo.rotY });
+      else if (def.field && hoverInfo.mountKind === 'desk') { Object.assign(dev, { mount: 'desk', x: hoverInfo.x, z: hoverInfo.z, y0: hoverInfo.y0 || 0 }); }
+      else if (def.field) { delete dev.mount; Object.assign(dev, { x: hoverInfo.x, z: hoverInfo.z, y0: hoverInfo.y0 || 0 }); }
+      else if (def.vertical) Object.assign(dev, { rackId: hoverInfo.rackId, side: hoverInfo.side, u: 0 });
+      else Object.assign(dev, { rackId: hoverInfo.rackId, u: hoverInfo.u });
+      buildDeviceGroup(dev);
+      placeExistingId = null;
+      setMode('select');
+      setStatus(`${dev.name} is now placed in the physical map.`);
+      return;
+    }
+    let dev;
+    if (def.field && hoverInfo.mountKind === 'wall') dev = { id: uid(), type: pendingType, mount: 'wall', x: hoverInfo.x, y: hoverInfo.y, z: hoverInfo.z, rotY: hoverInfo.rotY, name: deviceLabelCounter(pendingType) };
+    else if (def.field && hoverInfo.mountKind === 'desk') dev = { id: uid(), type: pendingType, mount: 'desk', x: hoverInfo.x, z: hoverInfo.z, y0: hoverInfo.y0 || 0, name: deviceLabelCounter(pendingType) };
+    else if (def.field) dev = { id: uid(), type: pendingType, x: hoverInfo.x, z: hoverInfo.z, y0: hoverInfo.y0 || 0, name: deviceLabelCounter(pendingType) };
+    else if (def.vertical) dev = { id: uid(), type: pendingType, rackId: hoverInfo.rackId, side: hoverInfo.side, u: 0, name: deviceLabelCounter(pendingType) };
+    else dev = { id: uid(), type: pendingType, rackId: hoverInfo.rackId, u: hoverInfo.u, name: deviceLabelCounter(pendingType) };
+    state.devices.push(dev);
+    buildDeviceGroup(dev);
+    recordRecent(dev.type);
+    setStatus(`Placed ${dev.name}. Click another slot, or Esc to finish.`);
+    return;
+  }
+
+  if (mode === 'rack') {
+    if (!hoverInfo) return;
+    undoPush();
+    const rack = { id: uid(), x: hoverInfo.x, z: hoverInfo.z, y0: hoverInfo.y0 || 0, rotY: pendingRackRot, name: `Rack-${state.racks.length + 1}` };
+    state.racks.push(rack);
+    buildRackGroup(rack);
+    setStatus(`Placed ${rack.name}. Click to add another, Q rotates, Esc to finish.`);
+    return;
+  }
+
+  if (mode === 'wall') {
+    if (!hoverInfo) return;
+    if (!wallStart) {
+      wallStart = { x: hoverInfo.x, z: hoverInfo.z, y0: hoverInfo.y0 || 0 };
+      setStatus('Wall started — click to set the end point.');
+    } else if (hoverInfo.x !== wallStart.x || hoverInfo.z !== wallStart.z) {
+      undoPush();
+      const w = { id: uid(), x1: wallStart.x, z1: wallStart.z, x2: hoverInfo.x, z2: hoverInfo.z, h: WALL_H, y0: wallStart.y0 || 0 };
+      state.walls.push(w);
+      buildWall(w);
+      wallStart = { x: hoverInfo.x, z: hoverInfo.z, y0: wallStart.y0 || 0 }; // chain into the next segment
+      setStatus('Wall placed — keep clicking to chain segments, Esc to finish.');
+    }
+    return;
+  }
+
+  if (mode === 'drill') {
+    if (!hoverInfo) return;
+    undoPush();
+    const h = {
+      id: uid(), wallId: hoverInfo.wallId, slabId: hoverInfo.slabId,
+      x: hoverInfo.x, y: hoverInfo.y, z: hoverInfo.z,
+      nx: hoverInfo.nx, ny: hoverInfo.ny || 0, nz: hoverInfo.nz,
+      t: hoverInfo.t, r: hoverInfo.r
+    };
+    state.holes.push(h);
+    buildHole(h);
+    setStatus(`Ø ${(h.r * 2)}" hole drilled${h.slabId ? ' between levels' : ` at ${(h.y / 12).toFixed(1)} ft`}. Cables route through it.`);
+    return;
+  }
+
+  if (mode === 'room') {
+    if (!hoverInfo) return;
+    const preset = document.getElementById('room-size').value;
+    if (preset === 'drag' && hoverInfo.start) {
+      roomStart = { x: hoverInfo.x, z: hoverInfo.z, y0: hoverInfo.y0 };
+      setStatus('Corner set — click the opposite corner to build the room.');
+      return;
+    }
+    if (hoverInfo.x1 === undefined) return;
+    buildRoom(hoverInfo.x1, hoverInfo.z1, hoverInfo.x2, hoverInfo.z2, hoverInfo.y0);
+    roomStart = null;
+    return;
+  }
+
+  if (mode === 'slab') {
+    if (!hoverInfo) return;
+    if (!slabStart) {
+      slabStart = { x: hoverInfo.x, z: hoverInfo.z };
+      setStatus('Corner set — click the opposite corner of the slab.');
+    } else if (Math.abs(hoverInfo.x - slabStart.x) > 6 && Math.abs(hoverInfo.z - slabStart.z) > 6) {
+      undoPush();
+      const s = { id: uid(), x1: slabStart.x, z1: slabStart.z, x2: hoverInfo.x, z2: hoverInfo.z, y: hoverInfo.y };
+      state.slabs.push(s);
+      buildSlab(s);
+      slabStart = null;
+      setStatus('Floor slab placed — build on it exactly like the ground floor. In Walk mode press F to fly up to it.');
+    }
+    return;
+  }
+
+  if (mode === 'measure') {
+    if (!hoverInfo || !hoverInfo.p) return;
+    if (!measureStart) {
+      measureStart = hoverInfo.p.clone();
+      setStatus('First point set — click the second point.');
+    } else {
+      undoPush();
+      const m = { id: uid(), ax: measureStart.x, ay: measureStart.y, az: measureStart.z, bx: hoverInfo.p.x, by: hoverInfo.p.y, bz: hoverInfo.p.z };
+      state.measures.push(m);
+      buildMeasure(m);
+      setStatus(`Measured ${fmtLen(measureStart.distanceTo(hoverInfo.p))} — dimension pinned. Click to start another.`);
+      measureStart = null;
+      clearMeasurePreview();
+    }
+    return;
+  }
+
+  if (mode === 'cable') {
+    const pObj = pickPort(lastPtr.x, lastPtr.y);
+    if (pObj) {
+      const { deviceId, port } = pObj.userData;
+      const side = meshSide(pObj);                 // which face of the jack was clicked
+      const faceOf = (d, p, s) => DEVICE_TYPES[d.type].passthrough ? ` ${s === REAR ? 'rear' : 'front'}` : '';
+      if (!cableDraft) {
+        if (portFull(deviceId, port, side)) { setStatus('That jack already has a cable in it. Pick a free port.'); return; }
+        cableDraft = { a: { deviceId, port, side }, waypoints: [] };
+        const dev = deviceById(deviceId);
+        setStatus(`Cable from ${dev.name} port ${port}${faceOf(dev, port, side)} — click cable managers to route, then click the destination port. Esc cancels.`);
+      } else {
+        const a = cableDraft.a;
+        if (deviceId === a.deviceId && port === a.port && side === epSide(a)) return;
+        if (portFull(deviceId, port, side)) { setStatus('That jack already has a cable in it. Pick a free port.'); return; }
+        undoPush();
+        const cable = {
+          id: uid(), a, b: { deviceId, port, side },
+          waypoints: cableDraft.waypoints,
+          color: document.getElementById('cable-color').value
+        };
+        state.cables.push(cable);
+        buildCableMesh(cable);
+        cableDraft = null;
+        clearPreview();
+        const da = deviceById(cable.a.deviceId), db = deviceById(cable.b.deviceId);
+        setStatus(`Connected ${da.name}:${cable.a.port}${faceOf(da, cable.a.port, epSide(cable.a))} → ${db.name}:${cable.b.port}${faceOf(db, cable.b.port, epSide(cable.b))} (~${(cable.lengthIn / 12).toFixed(1)} ft). Click a port to start another cable.`);
+      }
+      return;
+    }
+    if (cableDraft) {
+      // route through a drilled wall hole: adds entry + exit points
+      const hh = firstHit(holeMeshes);
+      if (hh) {
+        const hole = state.holes.find(h => h.id === hh.object.userData.holeId);
+        if (hole) {
+          const n = new THREE.Vector3(hole.nx || 0, hole.ny || 0, hole.nz || 0).normalize();
+          const ht = (hole.t || WALL_T) / 2 + 1;
+          const hp = new THREE.Vector3(hole.x, hole.y, hole.z);
+          const last = cableDraft.waypoints.length
+            ? new THREE.Vector3().copy(cableDraft.waypoints[cableDraft.waypoints.length - 1])
+            : getPortWorld(cableDraft.a.deviceId, cableDraft.a.port, epSide(cableDraft.a)).pos;
+          const side = Math.sign(new THREE.Vector3().subVectors(last, hp).dot(n)) || 1;
+          const near = hp.clone().addScaledVector(n, side * ht);
+          const far = hp.clone().addScaledVector(n, -side * ht);
+          cableDraft.waypoints.push({ x: near.x, y: near.y, z: near.z }, { x: far.x, y: far.y, z: far.z });
+          setStatus('Cable routed through the wall hole. Click destination port to finish.');
+          return;
+        }
+      }
+      const mh = firstHit(managerMeshes);
+      if (mh) {
+        const n = mh.face.normal.clone().transformDirection(mh.object.matrixWorld);
+        const p = mh.point.clone().addScaledVector(n, 0.6);
+        cableDraft.waypoints.push({ x: p.x, y: p.y, z: p.z });
+        setStatus(`Route point added (${cableDraft.waypoints.length}). Click destination port to finish.`);
+      }
+    }
+    return;
+  }
+
+  if (mode === 'tie') {
+    const ch = firstHit([...cableMeshes.values()]);
+    if (ch) {
+      const snap = serialize();
+      const tie = placeTie(ch.point);
+      if (tie) {
+        undoPush(snap);
+        setStatus(tie.count > 1
+          ? `Tie placed — ${tie.count} cables strapped into one bundle. ${physOn ? '' : 'Turn on Physics (0/P) to watch them cinch together.'}`
+          : 'Tie placed on 1 cable — ties shine when they bundle several cables running together.');
+      }
+    }
+    return;
+  }
+
+  if (mode === 'delete') {
+    const mm = firstHit(measureHits);
+    if (mm) { undoPush(); deleteMeasure(mm.object.userData.measureId); setStatus('Measurement removed.'); return; }
+    const th = firstHit(tieMeshes);
+    if (th) { undoPush(); deleteTie(th.object.userData.tieId); setStatus('Tie removed. (Ctrl+Z undoes)'); return; }
+    const ch = firstHit([...cableMeshes.values()]);
+    if (ch) { undoPush(); deleteCable(ch.object.userData.cableId); setStatus('Cable deleted. (Ctrl+Z undoes)'); return; }
+    const dh = firstHit(collectDeviceBodies());
+    if (dh) {
+      undoPush();
+      const dev = deviceById(dh.object.userData.deviceId);
+      deleteDevice(dh.object.userData.deviceId);
+      setStatus(`${dev ? dev.name : 'Device'} deleted (with its cables). (Ctrl+Z undoes)`);
+      return;
+    }
+    const hh = firstHit(holeMeshes);
+    if (hh) { undoPush(); deleteHole(hh.object.userData.holeId); setStatus('Hole removed. (Ctrl+Z undoes)'); return; }
+    const wh = firstHit([...wallMeshes.values()]);
+    if (wh) {
+      if (confirm('Delete this wall (and its drilled holes)?')) {
+        undoPush();
+        deleteWall(wh.object.userData.wallId);
+        setStatus('Wall deleted. (Ctrl+Z undoes)');
+      }
+      return;
+    }
+    const rh = firstHit(rackFrames);
+    if (rh) {
+      if (confirm('Delete this rack and everything in it?')) {
+        undoPush();
+        deleteRack(rh.object.userData.rackId);
+        setStatus('Rack deleted. (Ctrl+Z undoes)');
+      }
+      return;
+    }
+    const sh = firstHit([...slabMeshes.values()]);
+    if (sh) {
+      if (confirm('Delete this floor slab?')) {
+        undoPush();
+        deleteSlab(sh.object.userData.slabId);
+        setStatus('Floor slab deleted. (Ctrl+Z undoes)');
+      }
+    }
+    return;
+  }
+
+  // select mode
+  const ph = firstHit(portMeshes);
+  const ch = firstHit([...cableMeshes.values()]);
+  const dh = firstHit(collectDeviceBodies());
+  const rh = firstHit(rackFrames);
+  if (ch && (!dh || ch.distance < dh.distance)) { showCableProps(ch.object.userData.cableId); return; }
+  if (ph) { showPortProps(ph.object.userData.deviceId, ph.object.userData.port, meshSide(ph.object)); return; }
+  if (dh) { showDeviceProps(dh.object.userData.deviceId); return; }
+  if (rh) { showRackProps(rh.object.userData.rackId); return; }
+  const wh = firstHit([...wallMeshes.values()]);
+  if (wh) { showWallProps(wh.object.userData.wallId); return; }
+  hideProps();
+}
+
+function collectDeviceBodies() {
+  const arr = [];
+  for (const g of deviceGroups.values()) {
+    g.traverse(o => { if (o.userData && o.userData.isDeviceBody) arr.push(o); });
+  }
+  return arr;
+}
+
+//////////////////// Properties panel ////////////////////
+
+const propsEl = document.getElementById('props');
+const propsTitle = document.getElementById('props-title');
+const propsBody = document.getElementById('props-body');
+document.getElementById('props-close').onclick = hideProps;
+
+function hideProps() { propsEl.classList.add('hidden'); selected = null; }
+
+function row(k, v) { return `<div class="row"><span class="k">${k}</span><span>${v}</span></div>`; }
+
+function showDeviceProps(id) {
+  const dev = deviceById(id);
+  if (!dev) return;
+  const def = DEVICE_TYPES[dev.type];
+  const rack = rackById(dev.rackId);
+  const used = state.cables.filter(c => c.a.deviceId === id || c.b.deviceId === id).length;
+  propsTitle.textContent = 'Device';
+  let place;
+  if (!isPlaced(dev)) place = row('Position', 'Unplaced (logical)');
+  else if (def.field) place = dev.mount === 'wall'
+    ? row('Mount', `Wall @ ${(dev.y / 12).toFixed(1)} ft`)
+    : row('Position', `${dev.x}", ${dev.z}"`);
+  else place = row('Rack', rack ? rack.name : '?') + (def.vertical
+        ? row('Side', dev.side === 'L' ? 'Left' : 'Right')
+        : row('Position', 'U' + dev.u + (def.uh > 1 ? '–U' + (dev.u + def.uh - 1) : '')));
+  propsBody.innerHTML = `
+    <input type="text" id="dev-name" value="${dev.name}">
+    ${row('Type', def.label)}
+    ${place}
+    ${def.ports ? row('Ports used', `${used} / ${def.ports}`) : ''}
+    <div class="row"><span class="k">IP</span></div>
+    <input type="text" id="dev-ip" placeholder="e.g. 10.0.20.4" value="${dev.ip || ''}">
+    <div class="row" style="margin-top:6px"><span class="k">Notes</span></div>
+    <input type="text" id="dev-notes" placeholder="VLAN, location, model…" value="${dev.notes || ''}">
+    ${!isPlaced(dev) ? '<button id="dev-place">Place in 3D map</button>' : ''}
+    <button id="dev-del" class="danger">Delete device</button>`;
+  propsEl.classList.remove('hidden');
+  selected = { kind: 'device', id };
+  document.getElementById('dev-name').onchange = e => {
+    dev.name = e.target.value.trim() || dev.name;
+    updateDeviceFaceplate(id);
+  };
+  document.getElementById('dev-ip').onchange = e => { dev.ip = e.target.value.trim(); };
+  document.getElementById('dev-notes').onchange = e => { dev.notes = e.target.value.trim(); };
+  const placeBtn = document.getElementById('dev-place');
+  if (placeBtn) placeBtn.onclick = () => {
+    hideProps();
+    openPlan(false);
+    setMode('place', dev.type);
+    placeExistingId = id;
+    setStatus(`Placing ${dev.name} — click a ${DEVICE_TYPES[dev.type].field ? 'floor or wall spot' : 'rack slot'}.`);
+  };
+  document.getElementById('dev-del').onclick = () => { undoPush(); deleteDevice(id); hideProps(); };
+}
+
+function showPortProps(deviceId, port, side) {
+  const dev = deviceById(deviceId);
+  if (!dev) return;
+  const def = DEVICE_TYPES[dev.type];
+  side = side === REAR ? REAR : FRONT;
+  dev.portCfg = dev.portCfg || {};
+  const cfg = dev.portCfg[port] = dev.portCfg[port] || {};
+  const describe = (ep) => {
+    const od = deviceById(ep.deviceId);
+    const oFace = od && DEVICE_TYPES[od.type].passthrough ? ` (${epSide(ep)})` : '';
+    return `${od ? od.name : '?'} : ${ep.port}${oFace}`;
+  };
+  const conn = portConnection(deviceId, port, side);
+  let connTxt = 'unconnected';
+  if (conn) {
+    const isA = conn.a.deviceId === deviceId && conn.a.port === port && epSide(conn.a) === side;
+    connTxt = describe(isA ? conn.b : conn.a);
+  }
+  // A patch port is one circuit with two faces — show the far side too, so the
+  // panel reads the way a real one does: front patched here, permanent run there.
+  if (def.passthrough) {
+    const otherSide = side === REAR ? FRONT : REAR;
+    const mate = portConnection(deviceId, port, otherSide);
+    const mateFar = mate && (
+      (mate.a.deviceId === deviceId && mate.a.port === port && epSide(mate.a) === otherSide)
+        ? mate.b : mate.a);
+    connTxt += ` · ${otherSide}: ${mateFar ? describe(mateFar) : 'open'}`;
+  }
+  const isPwr = portRole(def, port) === 'PWR';
+  propsTitle.textContent = isPwr ? 'Power' : 'Port';
+  if (isPwr) {
+    propsBody.innerHTML = `
+      ${row('Device', dev.name)}
+      ${row('Connector', portLabel(dev, port))}
+      ${row('Connected to', connTxt)}
+      <button id="port-dev">Open device settings</button>`;
+    propsEl.classList.remove('hidden');
+    selected = { kind: 'port', id: deviceId, port };
+    document.getElementById('port-dev').onclick = () => showDeviceProps(deviceId);
+    return;
+  }
+  propsBody.innerHTML = `
+    ${row('Device', dev.name)}
+    ${row('Port', `${port} · ${portRole(def, port)}`)}
+    ${row('Connected to', connTxt)}
+    <div class="row"><span class="k">Untagged VLAN</span></div>
+    <input type="text" id="port-vlan" placeholder="access VLAN, default 1" value="${cfg.vlan || ''}">
+    <div class="row" style="margin-top:6px"><span class="k">Tagged VLANs</span></div>
+    <input type="text" id="port-tagged" placeholder="trunk: e.g. 10,20,30" value="${cfg.tagged || ''}">
+    <div class="row" style="margin-top:6px"><span class="k">Label</span></div>
+    <input type="text" id="port-label" placeholder="e.g. Uplink to IDF" value="${cfg.label || ''}">
+    <button id="port-trace">Simulate this VLAN</button>
+    <button id="port-dev">Open device settings</button>`;
+  propsEl.classList.remove('hidden');
+  selected = { kind: 'port', id: deviceId, port };
+  document.getElementById('port-vlan').onchange = e => { cfg.vlan = e.target.value.trim(); };
+  document.getElementById('port-tagged').onchange = e => { cfg.tagged = e.target.value.trim(); };
+  document.getElementById('port-label').onchange = e => { cfg.label = e.target.value.trim(); };
+  document.getElementById('port-trace').onclick = () => {
+    const v = parseInt(cfg.vlan, 10) || 1;
+    if (!simOn) setSim(true);
+    const f = traceVlan(deviceId, port, v, side);
+    setVlanFocus(f);
+    setStatus(`VLAN ${v} domain: ${f.devices.size} devices reachable over ${f.cables.size} cables. Blocked links glow red. Esc clears.`);
+  };
+  document.getElementById('port-dev').onclick = () => showDeviceProps(deviceId);
+}
+
+function showCableProps(id) {
+  const c = state.cables.find(c => c.id === id);
+  if (!c) return;
+  const da = deviceById(c.a.deviceId), db = deviceById(c.b.deviceId);
+  const opts = Object.entries(CABLE_COLOR_NAMES)
+    .map(([hex, name]) => `<option value="${hex}" ${hex === c.color ? 'selected' : ''}>${name}</option>`).join('');
+  propsTitle.textContent = 'Cable';
+  propsBody.innerHTML = `
+    ${row('From', `${da ? da.name : '?'} : ${c.a.port}`)}
+    ${row('To', `${db ? db.name : '?'} : ${c.b.port}`)}
+    ${row('Route points', c.waypoints.length)}
+    ${row('Est. length', (c.lengthIn / 12).toFixed(1) + ' ft')}
+    <div class="row"><span class="k">Color</span><select id="cbl-color">${opts}</select></div>
+    <div class="row"><span class="k">Slack %</span><input type="number" id="cbl-slack" min="0" max="40" style="width:64px" value="${c.slack === undefined ? 2 : c.slack}"></div>
+    <button id="cbl-del" class="danger">Delete cable</button>`;
+  propsEl.classList.remove('hidden');
+  selected = { kind: 'cable', id };
+  document.getElementById('cbl-color').onchange = e => {
+    c.color = e.target.value;
+    rebuildCable(c);
+    refreshPortTints();
+  };
+  document.getElementById('cbl-slack').onchange = e => {
+    c.slack = Math.max(0, Math.min(40, parseFloat(e.target.value) || 0));
+    if (physOn) buildRope(c);
+  };
+  document.getElementById('cbl-del').onclick = () => { undoPush(); deleteCable(id); hideProps(); };
+}
+
+function showWallProps(id) {
+  const w = state.walls.find(w => w.id === id);
+  if (!w) return;
+  const len = Math.hypot(w.x2 - w.x1, w.z2 - w.z1);
+  const holes = state.holes.filter(h => h.wallId === id).length;
+  propsTitle.textContent = 'Wall';
+  propsBody.innerHTML = `
+    ${row('Length', (len / 12).toFixed(1) + ' ft')}
+    ${row('Height', ((w.h || WALL_H) / 12).toFixed(1) + ' ft')}
+    ${row('Drilled holes', holes)}
+    <button id="wall-del" class="danger">Delete wall</button>`;
+  propsEl.classList.remove('hidden');
+  selected = { kind: 'wall', id };
+  document.getElementById('wall-del').onclick = () => {
+    if (confirm('Delete this wall (and its holes)?')) { undoPush(); deleteWall(id); hideProps(); }
+  };
+}
+
+function showRackProps(id) {
+  const r = rackById(id);
+  if (!r) return;
+  const devs = state.devices.filter(d => d.rackId === id).length;
+  propsTitle.textContent = 'Rack';
+  propsBody.innerHTML = `
+    <input type="text" id="rack-name" value="${r.name || 'Rack'}">
+    ${row('Size', RACK_UNITS + 'U')}
+    ${row('Devices', devs)}
+    <button id="rack-rot">Rotate 90°</button>
+    <button id="rack-del" class="danger">Delete rack</button>`;
+  propsEl.classList.remove('hidden');
+  selected = { kind: 'rack', id };
+  document.getElementById('rack-name').onchange = e => { r.name = e.target.value.trim() || r.name; };
+  document.getElementById('rack-rot').onclick = () => {
+    r.rotY = ((r.rotY || 0) + Math.PI / 2) % (Math.PI * 2);
+    rackGroups.get(id).rotation.y = r.rotY;
+    for (const c of state.cables) {
+      const ta = deviceById(c.a.deviceId), tb = deviceById(c.b.deviceId);
+      if ((ta && ta.rackId === id) || (tb && tb.rackId === id)) rebuildCable(c);
+    }
+  };
+  document.getElementById('rack-del').onclick = () => {
+    if (confirm('Delete this rack and everything in it?')) { undoPush(); deleteRack(id); hideProps(); }
+  };
+}
+
+//////////////////// Modes & toolbar ////////////////////
+
+const toolButtons = {
+  select: document.getElementById('tool-select'),
+  cable: document.getElementById('tool-cable'),
+  delete: document.getElementById('tool-delete'),
+  rack: document.getElementById('tool-rack'),
+  wall: document.getElementById('tool-wall'),
+  drill: document.getElementById('tool-drill'),
+  tie: document.getElementById('tool-tie'),
+  measure: document.getElementById('tool-measure'),
+  slab: document.getElementById('tool-slab'),
+  room: document.getElementById('tool-room')
+};
+let wallStart = null;
+
+function setMode(m, type) {
+  mode = m;
+  pendingType = type || null;
+  cableDraft = null;
+  wallStart = null;
+  slabStart = null;
+  roomStart = null;
+  measureStart = null;
+  clearMeasurePreview();
+  if (m !== 'place') placeExistingId = null;
+  clearPreview();
+  clearGhost();
+  document.querySelectorAll('.lib-item').forEach(el => el.classList.toggle('active', m === 'place' && el.dataset.type === type));
+  for (const [k, btn] of Object.entries(toolButtons)) btn.classList.toggle('active', k === m);
+  document.querySelectorAll('#hotbar .slot[data-mode]').forEach(s => s.classList.toggle('active', s.dataset.mode === m));
+  renderer.domElement.style.cursor = (m === 'select') ? 'default' : 'crosshair';
+  const msgs = {
+    select: 'Select mode — click a device, cable, wall, or rack to inspect.',
+    cable: 'Cable mode — click a source port to start a cable.',
+    delete: 'Delete mode — click a cable, device, hole, wall, or rack to remove it.',
+    rack: 'Click the floor to place a rack. Q rotates. Esc to finish.',
+    wall: 'Wall mode — click the floor to start a wall, click again to end it. Chains until Esc.',
+    drill: 'Drill mode — click a wall to drill a cable pass-through hole.',
+    tie: 'Tie mode — click a cable to strap it (nearby cables bundle into the same tie).',
+    measure: 'Measure — click two points to pin a real-scale ft/in dimension. Everything is 1:1 scale.',
+    slab: 'Upper floor — choose the level in the dropdown, then click two corners on the ground plan.',
+    room: 'Room — click two corners (or pick a preset size and click once). Builds 4 walls + a ceiling.',
+    place: pendingType ? `Placing ${DEVICE_TYPES[pendingType].label} — click a rack slot. Esc cancels.` : ''
+  };
+  setStatus(msgs[m] || '');
+}
+
+toolButtons.select.onclick = () => setMode('select');
+toolButtons.cable.onclick = () => setMode('cable');
+toolButtons.delete.onclick = () => setMode('delete');
+toolButtons.rack.onclick = () => setMode('rack');
+toolButtons.wall.onclick = () => setMode('wall');
+toolButtons.drill.onclick = () => setMode('drill');
+toolButtons.tie.onclick = () => setMode('tie');
+toolButtons.measure.onclick = () => setMode('measure');
+toolButtons.slab.onclick = () => setMode('slab');
+toolButtons.room.onclick = () => setMode('room');
+document.getElementById('btn-xray').onclick = () => setXray(!xrayOn);
+
+function populateLibrary() {
+  const wrap = document.getElementById('lib-items');
+  wrap.innerHTML = '';
+  const fixed = ['Generic', 'Office & Furniture', 'UniFi Gateways', 'UniFi Switches', 'UniFi APs', 'UniFi Cameras', 'UniFi Door Access', 'UniFi Storage & Power',
+    'Cisco & Meraki', 'Aruba / HPE', 'Netgear', 'TP-Link Omada', 'MikroTik', 'Custom'];
+  const extras = [...new Set(Object.values(DEVICE_TYPES).map(d => d.cat))].filter(c => c && !fixed.includes(c));
+  const order = [...fixed, ...extras];
+  const badge = def => {
+    if (!def.field) return def.vertical ? 'side' : def.uh + 'U';
+    return (def.mounts || ['ceiling']).map(m => ({ ceiling: 'ceil', wall: 'wall', desk: 'desk' })[m]).join('·');
+  };
+  for (const cat of order) {
+    const types = Object.entries(DEVICE_TYPES).filter(([, d]) => d.cat === cat);
+    if (!types.length) continue;
+    const det = document.createElement('details');
+    if (cat === 'Generic') det.open = true;
+    const sum = document.createElement('summary');
+    sum.textContent = cat;
+    det.appendChild(sum);
+    for (const [key, def] of types) {
+      const el = document.createElement('div');
+      el.className = 'lib-item';
+      el.dataset.type = key;
+      el.innerHTML = `${def.label} <em>${badge(def)}</em>`;
+      el.onclick = () => setMode('place', key);
+      det.appendChild(el);
+    }
+    wrap.appendChild(det);
+  }
+  if (typeof populatePlanTypes === 'function') populatePlanTypes();
+}
+populateLibrary();
+
+window.addEventListener('keydown', e => {
+  if (walkActive) {
+    // hotbar while walking (letters are reserved for movement)
+    const digitTools = { Digit1: 'select', Digit2: 'cable', Digit3: 'wall', Digit4: 'drill', Digit5: 'tie', Digit6: 'delete', Digit7: 'rack' };
+    if (digitTools[e.code]) setMode(digitTools[e.code]);
+    else if (e.code === 'Digit8') setXray(!xrayOn);
+    else if (e.code === 'Digit9') setSim(!simOn);
+    else if (e.code === 'Digit0') setPhys(!physOn);
+    else if (e.code === 'KeyM') setMode('measure');
+    else if (e.code === 'KeyB') { document.exitPointerLock(); openBuildMenu(true); }
+    else if (e.code === 'KeyF') {
+      flyMode = !flyMode;
+      walkVy = 0;
+      setStatus(flyMode ? 'Flying — Space/C go up and down. F returns to walking.' : 'Walking — Space jumps. F to fly.');
+    }
+    else if (e.key === 'q' || e.key === 'Q') { if (mode === 'rack') pendingRackRot = (pendingRackRot + Math.PI / 2) % (Math.PI * 2); }
+    return;
+  }
+  if (e.target.tagName === 'INPUT' || e.target.tagName === 'SELECT') return;
+  if ((e.metaKey || e.ctrlKey) && (e.key === 'z' || e.key === 'Z')) {
+    e.preventDefault();
+    if (undoStack.length) { restore(undoStack.pop()); setStatus('Undone.'); }
+    else setStatus('Nothing to undo.');
+    return;
+  }
+  if (planOpen) { if (e.key === 'Escape') openPlan(false); return; }
+  if (bmenuOpen) { if (e.key === 'Escape' || e.key === 'b' || e.key === 'B') closeBuildMenu(false); return; }
+  if (e.key === 'b' || e.key === 'B') { openBuildMenu(false); return; }
+  if (e.key === 'Escape') {
+    if (cableDraft) { cableDraft = null; clearPreview(); setStatus('Cable cancelled.'); }
+    else if (wallStart) { wallStart = null; clearGhost(); setStatus('Wall finished.'); }
+    else if (measureStart) { measureStart = null; clearMeasurePreview(); setStatus('Measurement cancelled.'); }
+    else if (slabStart) { slabStart = null; clearGhost(); setStatus('Slab cancelled.'); }
+    else if (roomStart) { roomStart = null; clearGhost(); setStatus('Room cancelled.'); }
+    else if (vlanFocus) { setVlanFocus(null); setStatus('VLAN trace cleared.'); }
+    else setMode('select');
+  }
+  else if (e.key === 'm' || e.key === 'M') setMode('measure');
+  else if (e.key === 'c' || e.key === 'C') setMode('cable');
+  else if (e.key === 'd' || e.key === 'D') setMode('delete');
+  else if (e.key === 'r' || e.key === 'R') setMode('rack');
+  else if (e.key === 'w' || e.key === 'W') setMode('wall');
+  else if (e.key === 'h' || e.key === 'H') setMode('drill');
+  else if (e.key === 'v' || e.key === 'V') enterWalk();
+  else if (e.key === 'x' || e.key === 'X') setXray(!xrayOn);
+  else if (e.key === 'g' || e.key === 'G') setSim(!simOn);
+  else if (e.key === 'p' || e.key === 'P') setPhys(!physOn);
+  else if (e.key === 't' || e.key === 'T') setMode('tie');
+  else if (e.key === 'q' || e.key === 'Q') { if (mode === 'rack') pendingRackRot = (pendingRackRot + Math.PI / 2) % (Math.PI * 2); }
+});
+
+//////////////////// Walk mode (first-person) ////////////////////
+
+let walkActive = false, walkYaw = 0, walkPitch = 0;
+let flyMode = false, walkVy = 0;
+const EYE_H = 66; // standing eye height in inches
+let placeExistingId = null;
+const walkKeys = {};
+
+function enterWalk() {
+  hideProps();
+  // keep the current tool active — build while you walk
+  renderer.domElement.requestPointerLock();
+}
+document.getElementById('btn-walk').onclick = enterWalk;
+
+document.addEventListener('pointerlockchange', () => {
+  walkActive = document.pointerLockElement === renderer.domElement;
+  controls.enabled = !walkActive;
+  document.getElementById('walkhint').classList.toggle('hidden', !walkActive);
+  document.getElementById('crosshair').classList.toggle('hidden', !walkActive);
+  document.getElementById('hotbar').classList.toggle('hidden', !walkActive);
+  document.getElementById('btn-walk').classList.toggle('active', walkActive);
+  if (walkActive) {
+    const e = new THREE.Euler().setFromQuaternion(camera.quaternion, 'YXZ');
+    walkYaw = e.y; walkPitch = e.x;
+    flyMode = false;
+    walkVy = 0;
+    // walking is the default; F toggles flying. Land on whichever floor is below.
+    camera.position.y = groundAt(camera.position.x, camera.position.z, camera.position.y) + EYE_H;
+    setStatus('Walking — WASD move, mouse look, Space jump, F to fly, Shift sprint, click uses the current tool.');
+  } else {
+    const fwd = new THREE.Vector3();
+    camera.getWorldDirection(fwd);
+    controls.target.copy(camera.position).addScaledVector(fwd, 80);
+    setStatus('Select mode — click a device, cable, wall, or rack to inspect.');
+  }
+});
+
+document.addEventListener('mousemove', e => {
+  if (!walkActive) return;
+  walkYaw -= e.movementX * 0.0022;
+  walkPitch = Math.max(-1.5, Math.min(1.5, walkPitch - e.movementY * 0.0022));
+  camera.quaternion.setFromEuler(new THREE.Euler(walkPitch, walkYaw, 0, 'YXZ'));
+});
+document.addEventListener('keydown', e => { walkKeys[e.code] = true; });
+document.addEventListener('keyup', e => { walkKeys[e.code] = false; });
+
+//////////////////// Traffic simulation ////////////////////
+
+let simOn = false;
+const pulses = new Map(); // cableId -> {mesh, frac}
+
+function setSim(on) {
+  simOn = on;
+  document.getElementById('btn-sim').classList.toggle('active', on);
+  if (!on) {
+    for (const p of pulses.values()) scene.remove(p.mesh);
+    pulses.clear();
+    setVlanFocus(null);
+    for (const m of cableMeshes.values()) if (m.material.emissive) m.material.emissive.setHex(0x000000);
+  }
+  setStatus(on ? 'Simulating — packets flow along every cable; VLAN-blocked links glow red. Trace a VLAN from any port\'s properties.' : 'Simulation stopped.');
+}
+document.getElementById('btn-sim').onclick = () => setSim(!simOn);
+
+function updatePulses(dt) {
+  for (const [id, p] of pulses) {
+    if (!state.cables.some(c => c.id === id)) { scene.remove(p.mesh); pulses.delete(id); }
+  }
+  for (const c of state.cables) {
+    const cm = cableMeshes.get(c.id);
+    if (!cm || !cm.userData.curve) continue;
+    // live VLAN validation: a link with no shared VLAN is blocked — glows red
+    const da = deviceById(c.a.deviceId), db = deviceById(c.b.deviceId);
+    const isPower = c.a.port === 'PWR' || c.b.port === 'PWR' ||
+      (da && DEVICE_TYPES[da.type].powerDevice) || (db && DEVICE_TYPES[db.type].powerDevice);
+    let blocked = false;
+    if (da && db && !isPower) {
+      const sh = sharedVlans(da, c.a.port, db, c.b.port);
+      blocked = sh !== 'ALL' && sh.size === 0;
+    }
+    if (isPower) {
+      if (cm.material.emissive) cm.material.emissive.setHex(0x000000);
+      const stale = pulses.get(c.id);
+      if (stale) { scene.remove(stale.mesh); pulses.delete(c.id); }
+      continue; // power feeds silently — no packets on a power cord
+    }
+    if (cm.material.emissive) cm.material.emissive.setHex(blocked ? 0x8a1616 : 0x000000);
+    if (blocked || (vlanFocus && !vlanFocus.cables.has(c.id))) {
+      const stale = pulses.get(c.id);
+      if (stale) { scene.remove(stale.mesh); pulses.delete(c.id); }
+      continue;
+    }
+    let p = pulses.get(c.id);
+    if (!p) {
+      const col = vlanFocus ? vlanColor(vlanFocus.vlan)
+        : new THREE.Color(c.color).lerp(new THREE.Color(0xffffff), 0.65);
+      const m = new THREE.Mesh(new THREE.SphereGeometry(0.55, 10, 10),
+        new THREE.MeshBasicMaterial({ color: col }));
+      scene.add(m);
+      p = { mesh: m, frac: Math.random() };
+      pulses.set(c.id, p);
+    }
+    p.frac = (p.frac + dt * 140 / Math.max(c.lengthIn || 60, 20)) % 1;
+    p.mesh.position.copy(cm.userData.curve.getPointAt(p.frac));
+  }
+}
+
+//////////////////// Cable physics (verlet ropes) ////////////////////
+
+let physOn = false;
+const ropes = new Map(); // cableId -> {pts, prev, pins, segLen}
+
+function setPhys(on) {
+  physOn = on;
+  document.getElementById('btn-phys').classList.toggle('active', on);
+  ropes.clear();
+  if (on) {
+    for (const c of state.cables) buildRope(c);
+    setStatus('Cable physics ON — cables hang with real slack. Set slack % per cable in its properties.');
+  } else {
+    for (const c of state.cables) rebuildCable(c);
+    for (const t of state.ties) {
+      const g = tieGroups.get(t.id);
+      if (g) {
+        g.position.set(t.x, t.y, t.z);
+        g.quaternion.setFromUnitVectors(new THREE.Vector3(0, 0, 1),
+          new THREE.Vector3(t.tx || 1, t.ty || 0, t.tz || 0).normalize());
+      }
+    }
+    setStatus('Cable physics off — cables return to drawn routes.');
+  }
+}
+document.getElementById('btn-phys').onclick = () => setPhys(!physOn);
+
+function buildRope(cable) {
+  const curve = cableCurve(cable);
+  if (!curve) return;
+  const len = curve.getLength();
+  const N = Math.max(10, Math.min(70, Math.round(len / 3)));
+  const pts = [], prev = [];
+  for (let i = 0; i < N; i++) {
+    const p = curve.getPointAt(i / (N - 1));
+    pts.push(p.clone()); prev.push(p.clone());
+  }
+  const pins = new Map();
+  pins.set(0, pts[0].clone());
+  pins.set(N - 1, pts[N - 1].clone());
+  // rope is held wherever the user routed it: managers, wall holes
+  for (const w of cable.waypoints) {
+    const wv = new THREE.Vector3(w.x, w.y, w.z);
+    let best = 1, bd = Infinity;
+    for (let i = 1; i < N - 1; i++) {
+      const d = pts[i].distanceToSquared(wv);
+      if (d < bd) { bd = d; best = i; }
+    }
+    pins.set(best, wv.clone());
+  }
+  const slack = (cable.slack === undefined ? 2 : cable.slack) / 100;
+  ropes.set(cable.id, { pts, prev, pins, segLen: (len * (1 + slack)) / (N - 1) });
+}
+
+const _ropeOff = new THREE.Vector3();
+let physAcc = 0;
+
+// ---- cable collision: ropes cannot clip through walls or floor slabs ----
+let collidersDirty = true;
+let ropeColliders = [];
+let holeZones = [];
+const _cl = new THREE.Vector3();
+const _hz = new THREE.Vector3();
+function rebuildRopeColliders() {
+  collidersDirty = false;
+  ropeColliders = [];
+  holeZones = (state.holes || []).map(h => ({
+    c: new THREE.Vector3(h.x, h.y, h.z),
+    n: new THREE.Vector3(h.nx || 0, h.ny || 0, h.nz || 0).normalize(),
+    r: (h.r || 0.9) + 1.1,
+    half: (h.t || WALL_T) / 2 + 1.6
+  }));
+  const R = 0.28; // cable radius + margin
+  for (const [id, m] of wallMeshes) {
+    const w = state.walls.find(x => x.id === id);
+    if (!w) continue;
+    m.updateMatrixWorld(true);
+    ropeColliders.push({
+      inv: m.matrixWorld.clone().invert(),
+      mat: m.matrixWorld.clone(),
+      hx: Math.hypot(w.x2 - w.x1, w.z2 - w.z1) / 2 + R,
+      hy: (w.h || WALL_H) / 2 + R,
+      hz: WALL_T / 2 + R
+    });
+  }
+  for (const s of state.slabs || []) {
+    ropeColliders.push({
+      aabb: true,
+      x1: Math.min(s.x1, s.x2) - R, x2: Math.max(s.x1, s.x2) + R,
+      y1: s.y - 6 - R, y2: s.y + R,
+      z1: Math.min(s.z1, s.z2) - R, z2: Math.max(s.z1, s.z2) + R
+    });
+  }
+  // rack corner posts — cables route around the frame, not through it
+  for (const [, rg] of rackGroups) {
+    rg.updateMatrixWorld(true);
+    const inv = rg.matrixWorld.clone().invert(), mtx = rg.matrixWorld.clone();
+    for (const [px2, pz2] of [[-1, 1], [1, 1], [-1, -1], [1, -1]]) {
+      ropeColliders.push({
+        inv, mat: mtx,
+        cx: px2 * (RACK_OUTER_W / 2 - 1), cy: RACK_H / 2, cz: pz2 * (RACK_D / 2 - 1.5),
+        hx: 1 + R, hy: RACK_H / 2, hz: 1.5 + R
+      });
+    }
+  }
+  // mounted device chassis — cables drape over gear, never through it
+  for (const d of state.devices) {
+    const dd = DEVICE_TYPES[d.type];
+    if (dd.field || dd.vertical || d.rackId === undefined || d.u === undefined) continue;
+    const rg = rackGroups.get(d.rackId);
+    if (!rg) continue;
+    ropeColliders.push({
+      inv: rg.matrixWorld.clone().invert(), mat: rg.matrixWorld.clone(),
+      cx: 0, cy: RACK_BASE + (d.u - 1) * U + dd.uh * U / 2, cz: RACK_D / 2 - 1 - dd.depth / 2 + 0.5,
+      hx: RACK_W / 2 + R, hy: dd.uh * U / 2 + R, hz: Math.max(dd.depth, 2) / 2 + R
+    });
+  }
+  // Field gear and furniture had no colliders at all, so a run would happily pass
+  // through a mounting pole, a desk or a standing person. Derive one box per solid
+  // mesh directly from its geometry: automatic, and exact for whatever the catalog
+  // builds — including anything the assistant adds later.
+  for (const d of state.devices) {
+    const dd = DEVICE_TYPES[d.type];
+    if (!dd.field && !dd.vertical) continue;
+    const g = deviceGroups.get(d.id);
+    if (!g) continue;
+    g.updateMatrixWorld(true);
+    g.traverse(o => {
+      if (!o.isMesh || !o.geometry || !(o.userData && o.userData.isDeviceBody)) return;
+      if (!o.geometry.boundingBox) o.geometry.computeBoundingBox();
+      const bb = o.geometry.boundingBox;
+      bb.getCenter(_bbc); bb.getSize(_bbs);
+      ropeColliders.push({
+        inv: o.matrixWorld.clone().invert(), mat: o.matrixWorld.clone(),
+        cx: _bbc.x, cy: _bbc.y, cz: _bbc.z,
+        hx: _bbs.x / 2 + R, hy: _bbs.y / 2 + R, hz: _bbs.z / 2 + R
+      });
+    });
+  }
+  for (const c of ropeColliders) finalizeCollider(c);
+}
+
+// Precompute a world-space AABB per collider. collidePoint runs for every free
+// sample of every cable across ten relaxation passes, so rejecting the ~95% of
+// colliders that are nowhere near the point with six compares — instead of a
+// matrix multiply each — is what keeps a fully-cabled rack interactive.
+const _bbc = new THREE.Vector3(), _bbs = new THREE.Vector3();
+const _corner = new THREE.Vector3();
+function finalizeCollider(c) {
+  if (c.aabb) {
+    c.wx1 = c.x1; c.wy1 = c.y1; c.wz1 = c.z1;
+    c.wx2 = c.x2; c.wy2 = c.y2; c.wz2 = c.z2;
+    return;
+  }
+  let x1 = Infinity, y1 = Infinity, z1 = Infinity, x2 = -Infinity, y2 = -Infinity, z2 = -Infinity;
+  for (let i = 0; i < 8; i++) {
+    _corner.set(
+      (c.cx || 0) + ((i & 1) ? c.hx : -c.hx),
+      (c.cy || 0) + ((i & 2) ? c.hy : -c.hy),
+      (c.cz || 0) + ((i & 4) ? c.hz : -c.hz)
+    ).applyMatrix4(c.mat);
+    x1 = Math.min(x1, _corner.x); x2 = Math.max(x2, _corner.x);
+    y1 = Math.min(y1, _corner.y); y2 = Math.max(y2, _corner.y);
+    z1 = Math.min(z1, _corner.z); z2 = Math.max(z2, _corner.z);
+  }
+  c.wx1 = x1; c.wy1 = y1; c.wz1 = z1;
+  c.wx2 = x2; c.wy2 = y2; c.wz2 = z2;
+}
+function collidePoint(p) {
+  // inside a drilled bore? then walls/slabs don't push — the cable is in the hole
+  for (const z of holeZones) {
+    _hz.copy(p).sub(z.c);
+    const along = _hz.dot(z.n);
+    if (Math.abs(along) < z.half && _hz.addScaledVector(z.n, -along).length() < z.r) return;
+  }
+  for (const c of ropeColliders) {
+    // broadphase: world AABB reject before any matrix work
+    if (p.x < c.wx1 || p.x > c.wx2 || p.y < c.wy1 || p.y > c.wy2 || p.z < c.wz1 || p.z > c.wz2) continue;
+    if (c.aabb) {
+      if (p.x > c.x1 && p.x < c.x2 && p.y > c.y1 && p.y < c.y2 && p.z > c.z1 && p.z < c.z2) {
+        // push out along the axis of least penetration
+        const dx = Math.min(p.x - c.x1, c.x2 - p.x);
+        const dy = Math.min(p.y - c.y1, c.y2 - p.y);
+        const dz = Math.min(p.z - c.z1, c.z2 - p.z);
+        if (dy <= dx && dy <= dz) p.y = (p.y - c.y1 < c.y2 - p.y) ? c.y1 : c.y2;
+        else if (dx <= dz) p.x = (p.x - c.x1 < c.x2 - p.x) ? c.x1 : c.x2;
+        else p.z = (p.z - c.z1 < c.z2 - p.z) ? c.z1 : c.z2;
+      }
+      continue;
+    }
+    _cl.copy(p).applyMatrix4(c.inv);
+    _cl.x -= c.cx || 0; _cl.y -= c.cy || 0; _cl.z -= c.cz || 0;
+    if (Math.abs(_cl.x) < c.hx && Math.abs(_cl.y) < c.hy && Math.abs(_cl.z) < c.hz) {
+      const dx = c.hx - Math.abs(_cl.x), dy = c.hy - Math.abs(_cl.y), dz = c.hz - Math.abs(_cl.z);
+      if (dz <= dx && dz <= dy) _cl.z = Math.sign(_cl.z || 1) * c.hz;      // usually out the face
+      else if (dy <= dx) _cl.y = Math.sign(_cl.y || 1) * c.hy;
+      else _cl.x = Math.sign(_cl.x || 1) * c.hx;
+      _cl.x += c.cx || 0; _cl.y += c.cy || 0; _cl.z += c.cz || 0;
+      p.copy(_cl.applyMatrix4(c.mat));
+    }
+  }
+}
+function ropeSubstep(h) {
+  const grav = -386 * h * h; // gravity, verlet form
+  for (const [, r] of ropes) {
+    const { pts, prev, pins } = r;
+    for (let i = 0; i < pts.length; i++) {
+      if (pins.has(i)) { pts[i].copy(pins.get(i)); prev[i].copy(pts[i]); continue; }
+      const p = pts[i], q = prev[i];
+      const nx = p.x + (p.x - q.x) * 0.985;
+      const ny = p.y + (p.y - q.y) * 0.985 + grav;
+      const nz = p.z + (p.z - q.z) * 0.985;
+      q.copy(p);
+      p.set(nx, Math.max(0.3, ny), nz); // floor collision
+    }
+  }
+  for (let it = 0; it < 4; it++) {
+    for (const [, r] of ropes) {
+      const { pts, pins, segLen } = r;
+      for (let i = 0; i < pts.length - 1; i++) {
+        const a = pts[i], b = pts[i + 1];
+        const d = a.distanceTo(b) || 1e-6;
+        const diff = (d - segLen) / d / 2;
+        _ropeOff.subVectors(b, a).multiplyScalar(diff);
+        const pa = pins.has(i), pb = pins.has(i + 1);
+        if (!pa && !pb) { a.add(_ropeOff); b.sub(_ropeOff); }
+        else if (pa && !pb) b.sub(_ropeOff.multiplyScalar(2));
+        else if (!pa && pb) a.add(_ropeOff.multiplyScalar(2));
+      }
+    }
+    // ties bundle cables to EACH OTHER inside the solver so they stay cinched
+    for (const tie of state.ties) {
+      if (!tie.members || tie.members.length < 2) continue;
+      const list = [];
+      for (const m of tie.members) {
+        const r = ropes.get(m.cableId);
+        if (!r) continue;
+        list.push({ r, idx: Math.max(1, Math.min(r.pts.length - 2, Math.round(m.t * (r.pts.length - 1)))) });
+      }
+      if (list.length < 2) continue;
+      const c = new THREE.Vector3();
+      for (const { r, idx } of list) c.add(r.pts[idx]);
+      c.multiplyScalar(1 / list.length);
+      list.forEach(({ r, idx }, k) => {
+        if (r.pins.has(idx)) return;
+        const ang = (k / list.length) * Math.PI * 2;
+        r.pts[idx].lerp(c, 0.5);
+        r.pts[idx].x += Math.cos(ang) * 0.27;
+        r.pts[idx].y += Math.sin(ang) * 0.27;
+      });
+    }
+  }
+  // bend stiffness once per substep — cat6 holds a smooth curve without jitter
+  for (const [, r] of ropes) {
+    const { pts, pins } = r;
+    for (let i = 1; i < pts.length - 1; i++) {
+      if (pins.has(i)) continue;
+      _ropeOff.copy(pts[i - 1]).add(pts[i + 1]).multiplyScalar(0.5);
+      pts[i].lerp(_ropeOff, 0.22);
+    }
+  }
+  // no clipping: push every free particle out of walls, slabs and gear
+  for (const [, r] of ropes) {
+    const { pts, pins } = r;
+    for (let i = 0; i < pts.length; i++) {
+      if (!pins.has(i)) collidePoint(pts[i]);
+    }
+  }
+}
+
+// Cables are solid to each other in physics mode too, or the sim would undo the
+// separation the static settle just achieved. One spatial hash over every
+// particle, then a symmetric push — both particles move, unlike the static pass
+// where the already-laid route is frozen.
+//
+// Runs once per frame rather than per 120 Hz substep: separation is a positional
+// constraint, and resolving it at frame rate is visually identical while costing
+// half as much. It was the single most expensive thing in the physics loop.
+function separateRopes() {
+  const cell = CABLE_SEP * 2;
+  const grid = new Map();
+  for (const [id, r] of ropes) {
+    for (let i = 0; i < r.pts.length; i++) {
+      const p = r.pts[i];
+      const k = `${Math.floor(p.x / cell)},${Math.floor(p.y / cell)},${Math.floor(p.z / cell)}`;
+      let a = grid.get(k);
+      if (!a) grid.set(k, a = []);
+      a.push({ r, i, id });
+    }
+  }
+  for (const [, bucket] of grid) {
+    for (const A of bucket) {
+      const pa = A.r.pts[A.i];
+      const bx = Math.floor(pa.x / cell), by = Math.floor(pa.y / cell), bz = Math.floor(pa.z / cell);
+      // sweep the 27 neighbouring cells, not just our own — a pair straddling a
+      // cell boundary is exactly the pair most likely to be touching
+      for (let dx = -1; dx <= 1; dx++) for (let dy = -1; dy <= 1; dy++) for (let dz = -1; dz <= 1; dz++) {
+        const near = grid.get(`${bx + dx},${by + dy},${bz + dz}`);
+        if (!near) continue;
+        for (const B of near) {
+          if (A.id === B.id || A === B) continue;
+          const pb = B.r.pts[B.i];
+          _ropeOff.subVectors(pa, pb);
+          const d = _ropeOff.length();
+          if (d >= CABLE_SEP) continue;
+          // exactly coincident particles have no separating direction of their
+          // own; skipping them would weld two cables together forever, so give
+          // them a defined one instead
+          if (d < 1e-5) _ropeOff.set(0.002, CABLE_SEP, 0);
+          else _ropeOff.multiplyScalar((CABLE_SEP - d) / d * 0.5);
+          if (!A.r.pins.has(A.i)) pa.add(_ropeOff);
+          if (!B.r.pins.has(B.i)) pb.sub(_ropeOff);
+        }
+      }
+    }
+  }
+  // a separation push can shove a particle into gear, so geometry gets the last word
+  for (const [, r] of ropes) {
+    const { pts, pins } = r;
+    for (let i = 0; i < pts.length; i++) {
+      if (!pins.has(i)) collidePoint(pts[i]);
+    }
+  }
+}
+
+function stepRopes(dt) {
+  for (const id of [...ropes.keys()]) {
+    if (!state.cables.some(c => c.id === id)) ropes.delete(id);
+  }
+  for (const c of state.cables) if (!ropes.has(c.id)) buildRope(c);
+  if (collidersDirty) rebuildRopeColliders();
+  // fixed 120 Hz substeps — frame-rate independent, no more jelly
+  physAcc = Math.min(physAcc + dt, 0.08);
+  const h = 1 / 120;
+  while (physAcc >= h) { physAcc -= h; ropeSubstep(h); }
+  separateRopes();
+  // Ties: pull member particles of each bundle toward their shared centroid,
+  // with a small radial offset so cables sit side by side inside the strap.
+  for (const tie of state.ties) {
+    if (!tie.members) continue;
+    const list = [];
+    for (const m of tie.members) {
+      const r = ropes.get(m.cableId);
+      if (!r) continue;
+      const idx = Math.max(1, Math.min(r.pts.length - 2, Math.round(m.t * (r.pts.length - 1))));
+      list.push({ r, idx });
+    }
+    if (!list.length) continue;
+    const c = new THREE.Vector3();
+    for (const { r, idx } of list) c.add(r.pts[idx]);
+    c.multiplyScalar(1 / list.length);
+    // (bundling itself happens inside the solver; here we just track the strap visual)
+    const g = tieGroups.get(tie.id);
+    if (g) {
+      g.position.copy(c);
+      const { r, idx } = list[0];
+      _ropeOff.subVectors(r.pts[Math.min(idx + 1, r.pts.length - 1)], r.pts[Math.max(idx - 1, 0)]).normalize();
+      g.quaternion.setFromUnitVectors(new THREE.Vector3(0, 0, 1), _ropeOff.clone());
+    }
+  }
+  // finally, rebuild the tube geometry from the settled particles
+  for (const [id, r] of ropes) {
+    const m = cableMeshes.get(id);
+    if (m) {
+      const curve = new THREE.CatmullRomCurve3(r.pts, false, 'centripetal', 0.5);
+      m.geometry.dispose();
+      m.geometry = new THREE.TubeGeometry(curve, r.pts.length * 2, CABLE_R, CABLE_RADIAL, false);
+      m.userData.curve = curve;
+      const cc = state.cables.find(c => c.id === id);
+      if (cc) cc.lengthIn = curve.getLength();
+    }
+  }
+}
+
+//////////////////// Save / Load / Export ////////////////////
+
+function serialize() {
+  return JSON.stringify({ version: 1, nextId, ...state }, null, 2);
+}
+
+async function saveMap() {
+  const data = serialize();
+  if (window.netmapNative) {
+    const r = await window.netmapNative.saveFile({ defaultName: 'network-map.json', data });
+    if (r.ok) setStatus('Saved to ' + r.filePath);
+  } else {
+    downloadBlob(data, 'network-map.json', 'application/json');
+  }
+}
+
+async function loadMap() {
+  if (window.netmapNative) {
+    const r = await window.netmapNative.openFile();
+    if (r.ok) restore(r.data);
+  } else {
+    const inp = document.createElement('input');
+    inp.type = 'file'; inp.accept = '.json';
+    inp.onchange = () => {
+      const f = inp.files[0];
+      if (!f) return;
+      const rd = new FileReader();
+      rd.onload = () => restore(rd.result);
+      rd.readAsText(f);
+    };
+    inp.click();
+  }
+}
+
+function clearScene() {
+  for (const id of [...cableMeshes.keys()]) deleteCable(id);
+  for (const r of [...state.racks]) deleteRack(r.id);
+  for (const d of [...state.devices]) deleteDevice(d.id);
+  for (const w of [...state.walls]) deleteWall(w.id);
+  for (const h of [...state.holes]) deleteHole(h.id);
+  for (const t of [...state.ties]) deleteTie(t.id);
+  for (const m of [...(state.measures || [])]) deleteMeasure(m.id);
+  for (const s of [...(state.slabs || [])]) deleteSlab(s.id);
+  cableRoutes.clear();
+  state = { racks: [], devices: [], cables: [], walls: [], holes: [], links: [], ties: [], measures: [], slabs: [], customTypes: state.customTypes || {} };
+}
+
+// Saves written before endpoints carried a side: everything defaults to the
+// front jack, except that a patch port holding two legacy cables gets the second
+// one moved to the rear punchdown — which is what those two cables always meant
+// (a patch lead on the front, the permanent run on the back).
+function migrateCableSides(cables) {
+  const used = new Set();
+  for (const c of cables) {
+    for (const ep of [c.a, c.b]) {
+      if (ep.side === FRONT || ep.side === REAR) { used.add(`${ep.deviceId}:${ep.port}:${ep.side}`); continue; }
+      const dev = deviceById(ep.deviceId);
+      const def = dev && DEVICE_TYPES[dev.type];
+      const front = `${ep.deviceId}:${ep.port}:${FRONT}`;
+      // rear-only jacks (UPS outlets, power inlets) were never front to begin with
+      const rearOnly = def && (def.powerDevice || ep.port === 'PWR');
+      ep.side = (rearOnly || (def && def.passthrough && used.has(front))) ? REAR : FRONT;
+      used.add(`${ep.deviceId}:${ep.port}:${ep.side}`);
+    }
+  }
+}
+
+function restore(json) {
+  let data;
+  try { data = JSON.parse(json); } catch { setStatus('Could not parse that file.'); return; }
+  clearScene();
+  state = {
+    racks: data.racks || [], devices: data.devices || [], cables: data.cables || [],
+    walls: data.walls || [], holes: data.holes || [], links: data.links || [], ties: data.ties || [],
+    measures: data.measures || [], slabs: data.slabs || [], customTypes: data.customTypes || {}
+  };
+  nextId = data.nextId || 1000;
+  migrateCableSides(state.cables);
+  // re-register custom devices BEFORE rebuilding anything that uses them
+  Object.assign(DEVICE_TYPES, state.customTypes);
+  populateLibrary();
+  for (const s of state.slabs) buildSlab(s);
+  for (const m of state.measures) buildMeasure(m);
+  for (const w of state.walls) buildWall(w);
+  for (const h of state.holes) buildHole(h);
+  for (const r of state.racks) buildRackGroup(r);
+  for (const d of state.devices) buildDeviceGroup(d);
+  for (const c of state.cables) buildCableMesh(c);
+  for (const t of state.ties) buildTie(t);
+  hideProps();
+  setStatus(`Loaded: ${state.racks.length} racks, ${state.devices.length} devices, ${state.cables.length} cables, ${state.walls.length} walls.`);
+}
+
+function exportCSV() {
+  const rows = [['Cable ID', 'From Device', 'From IP', 'From Port', 'From Face',
+    'To Device', 'To IP', 'To Port', 'To Face', 'Color', 'Route Points', 'Est. Length (ft)']];
+  // The face column is what makes this sheet installable: "panel port 12" is
+  // ambiguous on site, "panel port 12 rear" is a punchdown instruction.
+  const face = (dev, ep) => dev && DEVICE_TYPES[dev.type].passthrough ? epSide(ep) : '';
+  for (const c of state.cables) {
+    const da = deviceById(c.a.deviceId), db = deviceById(c.b.deviceId);
+    rows.push([c.id, da ? da.name : '?', da && da.ip ? da.ip : '', c.a.port, face(da, c.a),
+      db ? db.name : '?', db && db.ip ? db.ip : '', c.b.port, face(db, c.b),
+      CABLE_COLOR_NAMES[c.color] || c.color, c.waypoints.length, (c.lengthIn / 12).toFixed(1)]);
+  }
+  // device inventory appended below the cable map
+  rows.push([], ['Device', 'Type', 'IP', 'Location', 'Notes']);
+  for (const d of state.devices) {
+    const def = DEVICE_TYPES[d.type];
+    const rack = rackById(d.rackId);
+    const loc = def.field ? `floor ${d.x}",${d.z}"` : `${rack ? rack.name : '?'} ${def.vertical ? (d.side === 'L' ? 'left side' : 'right side') : 'U' + d.u}`;
+    rows.push([d.name, def.label, d.ip || '', loc, d.notes || '']);
+  }
+  if (state.links.length) {
+    rows.push([], ['Planned Link', 'From', 'To', 'Status']);
+    for (const l of state.links) {
+      const a = deviceById(l.aId), b = deviceById(l.bId);
+      const built = state.cables.some(c =>
+        (c.a.deviceId === l.aId && c.b.deviceId === l.bId) ||
+        (c.a.deviceId === l.bId && c.b.deviceId === l.aId));
+      rows.push([l.id, a ? a.name : '?', b ? b.name : '?', built ? 'Built' : 'Planned']);
+    }
+  }
+  const csv = rows.map(r => r.map(v => `"${String(v).replace(/"/g, '""')}"`).join(',')).join('\n');
+  if (window.netmapNative) {
+    window.netmapNative.saveFile({
+      defaultName: 'port-map.csv', data: csv,
+      filters: [{ name: 'CSV', extensions: ['csv'] }]
+    }).then(r => { if (r.ok) setStatus('Exported ' + r.filePath); });
+  } else {
+    downloadBlob(csv, 'port-map.csv', 'text/csv');
+  }
+}
+
+function downloadBlob(data, name, type) {
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob([data], { type }));
+  a.download = name;
+  a.click();
+  URL.revokeObjectURL(a.href);
+}
+
+document.getElementById('btn-save').onclick = () => { currentProject ? saveProject() : saveMap(); };
+document.getElementById('btn-load').onclick = () => openLauncher();
+document.getElementById('btn-export').onclick = exportCSV;
+
+//////////////////// 2D logical plan view ////////////////////
+
+let planOpen = false, planMode = 'select', planLinkFrom = null;
+const planCam = { x: 0, y: 0, s: 1 };
+let planDrag = null, planMoved = false, planMouse = null;
+const planCanvas = document.getElementById('plan-canvas');
+const pctx = planCanvas.getContext('2d');
+const NW = 160, NH = 56;
+
+function openPlan(open) {
+  planOpen = open;
+  document.getElementById('plan2d').classList.toggle('hidden', !open);
+  document.getElementById('btn-plan').classList.toggle('active', open);
+  if (open) {
+    hideProps();
+    setMode('select');
+    autoLayout(false);
+    resizePlan();
+    setStatus('2D plan — drag nodes to arrange, Link tool plans connections (dashed until physically cabled), + Device adds logical devices you can later place in 3D.');
+  }
+}
+document.getElementById('btn-plan').onclick = () => openPlan(!planOpen);
+document.getElementById('plan-close').onclick = () => openPlan(false);
+document.getElementById('plan-layout').onclick = () => autoLayout(true);
+for (const m of ['select', 'link', 'delete']) {
+  document.getElementById('plan-' + m).onclick = () => {
+    planMode = m; planLinkFrom = null;
+    document.querySelectorAll('.ptool').forEach(b => b.classList.remove('active'));
+    document.getElementById('plan-' + m).classList.add('active');
+  };
+}
+function populatePlanTypes() {
+  const sel = document.getElementById('plan-type');
+  sel.innerHTML = '';
+  const groups = {};
+  for (const [key, def] of Object.entries(DEVICE_TYPES)) {
+    if (def.manager) continue;
+    (groups[def.cat] = groups[def.cat] || []).push([key, def]);
+  }
+  for (const [cat, items] of Object.entries(groups)) {
+    const og = document.createElement('optgroup');
+    og.label = cat;
+    for (const [key, def] of items) {
+      const o = document.createElement('option');
+      o.value = key;
+      o.textContent = def.label;
+      og.appendChild(o);
+    }
+    sel.appendChild(og);
+  }
+}
+populatePlanTypes();
+
+document.getElementById('plan-add').onclick = () => {
+  undoPush();
+  const type = document.getElementById('plan-type').value;
+  const dev = {
+    id: uid(), type, name: deviceLabelCounter(type),
+    px: planCam.x + (Math.random() - 0.5) * 120, py: planCam.y + (Math.random() - 0.5) * 120
+  };
+  state.devices.push(dev);
+  setStatus(`${dev.name} added to the plan. Click it and use "Place in 3D map" when you're ready to build it.`);
+};
+
+function resizePlan() {
+  planCanvas.width = planCanvas.clientWidth;
+  planCanvas.height = planCanvas.clientHeight;
+}
+window.addEventListener('resize', () => { if (planOpen) resizePlan(); });
+
+const TIER = { router: 0, firewall: 0, switch48: 1, switch24: 1, patch24: 2, server: 3, ap: 3, camera: 3, ups: 4, hcm: 4, vcm: 4 };
+function tierOf(type) {
+  if (TIER[type] !== undefined) return TIER[type];
+  switch (DEVICE_TYPES[type].cat) {
+    case 'UniFi Gateways': return 0;
+    case 'UniFi Switches': return 1;
+    case 'UniFi APs': case 'UniFi Cameras': case 'UniFi Door Access': return 3;
+    default: return 4;
+  }
+}
+function autoLayout(force) {
+  const targets = state.devices.filter(d => force || d.px === undefined);
+  if (!targets.length) return;
+  const tiers = {};
+  for (const d of targets) {
+    const t = tierOf(d.type);
+    (tiers[t] = tiers[t] || []).push(d);
+  }
+  for (const t of Object.keys(tiers)) {
+    tiers[t].forEach((d, i) => {
+      d.px = (i - (tiers[t].length - 1) / 2) * (NW + 40);
+      d.py = -200 + t * 140;
+    });
+  }
+}
+
+const toScreen = (x, y) => [(x - planCam.x) * planCam.s + planCanvas.width / 2, (y - planCam.y) * planCam.s + planCanvas.height / 2];
+const toWorld = (sx, sy) => [(sx - planCanvas.width / 2) / planCam.s + planCam.x, (sy - planCanvas.height / 2) / planCam.s + planCam.y];
+
+function linkBuilt(l) {
+  return state.cables.some(c =>
+    (c.a.deviceId === l.aId && c.b.deviceId === l.bId) ||
+    (c.a.deviceId === l.bId && c.b.deviceId === l.aId));
+}
+
+function roundRectPath(x, y, w, h, r) {
+  pctx.beginPath();
+  pctx.moveTo(x + r, y);
+  pctx.arcTo(x + w, y, x + w, y + h, r);
+  pctx.arcTo(x + w, y + h, x, y + h, r);
+  pctx.arcTo(x, y + h, x, y, r);
+  pctx.arcTo(x, y, x + w, y, r);
+  pctx.closePath();
+}
+
+function drawPlan() {
+  const w = planCanvas.width, h = planCanvas.height;
+  pctx.clearRect(0, 0, w, h);
+  const step = 40 * planCam.s;
+  if (step > 13) {
+    pctx.fillStyle = '#1b2230';
+    const [wx0, wy0] = toWorld(0, 0);
+    const ox = (-wx0 * planCam.s % step + step) % step, oy = (-wy0 * planCam.s % step + step) % step;
+    for (let x = ox; x < w; x += step) for (let y = oy; y < h; y += step) pctx.fillRect(x - 1, y - 1, 2, 2);
+  }
+  pctx.lineWidth = 2.5;
+  for (const c of state.cables) {
+    const a = deviceById(c.a.deviceId), b = deviceById(c.b.deviceId);
+    if (!a || !b || a.px === undefined || b.px === undefined) continue;
+    const [x1, y1] = toScreen(a.px, a.py), [x2, y2] = toScreen(b.px, b.py);
+    pctx.strokeStyle = c.color;
+    pctx.setLineDash([]);
+    pctx.beginPath(); pctx.moveTo(x1, y1); pctx.lineTo(x2, y2); pctx.stroke();
+    if (planCam.s > 0.55) {
+      pctx.fillStyle = '#9aa7b8';
+      pctx.font = `${10 * planCam.s}px sans-serif`;
+      pctx.fillText(String(c.a.port), x1 + (x2 - x1) * 0.22, y1 + (y2 - y1) * 0.22 - 4);
+      pctx.fillText(String(c.b.port), x1 + (x2 - x1) * 0.78, y1 + (y2 - y1) * 0.78 - 4);
+    }
+  }
+  for (const l of state.links) {
+    if (linkBuilt(l)) continue;
+    const a = deviceById(l.aId), b = deviceById(l.bId);
+    if (!a || !b || a.px === undefined || b.px === undefined) continue;
+    const [x1, y1] = toScreen(a.px, a.py), [x2, y2] = toScreen(b.px, b.py);
+    pctx.strokeStyle = '#5b7cff';
+    pctx.setLineDash([7, 5]);
+    pctx.beginPath(); pctx.moveTo(x1, y1); pctx.lineTo(x2, y2); pctx.stroke();
+  }
+  pctx.setLineDash([]);
+  if (planMode === 'link' && planLinkFrom !== null && planMouse) {
+    const a = deviceById(planLinkFrom);
+    if (a && a.px !== undefined) {
+      const [x1, y1] = toScreen(a.px, a.py);
+      pctx.strokeStyle = '#5b7cff';
+      pctx.setLineDash([4, 4]);
+      pctx.beginPath(); pctx.moveTo(x1, y1); pctx.lineTo(planMouse[0], planMouse[1]); pctx.stroke();
+      pctx.setLineDash([]);
+    }
+  }
+  for (const d of state.devices) {
+    if (d.px === undefined) continue;
+    const def = DEVICE_TYPES[d.type];
+    const [cx, cy] = toScreen(d.px, d.py);
+    const nw = NW * planCam.s, nh = NH * planCam.s;
+    const x = cx - nw / 2, y = cy - nh / 2;
+    pctx.fillStyle = '#1b212b';
+    pctx.strokeStyle = (selected && selected.kind === 'device' && selected.id === d.id) ? '#4da3ff'
+      : (planLinkFrom === d.id ? '#5b7cff' : '#333d4e');
+    pctx.lineWidth = 1.5;
+    pctx.setLineDash(isPlaced(d) ? [] : [5, 4]);
+    roundRectPath(x, y, nw, nh, 8 * planCam.s);
+    pctx.fill(); pctx.stroke();
+    pctx.setLineDash([]);
+    const accent = def.color === 0x1c1f26 ? 0x4da3ff : def.color;
+    pctx.fillStyle = '#' + new THREE.Color(accent).getHexString();
+    pctx.fillRect(x, y + 2, 4 * planCam.s, nh - 4);
+    if (planCam.s > 0.45) {
+      pctx.fillStyle = '#e8eefc';
+      pctx.font = `600 ${13 * planCam.s}px sans-serif`;
+      pctx.fillText(d.name, x + 12 * planCam.s, y + 21 * planCam.s);
+      pctx.fillStyle = '#7c8ba0';
+      pctx.font = `${11 * planCam.s}px sans-serif`;
+      pctx.fillText((d.ip || def.label) + (isPlaced(d) ? '' : ' · unplaced'), x + 12 * planCam.s, y + 40 * planCam.s);
+    }
+    pctx.lineWidth = 2.5;
+  }
+}
+
+function planNodeAt(sx, sy) {
+  const [wx, wy] = toWorld(sx, sy);
+  for (let i = state.devices.length - 1; i >= 0; i--) {
+    const d = state.devices[i];
+    if (d.px === undefined) continue;
+    if (Math.abs(wx - d.px) < NW / 2 && Math.abs(wy - d.py) < NH / 2) return d;
+  }
+  return null;
+}
+function distToSeg(px, py, x1, y1, x2, y2) {
+  const dx = x2 - x1, dy = y2 - y1;
+  const t = Math.max(0, Math.min(1, ((px - x1) * dx + (py - y1) * dy) / (dx * dx + dy * dy || 1)));
+  return Math.hypot(px - (x1 + t * dx), py - (y1 + t * dy));
+}
+function planEdgeAt(sx, sy) {
+  const [wx, wy] = toWorld(sx, sy);
+  const tol = 8 / planCam.s;
+  for (const c of state.cables) {
+    const a = deviceById(c.a.deviceId), b = deviceById(c.b.deviceId);
+    if (!a || !b || a.px === undefined || b.px === undefined) continue;
+    if (distToSeg(wx, wy, a.px, a.py, b.px, b.py) < tol) return { kind: 'cable', id: c.id };
+  }
+  for (const l of state.links) {
+    if (linkBuilt(l)) continue;
+    const a = deviceById(l.aId), b = deviceById(l.bId);
+    if (!a || !b || a.px === undefined || b.px === undefined) continue;
+    if (distToSeg(wx, wy, a.px, a.py, b.px, b.py) < tol) return { kind: 'link', id: l.id };
+  }
+  return null;
+}
+
+planCanvas.addEventListener('wheel', e => {
+  e.preventDefault();
+  planCam.s = Math.max(0.2, Math.min(3, planCam.s * (e.deltaY < 0 ? 1.12 : 0.89)));
+}, { passive: false });
+
+planCanvas.addEventListener('mousedown', e => {
+  planMoved = false;
+  const node = planNodeAt(e.offsetX, e.offsetY);
+  if (planMode === 'select' && node) {
+    const [wx, wy] = toWorld(e.offsetX, e.offsetY);
+    planDrag = { kind: 'node', id: node.id, ox: node.px - wx, oy: node.py - wy, sx0: e.offsetX, sy0: e.offsetY };
+  } else {
+    planDrag = { kind: 'pan', sx0: e.offsetX, sy0: e.offsetY, cx: planCam.x, cy: planCam.y };
+  }
+});
+planCanvas.addEventListener('mousemove', e => {
+  planMouse = [e.offsetX, e.offsetY];
+  if (!planDrag) return;
+  if (Math.hypot(e.offsetX - planDrag.sx0, e.offsetY - planDrag.sy0) > 4) planMoved = true;
+  if (!planMoved) return;
+  if (planDrag.kind === 'node') {
+    const d = deviceById(planDrag.id);
+    if (d) {
+      const [wx, wy] = toWorld(e.offsetX, e.offsetY);
+      d.px = wx + planDrag.ox;
+      d.py = wy + planDrag.oy;
+    }
+  } else {
+    planCam.x = planDrag.cx - (e.offsetX - planDrag.sx0) / planCam.s;
+    planCam.y = planDrag.cy - (e.offsetY - planDrag.sy0) / planCam.s;
+  }
+});
+planCanvas.addEventListener('mouseup', e => {
+  const moved = planMoved;
+  planDrag = null;
+  if (moved) return;
+  const node = planNodeAt(e.offsetX, e.offsetY);
+  if (planMode === 'select') {
+    if (node) { showDeviceProps(node.id); return; }
+    const edge = planEdgeAt(e.offsetX, e.offsetY);
+    if (edge && edge.kind === 'cable') { showCableProps(edge.id); return; }
+    hideProps();
+  } else if (planMode === 'link') {
+    if (!node) return;
+    if (planLinkFrom === null) {
+      planLinkFrom = node.id;
+      setStatus(`Link from ${node.name} — click the destination device.`);
+    } else if (planLinkFrom !== node.id) {
+      const dup = state.links.some(l =>
+        (l.aId === planLinkFrom && l.bId === node.id) || (l.aId === node.id && l.bId === planLinkFrom));
+      if (!dup) { undoPush(); state.links.push({ id: uid(), aId: planLinkFrom, bId: node.id }); }
+      planLinkFrom = null;
+      setStatus('Planned link added (dashed). It shows solid once you cable it for real in 3D.');
+    }
+  } else if (planMode === 'delete') {
+    if (node) {
+      if (confirm(`Delete ${node.name} (and its cables/links)?`)) { undoPush(); deleteDevice(node.id); hideProps(); }
+      return;
+    }
+    const edge = planEdgeAt(e.offsetX, e.offsetY);
+    if (edge) {
+      undoPush();
+      if (edge.kind === 'cable') deleteCable(edge.id);
+      else removeFromArr(state.links, l => l.id === edge.id);
+      setStatus('Removed. (Ctrl+Z undoes)');
+    }
+  }
+});
+
+//////////////////// Design assistant (local, no cloud) ////////////////////
+
+const aiEl = document.getElementById('ai');
+document.getElementById('btn-ai').onclick = () => aiEl.classList.toggle('hidden');
+document.getElementById('ai-close').onclick = () => aiEl.classList.add('hidden');
+const aiOut = document.getElementById('ai-out');
+function aiPrint(html) { aiOut.innerHTML = html; }
+
+function analyzeMap() {
+  const issues = [], notes = [];
+  const cableCount = id => state.cables.filter(c => c.a.deviceId === id || c.b.deviceId === id).length;
+  for (const d of state.devices) {
+    const def = DEVICE_TYPES[d.type];
+    if (def.ports && isPlaced(d) && !def.manager && cableCount(d.id) === 0)
+      issues.push(`<b>${d.name}</b> has no cables connected.`);
+    if (def.ports > 4 && cableCount(d.id) / def.ports > 0.8)
+      notes.push(`<b>${d.name}</b> is over 80% port capacity — plan spare ports.`);
+    if (def.ports && isPlaced(d) && !d.ip && !def.manager && !def.passthrough)
+      notes.push(`<b>${d.name}</b> has no IP assigned.`);
+  }
+  for (const c of state.cables) {
+    const ft = (c.lengthIn || 0) / 12;
+    const da = deviceById(c.a.deviceId), db = deviceById(c.b.deviceId);
+    if (ft > 328) issues.push(`Cable <b>${da ? da.name : '?'}:${c.a.port} → ${db ? db.name : '?'}:${c.b.port}</b> is ${ft.toFixed(0)} ft — over the 328 ft Ethernet limit.`);
+    if (da && db) {
+      const sh = sharedVlans(da, c.a.port, db, c.b.port);
+      if (sh !== 'ALL' && sh.size === 0)
+        issues.push(`VLAN mismatch on <b>${da.name}:${c.a.port} ↔ ${db.name}:${c.b.port}</b> — no shared VLAN, link is blocked.`);
+    }
+  }
+  if (!state.devices.some(d => d.type === 'ups')) notes.push('No UPS in any rack — add battery backup.');
+  if (!state.devices.some(d => DEVICE_TYPES[d.type].passthrough)) notes.push('No patch panel — direct switch runs are harder to service.');
+  // AP coverage vs floor area
+  let area = 0;
+  if (state.walls.length) {
+    const xs = state.walls.flatMap(w => [w.x1, w.x2]), zs = state.walls.flatMap(w => [w.z1, w.z2]);
+    area += (Math.max(...xs) - Math.min(...xs)) * (Math.max(...zs) - Math.min(...zs)) / 144;
+  }
+  for (const s of state.slabs) area += Math.abs(s.x2 - s.x1) * Math.abs(s.z2 - s.z1) / 144;
+  if (area > 0) {
+    const aps = state.devices.filter(d => (DEVICE_TYPES[d.type].cat === 'UniFi APs' || d.type === 'ap') && isPlaced(d)).length;
+    const need = Math.max(1, Math.ceil(area / 1500));
+    if (aps < need) notes.push(`~${Math.round(area).toLocaleString()} sq ft mapped but only ${aps} AP${aps === 1 ? '' : 's'} — rule of thumb suggests ${need}.`);
+  }
+  // power review: everything must plug into something
+  for (const d of state.devices) {
+    const dd = DEVICE_TYPES[d.type];
+    if (!isPlaced(d) || dd.field || dd.manager || dd.passthrough || dd.powerDevice || !d.rackId) continue;
+    const powered = state.cables.some(c =>
+      (c.a.deviceId === d.id && c.a.port === 'PWR') || (c.b.deviceId === d.id && c.b.port === 'PWR'));
+    if (!powered) issues.push(`<b>${d.name}</b> has no power — run a cord from its rear inlet to a UPS/PDU outlet.`);
+  }
+  // failover / redundancy review
+  const isInfra = d => {
+    const c = DEVICE_TYPES[d.type].cat;
+    return c === 'UniFi Switches' || c === 'UniFi Gateways' || ['switch48', 'switch24', 'router', 'firewall'].includes(d.type);
+  };
+  for (const d of state.devices) {
+    if (!isPlaced(d) || !isInfra(d)) continue;
+    const infraLinks = state.cables.filter(c => {
+      const o = c.a.deviceId === d.id ? c.b : (c.b.deviceId === d.id ? c.a : null);
+      if (!o) return false;
+      const od = deviceById(o.deviceId);
+      return od && isInfra(od);
+    }).length;
+    if ((DEVICE_TYPES[d.type].cat === 'UniFi Switches' || d.type.startsWith('switch')) && cableCount(d.id) > 1 && infraLinks === 1)
+      notes.push(`<b>${d.name}</b> has a single uplink — no failover path if that link fails.`);
+    const ddef = DEVICE_TYPES[d.type];
+    let wanTotal = ddef.wan || 0;
+    if (ddef.roleMap) wanTotal = Object.values(ddef.roleMap).filter(r => r === 'WAN').length || wanTotal;
+    if (wanTotal >= 2) {
+      const wanUsed = state.cables.filter(c =>
+        (c.a.deviceId === d.id && portRole(ddef, c.a.port) === 'WAN') ||
+        (c.b.deviceId === d.id && portRole(ddef, c.b.port) === 'WAN')).length;
+      if (wanUsed === 1) notes.push(`<b>${d.name}</b> has ${wanTotal} WAN ports but only 1 cabled — add the second for dual-WAN failover.`);
+    }
+  }
+  const sec = (t, arr, cls) => arr.length ? `<h4 class="${cls}">${t}</h4><ul>${arr.map(i => `<li>${i}</li>`).join('')}</ul>` : '';
+  aiPrint(
+    sec('Problems', issues, 'ai-bad') + sec('Suggestions', notes, 'ai-note') +
+    (!issues.length && !notes.length ? '<p>Map looks clean — no problems found.</p>' : '') +
+    `<p class="ai-meta">${state.devices.length} devices · ${state.cables.length} cables · ${state.walls.length} walls · ${state.slabs.length} upper floors</p>`);
+}
+document.getElementById('ai-analyze').onclick = analyzeMap;
+
+function autoDesign() {
+  if (!state.walls.length) { aiPrint('<p>Draw the building outline first (Wall tool) — the designer works from your layout.</p>'); return; }
+  undoPush();
+  const xs = state.walls.flatMap(w => [w.x1, w.x2]), zs = state.walls.flatMap(w => [w.z1, w.z2]);
+  const x1 = Math.min(...xs), x2 = Math.max(...xs), z1 = Math.min(...zs), z2 = Math.max(...zs);
+  const made = [];
+  // core rack in a corner
+  let rack = state.racks[0];
+  if (!rack) {
+    rack = { id: uid(), x: x1 + 30, z: z1 + 36, y0: 0, rotY: 0, name: 'Rack-1' };
+    state.racks.push(rack); buildRackGroup(rack); made.push('42U rack');
+  }
+  const inRack = t => state.devices.find(d => d.rackId === rack.id && d.type === t);
+  const addRack = (type, u, name) => {
+    if (rackOccupied(rack.id, u, DEVICE_TYPES[type].uh)) return null;
+    const d = { id: uid(), type, rackId: rack.id, u, name: name || deviceLabelCounter(type) };
+    state.devices.push(d); buildDeviceGroup(d); made.push(DEVICE_TYPES[type].label);
+    return d;
+  };
+  const gw = state.devices.find(d => DEVICE_TYPES[d.type].cat === 'UniFi Gateways' && d.rackId) || addRack('u_udmpromax', 40);
+  const patch = state.devices.find(d => DEVICE_TYPES[d.type].passthrough) || addRack('patch24', 42);
+  const hcmD = state.devices.find(d => d.type === 'hcm') || addRack('hcm', 41);
+  const sw = state.devices.find(d => DEVICE_TYPES[d.type].cat === 'UniFi Switches' && d.rackId) || addRack('u_promax24', 39);
+  if (!inRack('ups')) addRack('ups', 1);
+  // AP grid ~ every 30 ft inside the outline
+  let port = 1, apN = 0;
+  const usedPorts = new Set(state.cables.flatMap(c => [
+    c.a.deviceId === (sw && sw.id) ? c.a.port : null,
+    c.b.deviceId === (sw && sw.id) ? c.b.port : null]).filter(Boolean));
+  const nextPort = () => { while (usedPorts.has(port)) port++; usedPorts.add(port); return port; };
+  for (let ax = x1 + 90; ax < x2 - 30; ax += 360) {
+    for (let az = z1 + 90; az < z2 - 30; az += 360) {
+      const ap = { id: uid(), type: 'u_u7pro', x: Math.round(ax / 3) * 3, z: Math.round(az / 3) * 3, y0: 0, name: deviceLabelCounter('u_u7pro'), notes: 'auto-design' };
+      state.devices.push(ap); buildDeviceGroup(ap); apN++;
+      if (sw) {
+        const c = { id: uid(), a: { deviceId: sw.id, port: nextPort() }, b: { deviceId: ap.id, port: 1 }, color: '#eab308', waypoints: [] };
+        state.cables.push(c); buildCableMesh(c);
+      }
+    }
+  }
+  if (apN) made.push(`${apN} ceiling AP${apN > 1 ? 's' : ''} on a 30 ft grid, cabled home`);
+  aiPrint(`<h4 class="ai-note">Sample design generated</h4><ul>${made.map(m => `<li>${m}</li>`).join('')}</ul><p>Everything is real: placed, cabled, and editable. Ctrl+Z reverts the whole design.</p>`);
+}
+document.getElementById('ai-design').onclick = autoDesign;
+
+// Add any real-world device on demand — the result is a complete replica:
+// correct U height / mount, full clickable port grid with WAN/SFP roles,
+// named faceplate, VLAN support, exports. Saved inside the map file.
+function registerCustomDevice(spec, fallbackName) {
+  const label = String(spec.label || fallbackName || 'Custom Device').slice(0, 44);
+  const brand = String(spec.brand || '').trim().slice(0, 24);
+  const mountKind = ['rack', 'wall', 'ceiling', 'desk'].includes(spec.mount) ? spec.mount : 'rack';
+  const ports = Math.max(0, Math.min(96, parseInt(spec.ports, 10) || 0));
+  const short = (label.replace(/[^A-Za-z0-9]/g, '').slice(0, 8) || 'Dev');
+  let def;
+  if (mountKind === 'rack') {
+    def = {
+      label, short,
+      uh: Math.max(1, Math.min(8, parseInt(spec.uh, 10) || 1)),
+      ports, rows: ports > 26 ? 2 : 1,
+      depth: Math.max(4, Math.min(30, parseInt(spec.depth_in, 10) || 14)),
+      color: 0x2f3b4d,
+      wan: Math.max(0, Math.min(4, parseInt(spec.wan, 10) || 0)),
+      sfp: Math.max(0, Math.min(ports, parseInt(spec.sfp, 10) || 0))
+    };
+  } else {
+    def = {
+      label, short, uh: 0,
+      ports: Math.max(0, Math.min(8, ports || 1)), rows: 1, depth: 0,
+      color: 0xe8ebef, field: true, mountH: 96,
+      mounts: mountKind === 'ceiling' ? ['ceiling', 'wall'] : [mountKind],
+      shape: mountKind === 'wall' ? 'box' : mountKind === 'desk' ? 'deskbox' : 'disc',
+      wan: Math.max(0, Math.min(2, parseInt(spec.wan, 10) || 0))
+    };
+  }
+  def.cat = brand || 'Custom';
+  let key = 'c_' + short.toLowerCase();
+  while (DEVICE_TYPES[key]) key += 'x';
+  DEVICE_TYPES[key] = def;
+  state.customTypes[key] = def;
+  populateLibrary();
+  return key;
+}
+
+function manualDeviceForm(q) {
+  aiPrint(`<h4 class="ai-note">Add “${q}” manually</h4>
+    <div class="ai-row">
+      <select id="ai-mk-mount"><option value="rack">Rack-mount</option><option value="ceiling">Ceiling</option><option value="wall">Wall</option><option value="desk">Desk</option></select>
+      <input type="number" id="ai-mk-uh" value="1" min="1" max="8" title="Rack units (U)" style="width:54px">
+    </div>
+    <div class="ai-row">
+      <input type="number" id="ai-mk-ports" value="24" min="0" max="96" title="Total ports" style="width:60px">
+      <input type="number" id="ai-mk-wan" value="0" min="0" max="4" title="WAN ports" style="width:54px">
+      <input type="number" id="ai-mk-sfp" value="0" min="0" max="48" title="SFP+ ports" style="width:54px">
+      <button id="ai-mk">Add to library</button>
+    </div>
+    <p class="ai-meta">ports · WAN · SFP+. It becomes a full device — clickable ports, VLANs, faceplate label, exports.</p>`);
+  document.getElementById('ai-mk').onclick = () => {
+    const key = registerCustomDevice({
+      label: q,
+      mount: document.getElementById('ai-mk-mount').value,
+      uh: document.getElementById('ai-mk-uh').value,
+      ports: document.getElementById('ai-mk-ports').value,
+      wan: document.getElementById('ai-mk-wan').value,
+      sfp: document.getElementById('ai-mk-sfp').value
+    }, q);
+    setMode('place', key);
+    aiPrint(`<p><b>${DEVICE_TYPES[key].label}</b> added to the library — placement armed, click where it mounts.</p>`);
+  };
+}
+
+document.getElementById('ai-adddev').onclick = async () => {
+  const q = document.getElementById('ai-devq').value.trim();
+  if (!q) { aiPrint('<p>Type a device name first — e.g. “Catalyst 9300 48-port”.</p>'); return; }
+  const ql = q.toLowerCase();
+  const hit = Object.entries(DEVICE_TYPES).find(([, d]) => d.label.toLowerCase().includes(ql));
+  if (hit) {
+    setMode('place', hit[0]);
+    aiPrint(`<p><b>${hit[1].label}</b> is already in the library — placement armed, click where it mounts.</p>`);
+    return;
+  }
+  aiPrint('<p>Not in the library — asking the local model for real install specs…</p>');
+  try {
+    const model = document.getElementById('ai-model').value.trim() || 'llama3';
+    const r = await fetch('http://localhost:11434/api/chat', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model, stream: false,
+        messages: [
+          { role: 'system', content: 'You output ONLY a JSON object. No prose, no markdown.' },
+          { role: 'user', content: `Physical install spec for the network device "${q}". Keys: label (full product name), brand, mount ("rack"|"wall"|"ceiling"|"desk"), uh (rack units, integer), ports (total ethernet ports incl. uplinks, integer), wan (integer), sfp (SFP/SFP+ port count, integer), depth_in (chassis depth in inches, integer).` }
+        ]
+      })
+    });
+    const j = await r.json();
+    const txt = (j.message && j.message.content) || '';
+    const spec = JSON.parse(txt.slice(txt.indexOf('{'), txt.lastIndexOf('}') + 1));
+    const key = registerCustomDevice(spec, q);
+    const d = DEVICE_TYPES[key];
+    setMode('place', key);
+    aiPrint(`<h4 class="ai-note">${d.label} added</h4><p>${d.field ? d.mounts.join('/') + ' mount' : d.uh + 'U rack-mount'} · ${d.ports} ports${d.wan ? ' · ' + d.wan + ' WAN' : ''}${d.sfp ? ' · ' + d.sfp + ' SFP+' : ''}. Filed under “${d.cat}”, saved with the map. Placement armed — click where it mounts.</p>`);
+  } catch (e) {
+    manualDeviceForm(q);
+  }
+};
+
+async function askLocalAI() {
+  const prompt = document.getElementById('ai-prompt').value.trim() || 'Review this network design and suggest improvements.';
+  const model = document.getElementById('ai-model').value.trim() || 'llama3';
+  aiPrint('<p>Asking local model…</p>');
+  const summary = state.devices.slice(0, 80).map(d => {
+    const def = DEVICE_TYPES[d.type];
+    return `${d.name} (${def.label}${d.ip ? ', ' + d.ip : ''})`;
+  }).join('; ');
+  const cables = state.cables.slice(0, 120).map(c => {
+    const a = deviceById(c.a.deviceId), b = deviceById(c.b.deviceId);
+    return `${a ? a.name : '?'}:${c.a.port}->${b ? b.name : '?'}:${c.b.port} ${(c.lengthIn / 12).toFixed(0)}ft`;
+  }).join('; ');
+  try {
+    const r = await fetch('http://localhost:11434/api/chat', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model, stream: false,
+        messages: [
+          { role: 'system', content: 'You are a network design reviewer inside a 3D network planning tool. Be concise and practical.' },
+          { role: 'user', content: `Devices: ${summary}\nCables: ${cables}\n\n${prompt}` }
+        ]
+      })
+    });
+    const j = await r.json();
+    aiPrint(`<div class="ai-reply">${(j.message && j.message.content || 'No reply.').replace(/\n/g, '<br>')}</div>`);
+  } catch (e) {
+    aiPrint('<p class="ai-bad">No local AI reachable at localhost:11434.</p><p>Install <b>Ollama</b> (ollama.com), run <code>ollama pull llama3</code>, and try again. The Analyze and Auto-design buttons work fully offline without it.</p>');
+  }
+}
+document.getElementById('ai-ask').onclick = askLocalAI;
+
+//////////////////// Build menu (B) — Satisfactory-style tool in hand ////////////////////
+
+let bmenuOpen = false, resumeWalkAfterMenu = false;
+const bmenuEl = document.getElementById('bmenu');
+
+function recentDevices() {
+  try { return JSON.parse(localStorage.getItem('nm3_recent') || '[]'); } catch (e) { return []; }
+}
+function recordRecent(type) {
+  try {
+    const r = recentDevices().filter(t => t !== type);
+    r.unshift(type);
+    localStorage.setItem('nm3_recent', JSON.stringify(r.slice(0, 8)));
+  } catch (e) {}
+}
+function renderBmenu(q) {
+  const box = document.getElementById('bmenu-results');
+  const label = document.getElementById('bmenu-label');
+  box.innerHTML = '';
+  let items;
+  if (q.trim()) {
+    label.textContent = 'Devices';
+    const ql = q.trim().toLowerCase();
+    items = Object.entries(DEVICE_TYPES)
+      .filter(([, d]) => d.label.toLowerCase().includes(ql) || (d.cat || '').toLowerCase().includes(ql))
+      .slice(0, 14);
+  } else {
+    label.textContent = 'Recent';
+    items = recentDevices().filter(t => DEVICE_TYPES[t]).map(t => [t, DEVICE_TYPES[t]]);
+    if (!items.length) items = [['u_udmpromax', DEVICE_TYPES.u_udmpromax], ['u_promax24', DEVICE_TYPES.u_promax24], ['u_u7pro', DEVICE_TYPES.u_u7pro], ['patch24', DEVICE_TYPES.patch24]];
+  }
+  for (const [key, def] of items) {
+    const el = document.createElement('div');
+    el.className = 'lib-item';
+    el.innerHTML = `${def.label} <em>${def.cat || ''}</em>`;
+    el.onclick = () => { closeBuildMenu(true); setMode('place', key); };
+    box.appendChild(el);
+  }
+}
+function openBuildMenu(fromWalk) {
+  resumeWalkAfterMenu = !!fromWalk;
+  bmenuOpen = true;
+  bmenuEl.classList.remove('hidden');
+  const s = document.getElementById('bmenu-q');
+  s.value = '';
+  renderBmenu('');
+  setTimeout(() => s.focus(), 30);
+}
+function closeBuildMenu(chose) {
+  bmenuOpen = false;
+  bmenuEl.classList.add('hidden');
+  if (resumeWalkAfterMenu && chose) renderer.domElement.requestPointerLock();
+  resumeWalkAfterMenu = false;
+}
+document.querySelectorAll('#bmenu-tools [data-tool]').forEach(b => {
+  b.onclick = () => { closeBuildMenu(true); setMode(b.dataset.tool); };
+});
+document.getElementById('bmenu-q').oninput = e => renderBmenu(e.target.value);
+document.getElementById('bmenu-q').onkeydown = e => {
+  if (e.key === 'Escape') { closeBuildMenu(false); }
+  if (e.key === 'Enter') {
+    const first = document.querySelector('#bmenu-results .lib-item');
+    if (first) first.onclick();
+  }
+};
+bmenuEl.addEventListener('mousedown', e => { if (e.target === bmenuEl) closeBuildMenu(false); });
+
+//////////////////// Scene themes: bright Studio (default) / Dark ops ////////////////////
+
+// Both themes are lit for a real room, not a product render. The old studio
+// preset ran exposure 1.26 over a near-white floor, which clipped the highlights
+// to paper and flattened every surface — the fastest way to make a 3D scene look
+// fake. Mid-gray VCT with the exposure pulled under 1.0 keeps the whole range on
+// screen, so shadows, tile seams and gear all read.
+const THEMES = {
+  studio: {
+    bg: 0xc7cfd8, fog: [0xc7cfd8, 620, 1900], hemi: [0xdae6ff, 0x9c9184, 0.40],
+    sun: [0xfff4e2, 1.12], rim: 0.20, exposure: 0.95,
+    floor: ['#c2c7ce', '#b3b9c1', '#a6acb5', 'rgba(38,44,54,0.42)'],
+    gridC: [0x8d959f, 0xa2a9b3], wall: 0xe7e3dc, slab: 0xc2c6cc
+  },
+  dark: {
+    bg: 0x11151b, fog: [0x11151b, 420, 1000], hemi: [0xa9c4f0, 0x2a231b, 0.30],
+    sun: [0xffeed6, 0.95], rim: 0.34, exposure: 1.02,
+    floor: ['#2b323e', '#232935', '#1b202a', 'rgba(0,0,0,0.55)'],
+    gridC: [0x323d4e, 0x27303e], wall: 0xb9bec7, slab: 0xa6abb3
+  }
+};
+let themeName = 'studio';
+try { themeName = localStorage.getItem('nm3_theme') || 'studio'; } catch (e) {}
+
+function applyTheme(name) {
+  themeName = name;
+  const t = THEMES[name];
+  scene.background = new THREE.Color(t.bg);
+  scene.fog = new THREE.Fog(t.fog[0], t.fog[1], t.fog[2]);
+  hemi.color.setHex(t.hemi[0]);
+  hemi.groundColor.setHex(t.hemi[1]);
+  hemi.intensity = t.hemi[2];
+  sun.color.setHex(t.sun[0]);
+  sun.intensity = t.sun[1];
+  rim.intensity = t.rim;
+  renderer.toneMappingExposure = t.exposure;
+  if (floorMesh.material.map) floorMesh.material.map.dispose();
+  floorMesh.material.map = makeFloorTexture(t.floor);
+  floorMesh.material.needsUpdate = true;
+  scene.remove(grid);
+  grid = new THREE.GridHelper(1200, 100, t.gridC[0], t.gridC[1]);
+  grid.position.y = 0.02;
+  scene.add(grid);
+  wallMat.color.setHex(t.wall);
+  for (const m of wallMats) m.color.setHex(t.wall);
+  // trim tracks the wall, a touch brighter — it takes no dynamic shadow, so it
+  // has to be tied to the theme or it glows in the dark room
+  baseboardMat.color.setHex(t.wall);
+  baseboardMat.color.offsetHSL(0, 0, 0.02);
+  slabMat.color.setHex(t.slab);
+  try { localStorage.setItem('nm3_theme', name); } catch (e) {}
+  const b = document.getElementById('btn-theme');
+  if (b) b.textContent = name === 'studio' ? 'Dark' : 'Light';
+}
+document.getElementById('btn-theme').onclick = () => applyTheme(themeName === 'studio' ? 'dark' : 'studio');
+applyTheme(themeName);
+
+//////////////////// Projects: real files in a folder you choose ////////////////////
+// Like Word/Docs: pick a "NetMap3D Projects" folder once and every project is a
+// .json file in it — visible in Finder/Explorer, autosaved every 30 s.
+// Falls back to in-app storage when the File System Access API isn't available.
+
+let currentProject = null;
+let projectsDir = null; // FileSystemDirectoryHandle
+const launcherEl = document.getElementById('launcher');
+const projNameEl = document.getElementById('proj-name');
+const safeFile = n => n.replace(/[\\/:*?"<>|]/g, '_') + '.json';
+
+function idbGet(key) {
+  return new Promise(res => {
+    try {
+      const rq = indexedDB.open('nm3fs', 1);
+      rq.onupgradeneeded = () => rq.result.createObjectStore('kv');
+      rq.onsuccess = () => {
+        const tx = rq.result.transaction('kv', 'readonly');
+        const g = tx.objectStore('kv').get(key);
+        g.onsuccess = () => res(g.result || null);
+        g.onerror = () => res(null);
+      };
+      rq.onerror = () => res(null);
+    } catch (e) { res(null); }
+  });
+}
+function idbSet(key, val) {
+  return new Promise(res => {
+    try {
+      const rq = indexedDB.open('nm3fs', 1);
+      rq.onupgradeneeded = () => rq.result.createObjectStore('kv');
+      rq.onsuccess = () => {
+        const tx = rq.result.transaction('kv', 'readwrite');
+        tx.objectStore('kv').put(val, key);
+        tx.oncomplete = () => res(true);
+        tx.onerror = () => res(false);
+      };
+      rq.onerror = () => res(false);
+    } catch (e) { res(false); }
+  });
+}
+
+function lsStore() { try { return JSON.parse(localStorage.getItem('nm3_projects') || '{}'); } catch (e) { return {}; } }
+function lsStoreSet(s) { try { localStorage.setItem('nm3_projects', JSON.stringify(s)); } catch (e) {} }
+
+async function listProjects() {
+  if (projectsDir) {
+    const out = [];
+    try {
+      for await (const [name, h] of projectsDir.entries()) {
+        if (h.kind === 'file' && name.endsWith('.json')) {
+          const f = await h.getFile();
+          out.push({ name: name.replace(/\.json$/, ''), t: f.lastModified });
+        }
+      }
+    } catch (e) { /* permission lapsed */ }
+    return out.sort((a, b) => b.t - a.t);
+  }
+  const s = lsStore();
+  return Object.keys(s).map(n => ({ name: n, t: s[n].t })).sort((a, b) => b.t - a.t);
+}
+async function readProjectData(name) {
+  if (projectsDir) {
+    const h = await projectsDir.getFileHandle(safeFile(name));
+    return await (await h.getFile()).text();
+  }
+  const s = lsStore();
+  return s[name] ? s[name].data : null;
+}
+async function writeProjectData(name, data) {
+  if (projectsDir) {
+    const h = await projectsDir.getFileHandle(safeFile(name), { create: true });
+    const w = await h.createWritable();
+    await w.write(data);
+    await w.close();
+    return;
+  }
+  const s = lsStore();
+  s[name] = { t: Date.now(), data };
+  lsStoreSet(s);
+}
+async function removeProject(name) {
+  if (projectsDir) { try { await projectsDir.removeEntry(safeFile(name)); } catch (e) {} return; }
+  const s = lsStore();
+  delete s[name];
+  lsStoreSet(s);
+}
+
+async function saveProject(quiet) {
+  if (!currentProject) return;
+  try {
+    await writeProjectData(currentProject, serialize());
+    if (!quiet) setStatus(`Project “${currentProject}” saved${projectsDir ? ' to your projects folder' : ''}.`);
+  } catch (e) {
+    if (!quiet) setStatus('Save failed — reconnect your projects folder from the Projects screen.');
+  }
+}
+function setProject(name) {
+  currentProject = name;
+  projNameEl.textContent = name || '';
+  launcherEl.classList.add('hidden');
+  undoStack.length = 0;
+  maybeShowHelp();
+}
+
+async function renderLauncher() {
+  const folderLine = document.getElementById('launch-folder');
+  if (window.showDirectoryPicker) {
+    folderLine.innerHTML = projectsDir
+      ? `Saving into folder: <b>${projectsDir.name}</b> · <a href="#" id="launch-pickdir">change</a>`
+      : `Projects currently save inside the app. <a href="#" id="launch-pickdir">Choose a folder on your computer…</a>`;
+    document.getElementById('launch-pickdir').onclick = async ev => {
+      ev.preventDefault();
+      try {
+        projectsDir = await window.showDirectoryPicker({ mode: 'readwrite' });
+        await idbSet('dir', projectsDir);
+        renderLauncher();
+      } catch (e) { /* cancelled */ }
+    };
+  } else {
+    folderLine.textContent = 'Projects save inside the app (this browser cannot write folders). Use Export for files.';
+  }
+  const list = document.getElementById('launch-list');
+  const items = await listProjects();
+  list.innerHTML = items.length ? '' : '<p class="l-empty">No saved projects yet — start a new one.</p>';
+  for (const it of items) {
+    const row = document.createElement('div');
+    row.className = 'l-row';
+    row.innerHTML = `<div><b></b><span>${new Date(it.t).toLocaleString()}</span></div>
+      <div class="l-btns"><button data-a="open">Open</button><button data-a="export">Export</button><button data-a="del" class="l-danger">Delete</button></div>`;
+    row.querySelector('b').textContent = it.name;
+    row.querySelector('[data-a=open]').onclick = async () => {
+      const data = await readProjectData(it.name);
+      if (!data) { setStatus('Could not read that project.'); return; }
+      restore(data);
+      setProject(it.name);
+      setStatus(`Project “${it.name}” opened.`);
+    };
+    row.querySelector('[data-a=export]').onclick = async () => {
+      const data = await readProjectData(it.name);
+      if (data) downloadBlob(data, it.name + '.json', 'application/json');
+    };
+    row.querySelector('[data-a=del]').onclick = async () => {
+      if (!confirm(`Delete project “${it.name}”?`)) return;
+      await removeProject(it.name);
+      renderLauncher();
+    };
+    list.appendChild(row);
+  }
+}
+async function openLauncher() {
+  await saveProject(true);
+  if (!projectsDir && window.showDirectoryPicker) {
+    const h = await idbGet('dir');
+    if (h) {
+      try {
+        const perm = await h.queryPermission({ mode: 'readwrite' });
+        if (perm === 'granted') projectsDir = h;
+        else if (perm === 'prompt' && (await h.requestPermission({ mode: 'readwrite' })) === 'granted') projectsDir = h;
+      } catch (e) {}
+    }
+  }
+  document.getElementById('launcher-close').classList.toggle('hidden', !currentProject);
+  await renderLauncher();
+  launcherEl.classList.remove('hidden');
+}
+document.getElementById('launch-new').onclick = async () => {
+  const name = (prompt('Project name:', 'New Site') || '').trim();
+  if (!name) return;
+  clearScene();
+  setProject(name);
+  await saveProject(true);
+  setStatus(`Project “${name}” — draw the building with Room/Wall, or drop a rack to begin.`);
+};
+document.getElementById('launch-demo').onclick = () => {
+  clearScene();
+  demo();
+  setProject('Sample Project');
+  setStatus('Sample project — a complete working site to explore and edit.');
+};
+document.getElementById('launch-import').onclick = () => {
+  const inp = document.createElement('input');
+  inp.type = 'file';
+  inp.accept = '.json';
+  inp.onchange = () => {
+    const f = inp.files[0];
+    if (!f) return;
+    const rd = new FileReader();
+    rd.onload = async () => {
+      restore(rd.result);
+      const name = (prompt('Name this project:', f.name.replace(/\.json$/, '')) || 'Imported Site').trim();
+      setProject(name);
+      await saveProject(true);
+    };
+    rd.readAsText(f);
+  };
+  inp.click();
+};
+document.getElementById('launcher-close').onclick = () => {
+  if (currentProject) launcherEl.classList.add('hidden');
+};
+setInterval(() => saveProject(true), 30000);
+window.addEventListener('beforeunload', () => saveProject(true));
+
+//////////////////// Help overlay ////////////////////
+
+const helpEl = document.getElementById('help');
+document.getElementById('btn-help').onclick = () => helpEl.classList.remove('hidden');
+document.getElementById('help-close').onclick = () => {
+  helpEl.classList.add('hidden');
+  try { localStorage.setItem('nm3_seenHelp', '1'); } catch (e) { /* file:// may block storage */ }
+};
+function maybeShowHelp() {
+  try { if (!localStorage.getItem('nm3_seenHelp')) helpEl.classList.remove('hidden'); } catch (e) {}
+}
+
+//////////////////// Demo scene ////////////////////
+
+function demo() {
+  const rack = { id: uid(), x: 0, z: 0, rotY: 0, name: 'Rack-1' };
+  state.racks.push(rack);
+  buildRackGroup(rack);
+
+  const mk = (type, u, extra = {}) => {
+    const d = DEVICE_TYPES[type].field
+      ? { id: uid(), type, name: deviceLabelCounter(type), ...extra }
+      : { id: uid(), type, rackId: rack.id, u, name: deviceLabelCounter(type), ...extra };
+    state.devices.push(d);
+    buildDeviceGroup(d);
+    return d;
+  };
+  const patch = mk('patch24', 42);
+  const hcm1 = mk('hcm', 41);
+  const sw = mk('switch48', 40, { ip: '10.0.0.2' });
+  const rtr = mk('router', 38, { ip: '10.0.0.1' });
+  const udm = mk('u_udmpromax', 35, { ip: '10.0.0.254', notes: 'core gateway' });
+  const pmax = mk('u_promax24', 33, { ip: '10.0.0.4', notes: 'Etherlighting demo' });
+  mk('firewall', 37, { ip: '10.0.0.254' });
+  const srv = mk('server', 20, { ip: '10.0.10.5' });
+  const ups1 = mk('ups', 1);
+  mk('vcm', 0, { side: 'R' });
+  const ap1 = mk('ap', 0, { x: 66, z: -36, ip: '10.0.20.11', notes: 'VLAN 20 - WiFi' });
+  const cam1 = mk('camera', 0, { x: -60, z: -48, ip: '10.0.30.21', notes: 'VLAN 30 - CCTV' });
+
+  // walls with a drilled pass-through, a wall-mounted camera, and an AP beyond the wall
+  const wallA = { id: uid(), x1: -144, z1: -84, x2: 144, z2: -84, h: WALL_H };
+  const wallB = { id: uid(), x1: -144, z1: -84, x2: -144, z2: 120, h: WALL_H };
+  state.walls.push(wallA, wallB);
+  buildWall(wallA); buildWall(wallB);
+  const hole1 = { id: uid(), wallId: wallA.id, x: -30, y: 80, z: -84, nx: 0, nz: 1 };
+  state.holes.push(hole1);
+  buildHole(hole1);
+  const wallCam = mk('camera', 0, { mount: 'wall', x: 50, y: 84, z: -81.6, rotY: 0, ip: '10.0.30.22', notes: 'VLAN 30 - CCTV' });
+  const apFar = mk('ap', 0, { x: -30, z: -170, ip: '10.0.20.12', notes: 'VLAN 20 - warehouse' });
+
+  // a planned-only device and link for the 2D view
+  state.devices.push({ id: uid(), type: 'switch24', name: 'Switch-IDF', ip: '10.0.0.3', notes: 'planned IDF closet' });
+  state.links.push({ id: uid(), aId: rtr.id, bId: sw.id });
+
+  // upstairs: a level-2 slab with an AP, plus an office corner downstairs
+  const slab2 = { id: uid(), x1: -160, z1: -60, x2: -40, z2: 100, y: 120 };
+  state.slabs.push(slab2);
+  buildSlab(slab2);
+  const apUp = mk('u_u7pro', 0, { x: -100, z: 20, y0: 120, ip: '10.0.20.13', notes: 'Level 2 WiFi' });
+  const ws1 = mk('o_ws', 0, { x: 80, z: 30, rotY: -0.7, ip: '10.0.10.21', notes: 'front desk PC' });
+  mk('o_chair', 0, { x: 92, z: 44, rotY: 2.4 });
+  mk('person', 0, { x: 40, z: 60 });
+
+  const hcmG = deviceGroups.get(hcm1.id);
+  hcmG.updateWorldMatrix(true, false);
+  const wp = hcmG.localToWorld(new THREE.Vector3(0, 0, 2.2));
+
+  // a port argument is either a plain number (front jack) or [number, side]
+  const mkCable = (a, ap, b, bp, color, wps = []) => {
+    const ep = (dev, p) => Array.isArray(p)
+      ? { deviceId: dev.id, port: p[0], side: p[1] }
+      : { deviceId: dev.id, port: p, side: FRONT };
+    const c = { id: uid(), a: ep(a, ap), b: ep(b, bp), color, waypoints: wps };
+    state.cables.push(c);
+    buildCableMesh(c);
+  };
+  // Structured cabling the way it is actually installed. Every horizontal run
+  // from a field device terminates on the BACK of the patch panel and never
+  // touches the switch; a short patch lead on the FRONT jumps that same port
+  // number across to a switch port. Re-patching a drop is then a 6" lead swap,
+  // not a re-pull — which is the entire reason the panel is in the rack.
+  // dressed down the back, each run on its own vertical line like a real bundle
+  const rearWp = (n) => ({ x: 2 + n * 1.4, y: RACK_BASE + 41.5 * U, z: -RACK_D / 2 - 3 });
+  // wps empty = let the auto-router take it up into the plenum and across
+  const drops = [
+    [1, sw, 1,  ap1,     '#eab308', []],
+    [2, sw, 26, cam1,    '#a855f7', []],
+    [3, sw, 12, wallCam, '#f97316', []],
+    // this one is hand-routed through the drilled hole in wall A to the warehouse AP
+    [4, sw, 14, apFar,   '#22c55e', [{ x: -30, y: 80, z: -81 }, { x: -30, y: 80, z: -87 }]],
+    [5, sw, 18, apUp,    '#eab308', []]
+  ];
+  for (const [p, swDev, swPort, field, color, wps] of drops) {
+    mkCable(swDev, swPort, patch, p, '#3b82f6', [{ x: wp.x - 8 + p * 3, y: wp.y, z: wp.z }]);
+    mkCable(patch, [p, REAR], field, 1, color, wps.length ? [rearWp(p), ...wps] : []);
+  }
+  // in-rack and adjacent gear patches straight to the switch — no panel needed
+  mkCable(sw, 42, srv, 1, '#22c55e');
+  mkCable(sw, 17, ws1, 1, '#3b82f6');
+  // power cords: rear inlets → UPS outlets, like a real rack
+  mkCable(sw, 'PWR', ups1, 1, '#111827');
+  mkCable(udm, 'PWR', ups1, 2, '#111827');
+  mkCable(pmax, 'PWR', ups1, 3, '#111827');
+  setStatus('Demo rack loaded — field runs land on the patch panel REAR, short leads patch the FRONT to the switch. Hover any port to see both faces.');
+}
+
+// boot into the project launcher — no auto-loaded demo
+openLauncher();
+
+// debug/verification handle (used by the automated physics test harness)
+window.__nm3debug = {
+  ropes, cableMeshes, getState: () => state,
+  colliders: () => ({ dirty: collidersDirty, count: ropeColliders.length, holes: holeZones.length })
+};
+
+//////////////////// Render loop ////////////////////
+
+window.addEventListener('resize', () => {
+  camera.aspect = innerWidth / innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+  if (composer) {
+    composer.setSize(innerWidth, innerHeight);
+    if (fxaaPass) fxaaPass.material.uniforms.resolution.value.set(1 / innerWidth, 1 / innerHeight);
+  }
+});
+
+const clock = new THREE.Clock();
+(function animate() {
+  requestAnimationFrame(animate);
+  const dt = Math.min(clock.getDelta(), 0.1);
+  if (walkActive) {
+    const speed = (walkKeys['ShiftLeft'] || walkKeys['ShiftRight']) ? 190 : 68;
+    const fwd = new THREE.Vector3(-Math.sin(walkYaw), 0, -Math.cos(walkYaw));
+    const right = new THREE.Vector3(-fwd.z, 0, fwd.x);
+    const v = new THREE.Vector3();
+    if (walkKeys['KeyW']) v.add(fwd);
+    if (walkKeys['KeyS']) v.sub(fwd);
+    if (walkKeys['KeyD']) v.add(right);
+    if (walkKeys['KeyA']) v.sub(right);
+    if (v.lengthSq()) camera.position.addScaledVector(v.normalize(), speed * dt);
+    if (flyMode) {
+      if (walkKeys['Space']) camera.position.y += speed * dt;
+      if (walkKeys['KeyC']) camera.position.y -= speed * dt;
+      camera.position.y = Math.max(6, camera.position.y);
+    } else {
+      // grounded walking with a jump — floor height comes from whichever slab you're on
+      const eye = groundAt(camera.position.x, camera.position.z, camera.position.y - 30) + EYE_H;
+      if (walkKeys['Space'] && camera.position.y <= eye + 0.01) walkVy = 105;
+      walkVy -= 420 * dt;
+      camera.position.y += walkVy * dt;
+      if (camera.position.y <= eye) { camera.position.y = eye; walkVy = 0; }
+    }
+    // crosshair interaction: hover whatever you're looking at, every frame
+    raycaster.setFromCamera(_centerNDC, camera);
+    updateHover(innerWidth / 2, innerHeight / 2 + 26);
+  } else {
+    controls.update();
+    if (camTween) {
+      camTween.k = Math.min(1, camTween.k + dt * 2.2);
+      const s = camTween.k * camTween.k * (3 - 2 * camTween.k);
+      camera.position.lerpVectors(camTween.p0, camTween.p1, s);
+      controls.target.lerpVectors(camTween.t0, camTween.t1, s);
+      if (camTween.k >= 1) camTween = null;
+    }
+  }
+  if (physOn) stepRopes(dt);
+  if (simOn) updatePulses(dt);
+  if (planOpen) drawPlan();
+  if (composer) {
+    try { composer.render(); } catch (err) { composer = null; }
+  }
+  if (!composer) renderer.render(scene, camera);
+})();

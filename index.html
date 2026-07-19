@@ -1,0 +1,219 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>NetMap3D</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div id="toolbar">
+    <span class="logo">NetMap<b>3D</b><span class="ver">v0.9.7 · Jul 19</span></span>
+    <span id="proj-name"></span>
+    <button id="tool-select" class="tool active" title="Select / inspect (Esc)">Select</button>
+    <button id="tool-cable"  class="tool" title="Draw cable: click source port, optionally click cable managers as route points, click destination port (C)">Cable</button>
+    <button id="tool-delete" class="tool" title="Delete devices / cables (D)">Delete</button>
+    <button id="tool-rack"   class="tool" title="Click the floor to place a new 42U rack (R)">+ Rack</button>
+    <button id="tool-wall"   class="tool" title="Draw walls: click floor for start, click again for end; keeps chaining. Esc finishes (W)">Wall</button>
+    <button id="tool-drill"  class="tool" title="Drill a cable hole: click a wall. Cables can route through holes (H)">Drill</button>
+    <select id="hole-size" title="Drill bit / conduit size">
+      <option value="0.5">Ø ½"</option>
+      <option value="0.75">Ø ¾"</option>
+      <option value="1" selected>Ø 1"</option>
+      <option value="1.5">Ø 1½"</option>
+      <option value="2">Ø 2"</option>
+      <option value="4">Ø 4"</option>
+    </select>
+    <span class="sep"></span>
+    <button id="tool-tie"  class="tool" title="Place a zip tie / velcro wrap: click a cable — nearby cables get bundled too (T)">Tie</button>
+    <button id="tool-measure" class="tool" title="Measure real distances in ft/in — click two points (M)">Measure</button>
+    <button id="tool-room" class="tool" title="Room: click two corners (or pick a preset and click once) — builds 4 walls + a ceiling">Room</button>
+    <select id="room-size" title="Room preset for the Room tool">
+      <option value="drag">Drag size</option>
+      <option value="120,120">10 × 10'</option>
+      <option value="144,144">12 × 12'</option>
+      <option value="240,180">20 × 15'</option>
+      <option value="360,240">30 × 20'</option>
+    </select>
+    <button id="tool-slab" class="tool" title="Add an upper floor: pick the level, then click two corners">+ Floor</button>
+    <select id="level-sel" title="Height of the floor slab being drawn">
+      <option value="120">Lvl 2 (10')</option>
+      <option value="240">Lvl 3 (20')</option>
+      <option value="360">Lvl 4 (30')</option>
+    </select>
+    <span class="sep"></span>
+    <button id="btn-walk" title="Walk around in first person: WASD + mouse, Space/C up/down, Shift sprint, Esc exits (V)">Walk</button>
+    <button id="btn-xray" title="See through walls to inspect cable runs (X)">X-ray</button>
+    <button id="btn-sim" title="Animate traffic flowing through every cable (G)">Simulate</button>
+    <button id="btn-phys" title="Cable physics: cables hang and drape like real cables (P)">Physics</button>
+    <button id="btn-plan" title="2D logical network diagram — plan first, then build in 3D">2D Plan</button>
+    <button id="btn-theme" title="Toggle bright studio / dark environment">Dark</button>
+    <span class="sep"></span>
+    <label class="clr-label">Cable color
+      <select id="cable-color">
+        <option value="#3b82f6" selected>Blue</option>
+        <option value="#ef4444">Red</option>
+        <option value="#22c55e">Green</option>
+        <option value="#eab308">Yellow</option>
+        <option value="#f97316">Orange</option>
+        <option value="#a855f7">Purple</option>
+        <option value="#e5e7eb">White</option>
+        <option value="#111827">Black</option>
+      </select>
+    </label>
+    <span class="sep"></span>
+    <button id="btn-save">Save</button>
+    <button id="btn-load">Projects</button>
+    <button id="btn-export">Export CSV</button>
+    <button id="btn-ai" title="Design assistant: analyze the map, auto-generate designs, or ask a local AI (Ollama)">Assistant</button>
+    <button id="btn-help" title="Quick-start guide">?</button>
+  </div>
+
+  <div id="library">
+    <h3>Device Library</h3>
+    <div id="lib-items"></div>
+    <p class="hint">Click an item, then click where it mounts (rack slot, wall, floor). Esc cancels.</p>
+  </div>
+
+  <div id="props" class="hidden">
+    <h3 id="props-title">Properties</h3>
+    <div id="props-body"></div>
+    <button id="props-close">Close</button>
+  </div>
+
+  <div id="ai" class="hidden">
+    <h3>Design Assistant <button id="ai-close">×</button></h3>
+    <div class="ai-row">
+      <button id="ai-analyze">Analyze map</button>
+      <button id="ai-design">Auto-design from layout</button>
+    </div>
+    <div class="ai-row">
+      <input type="text" id="ai-devq" placeholder="Need a device? e.g. Catalyst 9300 48-port">
+      <button id="ai-adddev">Find / add</button>
+    </div>
+    <textarea id="ai-prompt" rows="2" placeholder="Ask about this design… (uses a local Ollama model if installed)"></textarea>
+    <div class="ai-row">
+      <input type="text" id="ai-model" value="llama3" title="Ollama model name">
+      <button id="ai-ask">Ask local AI</button>
+    </div>
+    <div id="ai-out"><p>Analyze finds real problems (cable length limits, VLAN blocks, coverage gaps). Auto-design builds a working starter network from your walls — fully placed and cabled.</p></div>
+  </div>
+
+  <div id="tooltip" class="hidden"></div>
+  <div id="walkhint" class="hidden">WASD move · Space jump · F fly · Shift sprint · click = use tool · Esc exit</div>
+  <div id="crosshair" class="hidden"></div>
+  <div id="hotbar" class="hidden">
+    <div class="slot" data-mode="select"><b>1</b>Select</div>
+    <div class="slot" data-mode="cable"><b>2</b>Cable</div>
+    <div class="slot" data-mode="wall"><b>3</b>Wall</div>
+    <div class="slot" data-mode="drill"><b>4</b>Drill</div>
+    <div class="slot" data-mode="tie"><b>5</b>Tie</div>
+    <div class="slot" data-mode="delete"><b>6</b>Delete</div>
+    <div class="slot" data-mode="rack"><b>7</b>Rack</div>
+    <div class="slot"><b>8</b>X-ray</div>
+    <div class="slot"><b>9</b>Sim</div>
+    <div class="slot"><b>0</b>Physics</div>
+    <div class="slot"><b>F</b>Fly</div>
+    <div class="slot"><b>B</b>Build</div>
+  </div>
+
+  <div id="bmenu" class="hidden">
+    <div id="bmenu-card">
+      <input type="text" id="bmenu-q" placeholder="Search anything — “UDM”, “camera”, “Catalyst”…" autocomplete="off">
+      <div id="bmenu-tools">
+        <button data-tool="cable">Cable</button>
+        <button data-tool="wall">Wall</button>
+        <button data-tool="room">Room</button>
+        <button data-tool="drill">Drill</button>
+        <button data-tool="tie">Tie</button>
+        <button data-tool="measure">Measure</button>
+        <button data-tool="rack">+ Rack</button>
+        <button data-tool="slab">+ Floor</button>
+        <button data-tool="delete">Delete</button>
+        <button data-tool="select">Select</button>
+      </div>
+      <h4 id="bmenu-label">Recent</h4>
+      <div id="bmenu-results"></div>
+      <p class="bmenu-hint">B opens this anywhere — even while walking. Click an item, then place it.</p>
+    </div>
+  </div>
+
+  <div id="launcher">
+    <div id="launcher-card">
+      <div class="l-head">
+        <span class="logo">NetMap<b>3D</b></span>
+        <span class="l-sub">1:1 network install planning</span>
+      </div>
+      <div class="l-actions">
+        <button id="launch-new" class="l-primary">＋ New Project</button>
+        <button id="launch-demo">Open Sample Project</button>
+        <button id="launch-import">Import .json…</button>
+        <button id="launcher-close" class="hidden">Back to current project</button>
+      </div>
+      <h4>Your projects</h4>
+      <p id="launch-folder" class="l-empty"></p>
+      <div id="launch-list"></div>
+    </div>
+  </div>
+
+  <div id="help" class="hidden">
+    <div id="help-card">
+      <h2>NetMap3D — quick start</h2>
+      <div class="help-cols">
+        <div>
+          <h4>Build</h4>
+          <p>Pick gear from the <b>library</b> (left) and click where it mounts — rack slots snap to U positions, ceiling APs drop on poles, doorbells &amp; intercoms need a wall.</p>
+          <p><b>Wall (W)</b> draws walls corner to corner. <b>Drill (H)</b> punches cable holes through them. <b>+ Rack (R)</b> drops racks on the floor.</p>
+        </div>
+        <div>
+          <h4>Cable</h4>
+          <p><b>Cable (C)</b>: click a port, optionally click cable managers or wall holes to route, click the destination port. Ports glow when you're close enough — no pixel-hunting.</p>
+          <p><b>Tie (T)</b> straps nearby cables into a bundle. <b>Physics (P)</b> makes every cable hang like real cat6 — tune Slack % per cable.</p>
+        </div>
+        <div>
+          <h4>Explore</h4>
+          <p><b>Walk (V)</b>: first-person WASD + mouse, Space jumps, F flies, number keys 1–7 switch tools, click uses them.</p>
+          <p><b>2D Plan</b> is the logical diagram — plan links there, build them in 3D. <b>Simulate (G)</b> shows traffic. <b>X-ray (X)</b> sees through walls.</p>
+          <p>Everything is <b>1:1 scale</b> (grid = 1 ft). <b>Measure (M)</b> pins ft/in dimensions; <b>+ Floor</b> adds upper stories you can build on and walk.</p>
+        </div>
+      </div>
+      <p class="help-foot"><b>Right-click</b> cancels · <b>Esc</b> steps back · <b>Ctrl/Cmd+Z</b> undoes · hover anything for details</p>
+      <button id="help-close">Got it — let's build</button>
+    </div>
+  </div>
+
+  <div id="plan2d" class="hidden">
+    <div id="plan-toolbar">
+      <button id="plan-select" class="ptool active">Select</button>
+      <button id="plan-link" class="ptool">Link</button>
+      <button id="plan-delete" class="ptool">Delete</button>
+      <span class="sep"></span>
+      <select id="plan-type"></select>
+      <button id="plan-add">+ Device</button>
+      <button id="plan-layout">Auto-layout</button>
+      <span class="sep"></span>
+      <button id="plan-close">Back to 3D</button>
+    </div>
+    <canvas id="plan-canvas"></canvas>
+  </div>
+  <div id="status">Select mode — click a device or cable to inspect. Orbit: drag · Pan: right-drag · Zoom: scroll</div>
+
+  <script src="./node_modules/three/build/three.min.js"></script>
+  <script src="./node_modules/three/examples/js/controls/OrbitControls.js"></script>
+  <script src="./node_modules/three/examples/js/environments/RoomEnvironment.js"></script>
+  <script src="./node_modules/three/examples/js/geometries/RoundedBoxGeometry.js"></script>
+  <script src="./node_modules/three/examples/js/shaders/CopyShader.js"></script>
+  <script src="./node_modules/three/examples/js/shaders/LuminosityHighPassShader.js"></script>
+  <script src="./node_modules/three/examples/js/shaders/SAOShader.js"></script>
+  <script src="./node_modules/three/examples/js/shaders/DepthLimitedBlurShader.js"></script>
+  <script src="./node_modules/three/examples/js/shaders/UnpackDepthRGBAShader.js"></script>
+  <script src="./node_modules/three/examples/js/shaders/FXAAShader.js"></script>
+  <script src="./node_modules/three/examples/js/postprocessing/Pass.js"></script>
+  <script src="./node_modules/three/examples/js/postprocessing/MaskPass.js"></script>
+  <script src="./node_modules/three/examples/js/postprocessing/ShaderPass.js"></script>
+  <script src="./node_modules/three/examples/js/postprocessing/EffectComposer.js"></script>
+  <script src="./node_modules/three/examples/js/postprocessing/RenderPass.js"></script>
+  <script src="./node_modules/three/examples/js/postprocessing/SAOPass.js"></script>
+  <script src="./node_modules/three/examples/js/postprocessing/UnrealBloomPass.js"></script>
+  <script src="./app.js"></script>
+</body>
+</html>
