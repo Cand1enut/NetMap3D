@@ -32,6 +32,22 @@ No build step. Also works in a plain browser: `npx serve .` and open the URL (sa
 - **+ Rack (R)** · **Delete (D)** · **Select** to inspect/rename; devices carry IP + notes metadata (shown in tooltips and exports).
 - **Save/Load:** JSON (includes walls, holes, ties, links, 2D layout). **Export CSV:** cable map with IPs + device inventory + planned-link status.
 
+## Interface
+
+Two bars. The top one is identity, the build palette, and the view/file controls;
+the second shows options for **whichever tool is active** — cable colour for Cable,
+bit size for Drill, trade size for Raceway — plus the level selector, which is
+always visible because it's global context.
+
+That split exists for a structural reason, not a cosmetic one: the palette lives
+in a flex child with `min-width: 0` so it shrinks and scrolls, while the
+right-hand cluster is `flex: 0 0 auto` and stays pinned. Before this, everything
+was one row that simply grew — at 1440px it needed 2605px and seventeen controls,
+including cable colour, Save and the whole overflow menu, sat off the right edge
+where no mouse could reach them. **When adding a tool, put it in `#modescroll` and
+its options in `#optbar` with `data-for="<mode>"`.** Don't append to the right
+cluster, and don't rely on the bar fitting.
+
 ## Architecture notes (for extending)
 
 - `state` = plain JSON: `racks[]`, `devices[]`, `cables[]` (cable = two `{deviceId, port, side}` endpoints + waypoint list). This is the save format — everything 3D is rebuilt from it, so new features should edit state then rebuild.

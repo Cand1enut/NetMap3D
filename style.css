@@ -16,6 +16,9 @@
   --good: #30d158;
   --warn: #ffb020;
   --bad: #ff453a;
+  --bar-h: 52px;
+  --opt-h: 38px;
+  --bars-h: 90px;   /* toolbar + option bar */
   --radius: 12px;
   --radius-sm: 8px;
   --shadow: 0 12px 40px rgba(0, 0, 0, 0.55), 0 1px 0 rgba(255, 255, 255, 0.03) inset;
@@ -34,11 +37,81 @@ canvas { display: block; }
 
 /* ---------- top app bar ---------- */
 #toolbar {
-  position: fixed; top: 0; left: 0; right: 0; height: 52px; z-index: 10;
-  display: flex; align-items: center; gap: 6px; padding: 0 16px;
+  position: fixed; top: 0; left: 0; right: 0; height: var(--bar-h); z-index: 12;
+  display: flex; align-items: center; gap: 5px; padding: 0 14px;
   background: rgba(11, 13, 16, 0.88);
   border-bottom: 1px solid var(--line-soft);
   backdrop-filter: blur(18px) saturate(1.4);
+  /* The bar itself never scrolls — the palette inside it does. That keeps the
+     view toggles, Save and the overflow menu pinned to the right edge no matter
+     how many tools get added. Half this app was silently unreachable off the
+     right edge before the bar was split up. */
+  overflow: hidden;
+}
+#toolbar::-webkit-scrollbar { display: none; }
+.barspacer { flex: 1 1 auto; min-width: 8px; }
+
+/* The build palette scrolls; the right-hand cluster never does.
+   `min-width: 0` is the load-bearing part — without it a flex child refuses to
+   shrink below its content, which is exactly how the bar grew past the window
+   and pushed the menu, save and view controls somewhere unclickable. */
+#modescroll {
+  display: flex; align-items: center; gap: 5px;
+  flex: 1 1 auto; min-width: 0;
+  overflow-x: auto; overflow-y: hidden; scrollbar-width: none;
+}
+#modescroll::-webkit-scrollbar { display: none; }
+#barright { display: flex; align-items: center; gap: 5px; flex: 0 0 auto; }
+
+/* ---------- contextual option bar ---------- */
+/* Only the active tool's options are shown, which is both less to read and the
+   reason the top row has room to grow. */
+#optbar {
+  position: fixed; top: var(--bar-h); left: 0; right: 0; height: var(--opt-h); z-index: 11;
+  display: flex; align-items: center; gap: 8px; padding: 0 16px;
+  background: rgba(15, 17, 21, 0.82);
+  border-bottom: 1px solid var(--line-soft);
+  backdrop-filter: blur(18px) saturate(1.3);
+  overflow-x: auto; overflow-y: hidden; scrollbar-width: none;
+}
+#optbar::-webkit-scrollbar { display: none; }
+#opt-title {
+  font-size: 11px; font-weight: 700; color: var(--accent-hi);
+  text-transform: uppercase; letter-spacing: 0.09em; white-space: nowrap;
+  min-width: 62px;
+}
+#optbar .opt {
+  display: flex; align-items: center; gap: 7px; white-space: nowrap;
+  font-size: 11px; color: var(--faint);
+  text-transform: uppercase; letter-spacing: 0.08em;
+}
+#optbar .opt .unit { text-transform: none; letter-spacing: 0; }
+#optbar select, #optbar input { padding: 3px 7px; font-size: 12px; }
+#optbar button { padding: 4px 10px; font-size: 12px; }
+#opt-hint {
+  font-size: 11.5px; color: var(--faint); white-space: nowrap;
+  overflow: hidden; text-overflow: ellipsis; margin-left: 4px;
+}
+
+/* ---------- overflow menu ---------- */
+.menu-wrap { position: relative; flex: none; }
+/* Fixed, not absolute: the toolbar clips its own overflow so the palette can
+   scroll inside it, and an absolutely-positioned dropdown would be clipped too. */
+#more-menu {
+  position: fixed; top: calc(var(--bar-h) + 5px); right: 12px; z-index: 60;
+  display: flex; flex-direction: column; gap: 2px; padding: 6px; min-width: 172px;
+  background: var(--panel); border: 1px solid var(--line);
+  border-radius: var(--radius); box-shadow: var(--shadow);
+  backdrop-filter: blur(18px) saturate(1.3);
+}
+#more-menu button { text-align: left; width: 100%; padding: 7px 10px; }
+#more-menu.hidden { display: none; }
+
+/* narrow windows: tighten the palette before anything is forced to scroll */
+@media (max-width: 1340px) {
+  #toolbar { gap: 3px; padding: 0 10px; }
+  #toolbar button { padding: 6px 8px; font-size: 12px; }
+  .logo .ver { display: none; }
 }
 .logo {
   font-size: 14.5px; font-weight: 700; letter-spacing: 0.2px;
@@ -85,8 +158,8 @@ select:focus, input:focus { border-color: var(--accent); }
 }
 
 #library {
-  position: fixed; top: 66px; left: 14px; width: 232px; z-index: 10;
-  padding: 14px; max-height: calc(100vh - 150px); overflow-y: auto;
+  position: fixed; top: calc(var(--bars-h) + 14px); left: 14px; width: 232px; z-index: 10;
+  padding: 14px; max-height: calc(100vh - var(--bars-h) - 90px); overflow-y: auto;
 }
 #library h3, #props h3, #ai h3 {
   font-size: 10.5px; text-transform: uppercase; letter-spacing: 0.12em;
@@ -113,7 +186,7 @@ select:focus, input:focus { border-color: var(--accent); }
 
 /* ---------- properties ---------- */
 #props {
-  position: fixed; top: 66px; right: 14px; width: 256px; z-index: 40;
+  position: fixed; top: calc(var(--bars-h) + 14px); right: 14px; width: 256px; z-index: 40;
   padding: 14px;
 }
 #props .row { font-size: 12.5px; margin-bottom: 8px; display: flex; justify-content: space-between; gap: 8px; align-items: center; }
@@ -143,7 +216,7 @@ select:focus, input:focus { border-color: var(--accent); }
 
 /* ---------- walk HUD ---------- */
 #walkhint {
-  position: fixed; top: 62px; left: 50%; transform: translateX(-50%); z-index: 15;
+  position: fixed; top: calc(var(--bars-h) + 10px); left: 50%; transform: translateX(-50%); z-index: 15;
   background: rgba(9, 11, 14, 0.85); border: 1px solid var(--line); color: var(--muted);
   padding: 6px 14px; border-radius: 999px; font-size: 11.5px; letter-spacing: 0.02em;
   backdrop-filter: blur(12px);
@@ -175,7 +248,7 @@ select:focus, input:focus { border-color: var(--accent); }
 
 /* ---------- 2D plan ---------- */
 #plan2d {
-  position: fixed; top: 52px; left: 0; right: 0; bottom: 0; z-index: 25;
+  position: fixed; top: var(--bars-h); left: 0; right: 0; bottom: 0; z-index: 25;
   background: var(--bg);
 }
 #plan-canvas { width: 100%; height: 100%; display: block; cursor: default; }

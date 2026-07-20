@@ -3289,7 +3289,7 @@ function updateHover(cx, cy) {
   }
 
   if (mode === 'drill') {
-    const dia = parseFloat(document.getElementById('hole-size').value) || 1;
+    const dia = currentBitDiameter();
     const hr = dia / 2;
     const wh = firstHit([...wallMeshes.values(), ...slabMeshes.values()]);
     if (wh) {
@@ -3963,6 +3963,79 @@ const toolButtons = {
 let wallStart = null;
 let racewayStart = null;
 
+// Option bar: show only the controls that belong to the active tool. Anything
+// marked `.always` (level selector, all-levels) is global context and stays put.
+const OPT_TITLES = {
+  select: 'Select', cable: 'Cable', tie: 'Tie', delete: 'Delete', rack: 'Rack',
+  wall: 'Wall', room: 'Room', slab: 'Floor', stairs: 'Stairs', drill: 'Drill',
+  raceway: 'Raceway', measure: 'Measure', place: 'Place'
+};
+const OPT_HINTS = {
+  select: 'Click anything to inspect it. Double-click a device for a close-up.',
+  cable: 'Click a port, then cable managers / raceways to route, then the destination port.',
+  tie: 'Click a cable — everything running near it gets strapped into the bundle.',
+  delete: 'Click a cable, device, rack, wall, hole, stair or raceway to remove it.',
+  rack: 'Click the floor to drop a 42U rack. Q rotates.',
+  wall: 'Click for the start, click again for the end. Keeps chaining; Esc finishes.',
+  room: 'Click two corners — builds four walls and a ceiling at the active level.',
+  slab: 'Click two corners to pour a floor slab on the active level.',
+  stairs: 'Click to place a flight up to the deck above. Q rotates.',
+  drill: 'Click a wall to bore a pass-through at the selected size.',
+  raceway: 'Click the start and end of the run. Pull cables in from Cable mode.',
+  measure: 'Click two points for a real ft/in dimension.',
+  place: 'Click where it mounts — rack slot, wall, ceiling or floor.'
+};
+
+function updateOptionBar() {
+  const t = document.getElementById('opt-title');
+  if (t) t.textContent = OPT_TITLES[mode] || mode;
+  const h = document.getElementById('opt-hint');
+  if (h) h.textContent = OPT_HINTS[mode] || '';
+  for (const el of document.querySelectorAll('#optbar .opt[data-for]')) {
+    const want = el.dataset.for === mode;
+    // the custom-bit field has its own visibility rule on top of the tool match
+    if (el.id === 'opt-bit-custom') {
+      const sel = document.getElementById('hole-size');
+      el.style.display = (want && sel && sel.value === 'custom') ? '' : 'none';
+      continue;
+    }
+    el.style.display = want ? '' : 'none';
+  }
+}
+
+(function initMoreMenu() {
+  const btn = document.getElementById('btn-more');
+  const menu = document.getElementById('more-menu');
+  if (!btn || !menu) return;
+  btn.onclick = e => { e.stopPropagation(); menu.classList.toggle('hidden'); };
+  // any command inside closes it, and so does clicking anywhere else
+  menu.addEventListener('click', () => menu.classList.add('hidden'));
+  document.addEventListener('click', e => {
+    if (!menu.contains(e.target) && e.target !== btn) menu.classList.add('hidden');
+  });
+})();
+
+// Free-entry drill size: the presets cover the common bits, but core drills and
+// custom bores are real, so "Custom…" opens a numeric field.
+(function initCustomBit() {
+  const sel = document.getElementById('hole-size');
+  const wrap = document.getElementById('opt-bit-custom');
+  if (!sel || !wrap) return;
+  sel.addEventListener('change', () => {
+    wrap.style.display = sel.value === 'custom' ? '' : 'none';
+  });
+})();
+
+// Diameter the Drill tool should use, honouring the custom field.
+function currentBitDiameter() {
+  const sel = document.getElementById('hole-size');
+  if (sel && sel.value === 'custom') {
+    const v = parseFloat(document.getElementById('hole-size-custom').value);
+    return Math.max(0.125, Math.min(12, isFinite(v) ? v : 1));
+  }
+  return parseFloat(sel ? sel.value : 1) || 1;
+}
+
 (function initRacewayUI() {
   const sel = document.getElementById('raceway-type');
   if (!sel) return;
@@ -4010,7 +4083,8 @@ function setMode(m, type) {
   clearPreview();
   clearGhost();
   document.querySelectorAll('.lib-item').forEach(el => el.classList.toggle('active', m === 'place' && el.dataset.type === type));
-  for (const [k, btn] of Object.entries(toolButtons)) btn.classList.toggle('active', k === m);
+  for (const [k, btn] of Object.entries(toolButtons)) { if (btn) btn.classList.toggle('active', k === m); }
+  updateOptionBar();
   document.querySelectorAll('#hotbar .slot[data-mode]').forEach(s => s.classList.toggle('active', s.dataset.mode === m));
   renderer.domElement.style.cursor = (m === 'select') ? 'default' : 'crosshair';
   const msgs = {
@@ -5766,6 +5840,7 @@ function demo() {
 
 // boot into the project launcher — no auto-loaded demo
 applyLevelVisibility();   // settle work plane / grade before anything loads
+updateOptionBar();        // show the starting tool's options
 openLauncher();
 
 // debug/verification handle (used by the automated physics test harness)
