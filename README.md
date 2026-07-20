@@ -21,19 +21,7 @@ nothing about a network.
 
 NetMap3D is the overlap. Everything is inches, nothing is decorative:
 
-- A **patch panel port exists twice** — the front RJ45 you patch into and the rear
-  punchdown the horizontal run terminates on. Separate jacks, separate places,
-  one plug each. That's what lets you re-patch a drop by swapping a 6" lead
-  instead of re-pulling cable, and the CSV export names the face so
-  "panel port 12 rear" is an unambiguous punchdown instruction.
-- **Conduit fill is computed, not guessed.** Trade sizes carry their real inside
-  diameters from NEC Chapter 9 Table 4, checked against the 53% / 31% / 40%
-  rules. Overfill a raceway and it turns red, because that design isn't buildable.
-- **Cables can't pass through anything** — not walls, not gear, not each other.
-- **Stairs are laid out to IRC R311.7** (max 7¾" riser, min 10" tread), so a
-  flight has its real footprint and you can see whether it fits the room.
-- The 5'10" reference figure is there so every other dimension has something
-  honest to be judged against.
+
 
 ---
 
