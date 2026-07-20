@@ -49,18 +49,31 @@ see in.
 
 ## Run it
 
+### Just open it — no install
+
+Download **[`NetMap3D.html`](NetMap3D.html)** and double-click it. That's the
+whole thing: one ~1 MB file with three.js, the styles and the app inlined. No
+npm, no toolchain, no server, nothing to install. Works offline, and you can
+email it to someone or drop it on a USB stick for a site visit.
+
+> On GitHub, use the **Download raw file** button on that page — the "Raw" link
+> renders as text in the browser instead of saving.
+
+It's committed to the repo on purpose and rebuilt automatically whenever the
+sources change, so it's never behind.
+
+### From source
+
 ```bash
 npm install
 npm start          # Electron desktop app
 ```
 
 No build step. It also runs in a plain browser — `npx serve .` — where save/load
-falls back to file download/upload.
-
-For a single self-contained file you can hand to someone:
+falls back to file download/upload. To regenerate the portable build yourself:
 
 ```bash
-node build-portable.js   # writes NetMap3D.html, ~1 MB, no dependencies
+node build-portable.js
 ```
 
 ---
