@@ -4381,6 +4381,131 @@ const BRAND_PACK = {
 };
 Object.assign(DEVICE_TYPES, BRAND_PACK);
 
+// ---- Cisco / Meraki ----
+// Port tables checked against the datasheets listed in SPEC_SOURCES. Cisco groups
+// access ports in blocks of six and puts uplinks hard right; Meraki runs WAN on
+// the left, then LAN, then LAN fibre. Counts and speeds are from the datasheet;
+// spacing follows house convention.
+const CISCO_PACK = {
+  // --- Catalyst access switches ---
+  c_c9200l48: { ...R('Catalyst 9200L-48P-4G', 'C9200-48', 52, 2, 1, 16, { sfp: 4, verified: true,
+    portLayout: [
+      { type: 'rj', cols: 6, rows: 2, speed: SPEED.ge, poe: POE.at },
+      { type: 'rj', cols: 6, rows: 2, gapBefore: 0.3, speed: SPEED.ge, poe: POE.at },
+      { type: 'rj', cols: 6, rows: 2, gapBefore: 0.3, speed: SPEED.ge, poe: POE.at },
+      { type: 'rj', cols: 6, rows: 2, gapBefore: 0.3, speed: SPEED.ge, poe: POE.at },
+      { type: 'sfp', cols: 4, rows: 1, gapBefore: 0.5, speed: SPEED.ge, role: 'Uplink' }
+    ] }), cat: 'Cisco & Meraki' },
+  c_c9300l24: { ...R('Catalyst 9300L-24P-4X', 'C9300L-24', 28, 2, 1, 17, { sfp: 4, verified: true,
+    portLayout: [
+      { type: 'rj', cols: 6, rows: 2, speed: SPEED.ge, poe: POE.at },
+      { type: 'rj', cols: 6, rows: 2, gapBefore: 0.3, speed: SPEED.ge, poe: POE.at },
+      { type: 'sfp', cols: 4, rows: 1, gapBefore: 0.5, speed: SPEED.x10, role: 'Uplink' }
+    ] }), cat: 'Cisco & Meraki' },
+  c_c9300l48: { ...R('Catalyst 9300L-48P-4X', 'C9300L-48', 52, 2, 1, 17, { sfp: 4, verified: true,
+    portLayout: [
+      { type: 'rj', cols: 6, rows: 2, speed: SPEED.ge, poe: POE.at },
+      { type: 'rj', cols: 6, rows: 2, gapBefore: 0.3, speed: SPEED.ge, poe: POE.at },
+      { type: 'rj', cols: 6, rows: 2, gapBefore: 0.3, speed: SPEED.ge, poe: POE.at },
+      { type: 'rj', cols: 6, rows: 2, gapBefore: 0.3, speed: SPEED.ge, poe: POE.at },
+      { type: 'sfp', cols: 4, rows: 1, gapBefore: 0.5, speed: SPEED.x10, role: 'Uplink' }
+    ] }), cat: 'Cisco & Meraki' },
+
+  // --- Firepower NGFW ---
+  // 1010 is copper-only with two PoE+ ports; 1120/1140 add four SFP cages.
+  // All three carry a separate management RJ45 alongside the data ports.
+  c_fpr1010: { ...R('Firepower 1010', 'FPR1010', 9, 1, 1, 12, { verified: true,
+    roleMap: { 1: 'WAN', 9: 'MGMT' },
+    portLayout: [
+      { type: 'rj', cols: 1, speed: SPEED.ge, role: 'WAN' },
+      { type: 'rj', cols: 5, gapBefore: 0.4, speed: SPEED.ge },
+      { type: 'rj', cols: 2, speed: SPEED.ge, poe: POE.at },
+      { type: 'rj', cols: 1, gapBefore: 0.5, speed: SPEED.ge, role: 'MGMT' }
+    ] }), cat: 'Cisco & Meraki' },
+  c_fpr1120: { ...R('Firepower 1120', 'FPR1120', 13, 1, 1, 16, { sfp: 4, verified: true,
+    roleMap: { 1: 'WAN', 13: 'MGMT' },
+    portLayout: [
+      { type: 'rj', cols: 1, speed: SPEED.ge, role: 'WAN' },
+      { type: 'rj', cols: 7, gapBefore: 0.4, speed: SPEED.ge },
+      { type: 'sfp', cols: 4, gapBefore: 0.5, speed: SPEED.ge },
+      { type: 'rj', cols: 1, gapBefore: 0.5, speed: SPEED.ge, role: 'MGMT' }
+    ] }), cat: 'Cisco & Meraki' },
+  c_fpr1140: { ...R('Firepower 1140', 'FPR1140', 13, 1, 1, 16, { sfp: 4, verified: true,
+    roleMap: { 1: 'WAN', 13: 'MGMT' },
+    portLayout: [
+      { type: 'rj', cols: 1, speed: SPEED.ge, role: 'WAN' },
+      { type: 'rj', cols: 7, gapBefore: 0.4, speed: SPEED.ge },
+      { type: 'sfp', cols: 4, gapBefore: 0.5, speed: SPEED.ge },
+      { type: 'rj', cols: 1, gapBefore: 0.5, speed: SPEED.ge, role: 'MGMT' }
+    ] }), cat: 'Cisco & Meraki' },
+
+  // --- Meraki MX ---
+  c_mx67: { ...R('Meraki MX67', 'MX67', 6, 1, 1, 10, { wan: 2, verified: true,
+    roleMap: { 1: 'WAN', 2: 'WAN' },
+    portLayout: [
+      { type: 'rj', cols: 2, speed: SPEED.ge, role: 'WAN' },
+      { type: 'rj', cols: 4, gapBefore: 0.5, speed: SPEED.ge }
+    ] }), cat: 'Cisco & Meraki' },
+  // MX95/105 share a port table: 2× 10G SFP+ and 2× 2.5G mGig for WAN, then
+  // 4× 1G copper and 2× 10G fibre for LAN.
+  c_mx95: { ...R('Meraki MX95', 'MX95', 10, 1, 1, 16, { wan: 4, sfp: 4, verified: true,
+    roleMap: { 1: 'WAN', 2: 'WAN', 3: 'WAN', 4: 'WAN' },
+    portLayout: [
+      { type: 'sfp', cols: 2, speed: SPEED.x10, role: 'WAN' },
+      { type: 'rj', cols: 2, gapBefore: 0.3, speed: SPEED.m25, role: 'WAN', poe: POE.at },
+      { type: 'rj', cols: 4, gapBefore: 0.5, speed: SPEED.ge },
+      { type: 'sfp', cols: 2, gapBefore: 0.4, speed: SPEED.x10 }
+    ] }), cat: 'Cisco & Meraki' },
+  c_mx105: { ...R('Meraki MX105', 'MX105', 10, 1, 1, 16, { wan: 4, sfp: 4, verified: true,
+    roleMap: { 1: 'WAN', 2: 'WAN', 3: 'WAN', 4: 'WAN' },
+    portLayout: [
+      { type: 'sfp', cols: 2, speed: SPEED.x10, role: 'WAN' },
+      { type: 'rj', cols: 2, gapBefore: 0.3, speed: SPEED.m25, role: 'WAN', poe: POE.at },
+      { type: 'rj', cols: 4, gapBefore: 0.5, speed: SPEED.ge },
+      { type: 'sfp', cols: 2, gapBefore: 0.4, speed: SPEED.x10 }
+    ] }), cat: 'Cisco & Meraki' },
+
+  // --- Meraki MS switches ---
+  c_ms120_24p: { ...R('Meraki MS120-24P', 'MS120', 28, 2, 1, 12, { sfp: 4, verified: true,
+    portLayout: [
+      { type: 'rj', cols: 12, rows: 2, speed: SPEED.ge, poe: POE.at },
+      { type: 'sfp', cols: 4, rows: 1, gapBefore: 0.5, speed: SPEED.ge, role: 'Uplink' }
+    ] }), cat: 'Cisco & Meraki' },
+  c_ms225_48lp: { ...R('Meraki MS225-48LP', 'MS225', 52, 2, 1, 14, { sfp: 4, verified: true,
+    portLayout: [
+      { type: 'rj', cols: 24, rows: 2, speed: SPEED.ge, poe: POE.at },
+      { type: 'sfp', cols: 4, rows: 1, gapBefore: 0.5, speed: SPEED.x10, role: 'Uplink' }
+    ] }), cat: 'Cisco & Meraki' },
+  c_ms250_48: { ...R('Meraki MS250-48', 'MS250', 52, 2, 1, 16, { sfp: 4, verified: true,
+    portLayout: [
+      { type: 'rj', cols: 24, rows: 2, speed: SPEED.ge },
+      { type: 'sfp', cols: 4, rows: 1, gapBefore: 0.5, speed: SPEED.x10, role: 'Uplink' }
+    ] }), cat: 'Cisco & Meraki' },
+
+  // --- Wireless ---
+  c_c9120ax: { ...F('Catalyst 9120AX', 'C9120', ['ceiling', 'wall'], 'disc', 1, { portSpeed: SPEED.m25 }), cat: 'Cisco & Meraki' },
+  c_c9130ax: { ...F('Catalyst 9130AX', 'C9130', ['ceiling', 'wall'], 'disc', 1, { portSpeed: SPEED.m5 }), cat: 'Cisco & Meraki' },
+  c_mr36:    { ...F('Meraki MR36', 'MR36', ['ceiling', 'wall'], 'disc'), cat: 'Cisco & Meraki' },
+  c_mr57:    { ...F('Meraki MR57', 'MR57', ['ceiling', 'wall'], 'disc', 1, { portSpeed: SPEED.m5 }), cat: 'Cisco & Meraki' },
+  c_cw9164:  { ...F('Meraki CW9164', 'CW9164', ['ceiling', 'wall'], 'disc', 1, { portSpeed: SPEED.m25 }), cat: 'Cisco & Meraki' },
+  c_mg21:    { ...F('Meraki MG21 (Cellular)', 'MG21', ['wall', 'ceiling'], 'box', 1), cat: 'Cisco & Meraki' }
+};
+Object.assign(DEVICE_TYPES, CISCO_PACK);
+Object.assign(SPEC_SOURCES, {
+  c_c9200l48: SPEC_SOURCES.b_c9200,
+  c_c9300l24: 'https://www.cisco.com/c/en/us/products/collateral/switches/catalyst-9300-series-switches/nb-06-cat9300-ser-data-sheet-cte-en.html',
+  c_c9300l48: 'https://www.cisco.com/c/en/us/products/collateral/switches/catalyst-9300-series-switches/nb-06-cat9300-ser-data-sheet-cte-en.html',
+  c_fpr1010: 'https://www.cisco.com/c/en/us/support/security/firepower-1000-series/series.html',
+  c_fpr1120: 'https://www.cisco.com/c/en/us/support/security/firepower-1000-series/series.html',
+  c_fpr1140: 'https://www.cisco.com/c/en/us/support/security/firepower-1000-series/series.html',
+  c_mx67: 'https://documentation.meraki.com/SASE_and_SD-WAN/MX/Product_Information/Overviews_and_Datasheets/MX67_and_MX68_Datasheet',
+  c_mx95: 'https://www.rhinonetworks.com/sites/default/files/2022-02/MX95_105%20Datasheet.pdf',
+  c_mx105: 'https://www.rhinonetworks.com/sites/default/files/2022-02/MX95_105%20Datasheet.pdf',
+  c_ms120_24p: 'https://meraki.cisco.com/lib/pdf/meraki_datasheet_ms_family.pdf',
+  c_ms225_48lp: 'https://meraki.cisco.com/lib/pdf/meraki_datasheet_ms_family.pdf',
+  c_ms250_48: 'https://documentation.meraki.com/Switching/MS_-_Switches/Product_Information/Overviews_and_Datasheets/MS250_Datasheet'
+});
+
 const CABLE_COLOR_NAMES = {
   '#3b82f6': 'Blue', '#ef4444': 'Red', '#22c55e': 'Green', '#eab308': 'Yellow',
   '#f97316': 'Orange', '#a855f7': 'Purple', '#e5e7eb': 'White', '#111827': 'Black'
