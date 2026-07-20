@@ -1,151 +1,75 @@
 # NetMap3D
 
-**Build the building, run the wire, then follow your own model on site.**
-
-A 3D network design tool for people who actually pull cable. You draw the
-structure — floors, walls, basements, crawlspaces — then route real Cat6 through
-it at 1:1 scale, into real conduit, onto the correct face of a real patch panel.
-The result isn't a diagram that approximates the job. It's a model a technician
-can install from.
+3D network design at 1:1 scale. Draw the building, run the cable through it, take the model to site.
 
 ![NetMap3D](docs/hero.jpg)
 
----
-
-## Why this exists
-
-Network diagrams tell you what connects to what. They don't tell you whether the
-run fits in the conduit, which side of the patch panel it lands on, or how much
-cable to put on the truck. Building tools model space beautifully but know
-nothing about a network.
-
-NetMap3D is the overlap. Everything is inches, nothing is decorative.
-
----
-
-## What it looks like
-
-**Structured cabling, done properly.** Horizontal runs land on the panel's rear
-punchdown; short leads patch the front across to the switch. Nothing plugs
-field-to-switch.
-
-![Rack detail](docs/rack-detail.jpg)
-
-**Raceways with live fill.** Pull runs into conduit or tray and they ride in
-their own packed slot — no sag, because the pipe carries them. 200 cables can
-share a 24" tray and each still terminate somewhere different.
-
-![Raceway fill](docs/raceway-fill.jpg)
-
-**Real storeys, including below grade.** Basement, crawlspace, ground, upper
-floors, attic. Draw on the active level and the ones above cut away so you can
-see in.
-
-![Building section](docs/levels-section.jpg)
-
----
-
 ## Run it
 
-### Just open it — no install
+Download [`NetMap3D.html`](NetMap3D.html) and open it. One file, ~1 MB, everything inlined. No install, works offline.
 
-Download **[`NetMap3D.html`](NetMap3D.html)** and double-click it. That's the
-whole thing: one ~1 MB file with three.js, the styles and the app inlined. No
-npm, no toolchain, no server, nothing to install. Works offline, and you can
-email it to someone or drop it on a USB stick for a site visit.
+(Use GitHub's **Download raw file** button. The Raw link opens it as text.)
 
-> On GitHub, use the **Download raw file** button on that page — the "Raw" link
-> renders as text in the browser instead of saving.
-
-It's committed to the repo on purpose and rebuilt automatically whenever the
-sources change, so it's never behind.
-
-### From source
+From source:
 
 ```bash
 npm install
-npm start          # Electron desktop app
+npm start                # Electron
+npx serve .              # or any browser
+node build-portable.js   # regenerate NetMap3D.html
 ```
 
-No build step. It also runs in a plain browser — `npx serve .` — where save/load
-falls back to file download/upload. To regenerate the portable build yourself:
+## Tools
 
-```bash
-node build-portable.js
-```
+Orbit drag, pan right-drag, zoom scroll. Walk (V) is first-person WASD, Space jumps, F flies.
 
----
-
-## Using it
-
-**Orbit** drag · **Pan** right-drag · **Zoom** scroll · **Walk (V)** first-person
-WASD + mouselook, Space jumps, F flies, Esc exits.
-
-The interface is two bars: the build palette on top, and options for whichever
-tool is active underneath — cable colour under Cable, bit size under Drill,
-trade size under Raceway. The level selector is always visible, because it's
-global context.
-
-| Tool | What it does |
+| | |
 |---|---|
-| **Cable (C)** | Click a port, optionally route via cable managers, wall holes or raceways, click the destination. Runs over 5 ft auto-route through the plenum the way a tech actually pulls them. |
-| **Tie (T)** | Straps nearby cables into a real bundle — members cinch into hex-packed slots and funnel in and out of the strap. |
-| **Wall / Room / Floor** | Draw structure on the active level. Room builds four walls plus a ceiling at that storey's real clear height. |
-| **Stairs** | A flight from the active level to the deck above, walkable and collidable. |
-| **Drill (H)** | Bore a pass-through at a preset or custom size (⅛"–12"). Cables route through it. |
-| **Raceway** | EMT ½"–4", cable tray, surface raceway, J-hooks — with NEC fill tracking. |
-| **Measure (M)** | Real ft/in dimensions between any two points. |
-| **2D Plan** | Logical view. Plan links there, build them in 3D; a planned link turns solid once you actually cable it. |
+| **Cable** (C) | Click port, route via managers / holes / raceways, click destination. Runs over 5 ft auto-route through the plenum. |
+| **Tie** (T) | Straps nearby cables into a hex-packed bundle. |
+| **Wall / Room / Floor** | Structure on the active level. Room adds four walls and a ceiling at that storey's clear height. |
+| **Stairs** | Flight up to the deck above. Walkable, collidable. IRC R311.7 rise and run. |
+| **Drill** (H) | Pass-through at preset or custom size, ⅛"–12". |
+| **Raceway** | EMT ½"–4", tray, surface raceway, J-hooks. Fill tracked to NEC Ch. 9 Table 4. |
+| **Measure** (M) | ft/in between two points. |
+| **2D Plan** | Logical view. Planned links go solid once cabled in 3D. |
 
-**Levels:** `[` and `]` move a storey, `\` shows the whole building. Below-grade
-storeys excavate — grade stops being a floor where a basement exists.
-Crawlspaces and attics are "route" storeys: low clearance, no ceiling grid,
-because they exist to run wire through.
+Levels: `[` and `]` change storey, `\` shows all. Basement, crawlspace, ground, upper floors, attic. Storeys above the active one hide so you can see in. Below-grade storeys excavate.
 
-**Save/Load** is plain JSON. **Export CSV** gives the cable schedule with IPs,
-face, colour, route points and length, plus a device inventory.
+Save/Load is JSON. Export CSV gives the cable schedule with IPs, panel face, colour, length, plus device inventory.
 
----
+![Rack detail](docs/rack-detail.jpg)
+![Raceway fill](docs/raceway-fill.jpg)
+![Building section](docs/levels-section.jpg)
 
 ## Roadmap
 
-Working toward Cisco Packet Tracer's simulation depth with UniFi-OS polish, in a
-building you model yourself:
-
-- [x] Install-grade cable routing — collision-aware, no clipping
-- [x] True patch panel front/rear semantics
-- [x] Building levels, basements, crawlspaces, attics, stairs
+- [x] Collision-aware cable routing
+- [x] Patch panel front/rear as separate jacks
+- [x] Levels, basements, crawlspaces, attics, stairs
 - [x] Conduit and raceway with NEC fill
-- [ ] 1:1 device port layouts from published spec sheets
-- [ ] Simulation engine — MAC/ARP tables, L2 forwarding, VLANs, routing, DHCP, CLI
-- [ ] Wider device catalog across major vendors
-- [ ] Video walkthrough → building model (photogrammetry import)
-- [ ] Real-time multi-user collaboration
+- [ ] 1:1 device port layouts from spec sheets
+- [ ] Simulation: MAC/ARP, L2 forwarding, VLANs, routing, DHCP, CLI
+- [ ] Wider device catalog
+- [ ] Video walkthrough to building model
+- [ ] Multi-user collaboration
 
----
+## Notes for contributors
 
-## Architecture notes
+`state` is plain JSON (`racks[]`, `devices[]`, `cables[]`, `walls[]`, `slabs[]`, `stairs[]`, `raceways[]`). It's the save format. Everything 3D rebuilds from it, so edit state then rebuild.
 
-- `state` is plain JSON: `racks[]`, `devices[]`, `cables[]`, `walls[]`, `slabs[]`,
-  `stairs[]`, `raceways[]`. It's the save format, and everything 3D is rebuilt
-  from it — new features should edit state, then rebuild.
-- **A cable endpoint is `(device, port, side)`, never just `(device, port)`.**
-  `side` is `'front'` or `'rear'`; capacity is per jack, not per port number.
-  Older saves migrate in `migrateCableSides`.
-- **Routing precedence:** a raceway beats hand-placed waypoints beats
-  auto-routing. A cable inside a pipe has no say in where it goes.
-- `settleCable` applies catenary droop, pushes samples out of walls / racks /
-  gear / furniture, and separates each run from every other settled route
-  (`cableRoutes` + a spatial hash). Ties and raceway spans are exempt — inside a
-  strap or a conduit, cables are *supposed* to touch.
-- Colliders come from each solid mesh's own geometry bounding box, so anything
-  added to the catalog is collidable for free. Each caches a world AABB for
-  broadphase rejection.
-- Post-processing uses an explicitly **multisampled** composer target. The
-  default target silently bypasses the canvas `antialias` flag and shreds thin
-  geometry like cat6 — keep it.
-- **Adding a tool:** put the button in `#modescroll` and its options in `#optbar`
-  with `data-for="<mode>"`. Don't append to the right-hand cluster, and don't
-  assume the bar fits.
-- Pinned to `three@0.147` for the UMD builds (no bundler). To modernise: Vite +
-  current three + ES modules.
+A cable endpoint is `(device, port, side)`, not `(device, port)`. `side` is `front` or `rear`, and capacity is per jack. Old saves migrate in `migrateCableSides`.
+
+Routing precedence: raceway > hand-placed waypoints > auto-route.
+
+`settleCable` applies droop, pushes samples out of walls, racks, gear and furniture, and separates each run from every other settled route. Ties and raceway spans are exempt, since cables touch inside a strap or conduit.
+
+Colliders derive from each solid mesh's geometry bounding box, so new catalog items are collidable for free.
+
+The composer target must stay multisampled. The default target bypasses the canvas `antialias` flag and wrecks thin geometry like cat6.
+
+Adding a tool: button goes in `#modescroll`, options in `#optbar` with `data-for="<mode>"`. Don't add to the right-hand cluster.
+
+`NetMap3D.html` is committed and rebuilt by a pre-commit hook when `app.js`, `index.html` or `style.css` change. Building elsewhere, run `node build-portable.js` first.
+
+Pinned to `three@0.147` (UMD, no bundler).
