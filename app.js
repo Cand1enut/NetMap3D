@@ -37,6 +37,24 @@ for (const k of Object.keys(DEVICE_TYPES)) DEVICE_TYPES[k].cat = 'Generic';
 // UniFi product catalog. Representative current lineup; mounts reflect how each
 // product is actually installed (wall-only intercoms, ceiling APs, rack gear...).
 const UI_SILVER = 0xd9dce1;
+// Port electrical spec, per block of a faceplate.
+//
+// Counts and types come from vendor datasheets and are verifiable. Exact pixel
+// geometry of a faceplate is not published anywhere, so block order and spacing
+// follow each vendor's house convention rather than a measured drawing — treat
+// positions as representative, counts/speeds/PoE as authoritative. SKUs carrying
+// `verified` have had their port table checked against the datasheet linked in
+// SPEC_SOURCES; everything else is a reasonable default awaiting the same pass.
+const SPEED = { fe: 0.1, ge: 1, m25: 2.5, m5: 5, x10: 10, x25: 25, x40: 40, x100: 100 };
+const POE = { none: null, af: 'PoE', at: 'PoE+', bt60: 'PoE++ (60W)', bt90: 'PoE++ (90W)' };
+
+// Datasheets backing the `verified: true` entries.
+const SPEC_SOURCES = {
+  b_c9200: 'https://www.cisco.com/c/en/us/products/collateral/switches/catalyst-9200-series-switches/nb-06-cat9200-ser-data-sheet-cte-en.html',
+  b_mx85: 'https://documentation.meraki.com/SASE_and_SD-WAN/MX/Product_Information/Overviews_and_Datasheets/MX85_Datasheet',
+  u_promax48: 'https://techspecs.ui.com/unifi/switching/usw-pro-max-48-poe'
+};
+
 const F = (label, short, mounts, shape, ports = 1, extra = {}) =>
   ({ label, short, uh: 0, ports, rows: 1, depth: 0, color: 0xe8ebef, field: true, mountH: 96, mounts, shape, ...extra });
 const R = (label, short, ports, rows = 1, uh = 1, depth = 14, extra = {}) =>
@@ -65,8 +83,18 @@ const UNIFI_CATALOG = {
   u_cgindustrial: { ...F('Cloud Gateway Industrial', 'CGI', ['wall'], 'box', 9, { wan: 1 }), cat: 'UniFi Gateways' },
   // Switches
   // UniFi switches: one continuous RJ45 block (no Cisco-style gaps) + stacked SFP+ at right
-  u_promax48:  { ...R('Pro Max 48 PoE', 'PM48', 52, 2, 1, 16, { sfp: 4, faceInsetL: 2.6, display: { side: 'L', w: 1.6, h: 1.2 },
-    portLayout: [{ type: 'rj', cols: 24, rows: 2 }, { type: 'sfp', cols: 2, rows: 2, gapBefore: 0.6 }] }), cat: 'UniFi Switches' },
+  // Pro Max 48 PoE: 16× 2.5G (8 PoE+, 8 PoE++) then 32× 1G (24 PoE+, 8 PoE++),
+  // then 4× 10G SFP+. The mixed-speed split is the whole reason to buy this SKU,
+  // so it now shows on the faceplate instead of 48 identical ports.
+  u_promax48:  { ...R('Pro Max 48 PoE', 'PM48', 52, 2, 1, 16, { sfp: 4, faceInsetL: 2.6, verified: true,
+    display: { side: 'L', w: 1.6, h: 1.2 },
+    portLayout: [
+      { type: 'rj', cols: 4, rows: 2, speed: SPEED.m25, poe: POE.at },
+      { type: 'rj', cols: 4, rows: 2, speed: SPEED.m25, poe: POE.bt60 },
+      { type: 'rj', cols: 12, rows: 2, gapBefore: 0.3, speed: SPEED.ge, poe: POE.at },
+      { type: 'rj', cols: 4, rows: 2, speed: SPEED.ge, poe: POE.bt60 },
+      { type: 'sfp', cols: 2, rows: 2, gapBefore: 0.6, speed: SPEED.x10, role: 'Uplink' }
+    ] }), cat: 'UniFi Switches' },
   u_promax24:  { ...R('Pro Max 24 PoE', 'PM24', 26, 2, 1, 16, { sfp: 2, faceInsetL: 2.6, display: { side: 'L', w: 1.6, h: 1.2 },
     portLayout: [{ type: 'rj', cols: 12, rows: 2 }, { type: 'sfp', cols: 1, rows: 2, gapBefore: 0.6 }] }), cat: 'UniFi Switches' },
   u_pro48:     { ...R('Pro 48 PoE', 'Pro48', 52, 2, 1, 16, { sfp: 4, faceInsetL: 2.2, display: { side: 'L', w: 1.4, h: 1.0 },
@@ -129,12 +157,29 @@ const FLOOR_SHAPES = new Set(['person', 'table', 'workstation', 'chair', 'pctowe
 
 // Starter multi-brand pack — the assistant can add anything else on demand
 const BRAND_PACK = {
-  b_c9200:   { ...R('Cisco Catalyst 9200L-24P', 'C9200', 26, 2, 1, 16, { sfp: 2,
-    portLayout: [{ type: 'rj', cols: 6, rows: 2 }, { type: 'rj', cols: 6, rows: 2, gapBefore: 0.3 }, { type: 'sfp', cols: 1, rows: 2, gapBefore: 0.5 }] }), cat: 'Cisco & Meraki' },
+  // C9200L-24P-4G: 24× 1G PoE+ over two rows, then FOUR fixed 1G SFP uplinks in a
+  // single row. Was modelled with two uplinks — the -4G suffix is literally the
+  // uplink count, so half the fibre capacity was missing.
+  b_c9200:   { ...R('Cisco Catalyst 9200L-24P-4G', 'C9200', 28, 2, 1, 16, { sfp: 4, verified: true,
+    portLayout: [
+      { type: 'rj', cols: 6, rows: 2, speed: SPEED.ge, poe: POE.at },
+      { type: 'rj', cols: 6, rows: 2, gapBefore: 0.3, speed: SPEED.ge, poe: POE.at },
+      { type: 'sfp', cols: 4, rows: 1, gapBefore: 0.5, speed: SPEED.ge, role: 'Uplink' }
+    ] }), cat: 'Cisco & Meraki' },
   b_c9300:   { ...R('Cisco Catalyst 9300-48P', 'C9300', 52, 2, 1, 17, { sfp: 4,
     portLayout: [{ type: 'rj', cols: 6, rows: 2 }, { type: 'rj', cols: 6, rows: 2, gapBefore: 0.3 }, { type: 'rj', cols: 6, rows: 2, gapBefore: 0.3 }, { type: 'rj', cols: 6, rows: 2, gapBefore: 0.3 }, { type: 'sfp', cols: 2, rows: 2, gapBefore: 0.5 }] }), cat: 'Cisco & Meraki' },
-  b_mx85:    { ...R('Meraki MX85', 'MX85', 10, 1, 1, 14, { wan: 2,
-    portLayout: [{ type: 'rj', cols: 2 }, { type: 'rj', cols: 8, gapBefore: 0.5 }] }), cat: 'Cisco & Meraki' },
+  // MX85: 4 dedicated WAN (2× SFP + 2× RJ45, one of them PoE+) and 10 LAN
+  // (8× RJ45 + 2× SFP), plus a management RJ45. The four SFP cages were missing
+  // entirely, so the appliance had no fibre uplink path at all.
+  b_mx85:    { ...R('Meraki MX85', 'MX85', 15, 1, 1, 14, { wan: 4, sfp: 4, verified: true,
+    roleMap: { 1: 'WAN', 2: 'WAN', 3: 'WAN', 4: 'WAN', 15: 'MGMT' },
+    portLayout: [
+      { type: 'sfp', cols: 2, speed: SPEED.ge, role: 'WAN' },
+      { type: 'rj', cols: 2, gapBefore: 0.3, speed: SPEED.ge, role: 'WAN', poe: POE.at },
+      { type: 'rj', cols: 8, gapBefore: 0.5, speed: SPEED.ge },
+      { type: 'sfp', cols: 2, gapBefore: 0.4, speed: SPEED.ge },
+      { type: 'rj', cols: 1, gapBefore: 0.5, speed: SPEED.ge, role: 'MGMT' }
+    ] }), cat: 'Cisco & Meraki' },
   b_mr46:    { ...F('Meraki MR46', 'MR46', ['ceiling', 'wall'], 'disc'), cat: 'Cisco & Meraki' },
   b_a6300:   { ...R('Aruba 6300M 48G PoE', 'A6300', 52, 2, 1, 17, { sfp: 4,
     portLayout: [{ type: 'rj', cols: 12, rows: 2 }, { type: 'rj', cols: 12, rows: 2, gapBefore: 0.35 }, { type: 'sfp', cols: 2, rows: 2, gapBefore: 0.5 }] }), cat: 'Aruba / HPE' },
@@ -1423,7 +1468,12 @@ function portGrid(def) {
         const cx = x + w / 2;
         const rows = b.rows || 1;
         for (let r = 0; r < rows; r++) {
-          pts.push({ x: cx, y: rows === 2 ? (r === 0 ? 0.44 : -0.44) : (b.y || 0), port: p++, kind: b.type });
+          // speed/poe ride along with the port so tooltips, the properties panel
+          // and (later) the simulation all read the same electrical truth
+          pts.push({
+            x: cx, y: rows === 2 ? (r === 0 ? 0.44 : -0.44) : (b.y || 0),
+            port: p++, kind: b.type, speed: b.speed, poe: b.poe, role: b.role
+          });
         }
         x += w;
       }
@@ -1996,7 +2046,8 @@ function buildDeviceGroup(dev) {
       g.add(bezel);
       const jack = new THREE.Mesh(sfp ? GEO_SFP_HIT : GEO_RJ_HIT, mat(0x07090d, { roughness: 0.3 }));
       jack.position.set(p.x, p.y, 1.05);
-      jack.userData = { isPort: true, deviceId: dev.id, port: p.port, side: FRONT };
+      jack.userData = { isPort: true, deviceId: dev.id, port: p.port, side: FRONT,
+        speed: p.speed, poe: p.poe, kind: p.kind, roleHint: p.role };
       g.add(jack); portMeshes.push(jack);
       if (!sfp) {
         const gold = new THREE.Mesh(GEO_GOLD, mat(0xc9a227, { metalness: 1, roughness: 0.3 }));
@@ -2602,6 +2653,16 @@ function portLabel(dev, port) {
   return `Port ${port}`;
 }
 
+// Human label for a port's electrical spec, e.g. "2.5G · PoE++ (60W)".
+function portSpecLabel(u) {
+  if (!u) return '';
+  const bits = [];
+  if (u.speed) bits.push(u.speed >= 1 ? `${u.speed}G` : `${u.speed * 1000}M`);
+  if (u.kind === 'sfp') bits.push('SFP');
+  if (u.poe) bits.push(u.poe);
+  return bits.join(' · ');
+}
+
 function portRole(def, port) {
   if (port === 'PWR') return 'PWR';
   if (def.powerDevice) return 'PWR';
@@ -3016,7 +3077,9 @@ function updateHover(cx, cy) {
     // on a patch panel the face is the whole point — say which one you're on
     const face = dev && DEVICE_TYPES[dev.type].passthrough
       ? (side === REAR ? ' · rear punchdown' : ' · front') : '';
+    const spec = portSpecLabel(portHit.object.userData);
     let txt = `${dev ? dev.name : '?'}${dev && dev.ip ? ' (' + dev.ip + ')' : ''} · ${portLabel(dev, port)}${face}`
+      + (spec ? ` · ${spec}` : '')
       + (role !== 'LAN' && role !== 'PWR' ? ` (${role})` : '')
       + (pcfg && pcfg.vlan ? ` · VLAN ${pcfg.vlan}` : '')
       + (pcfg && pcfg.label ? ` · ${pcfg.label}` : '');
