@@ -7,7 +7,7 @@
 </head>
 <body>
   <div id="toolbar">
-    <span class="logo">NetMap<b>3D</b><span class="ver">v0.9.7 · Jul 19</span></span>
+    <span class="logo">NetMap<b>3D</b><span class="ver">v0.10.0 · Jul 19</span></span>
     <span id="proj-name"></span>
     <button id="tool-select" class="tool active" title="Select / inspect (Esc)">Select</button>
     <button id="tool-cable"  class="tool" title="Draw cable: click source port, optionally click cable managers as route points, click destination port (C)">Cable</button>
@@ -34,12 +34,13 @@
       <option value="240,180">20 × 15'</option>
       <option value="360,240">30 × 20'</option>
     </select>
-    <button id="tool-slab" class="tool" title="Add an upper floor: pick the level, then click two corners">+ Floor</button>
-    <select id="level-sel" title="Height of the floor slab being drawn">
-      <option value="120">Lvl 2 (10')</option>
-      <option value="240">Lvl 3 (20')</option>
-      <option value="360">Lvl 4 (30')</option>
-    </select>
+    <button id="tool-slab" class="tool" title="Add a floor slab on the active level: click two corners">+ Floor</button>
+    <button id="tool-stairs" class="tool" title="Stairs between this level and the one above: click the bottom, then drag the direction">Stairs</button>
+    <button id="tool-raceway" class="tool" title="Run conduit, cable tray or surface raceway: click start, click end. Cables pulled into it share the pathway and its fill is tracked to NEC limits">Raceway</button>
+    <select id="raceway-type" title="Raceway trade size — fill capacity is computed from the real inside diameter"></select>
+    <span class="sep"></span>
+    <select id="level-sel" title="Active building level — everything you draw lands here, and levels above are hidden so you can see in ([ and ] to change)"></select>
+    <button id="btn-alllevels" title="Show every level at once for the finished walkthrough">All levels</button>
     <span class="sep"></span>
     <button id="btn-walk" title="Walk around in first person: WASD + mouse, Space/C up/down, Shift sprint, Esc exits (V)">Walk</button>
     <button id="btn-xray" title="See through walls to inspect cable runs (X)">X-ray</button>

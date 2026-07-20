@@ -163,7 +163,7 @@ const CABLE_COLOR_NAMES = {
 
 //////////////////// State ////////////////////
 
-let state = { racks: [], devices: [], cables: [], walls: [], holes: [], links: [], ties: [], measures: [], slabs: [], customTypes: {} };
+let state = { racks: [], devices: [], cables: [], walls: [], holes: [], links: [], ties: [], measures: [], slabs: [], stairs: [], raceways: [], customTypes: {} };
 
 // Everything is real-scale: 1 unit = 1 inch. Floor grid squares are 1 ft.
 function fmtLen(inches) {
@@ -172,6 +172,54 @@ function fmtLen(inches) {
 }
 const WALL_H = 114, WALL_T = 4;  // 9'6" walls — tops meet the next level's slab (120" spacing, 6" slab)
 const LEVEL_H = 120;
+const SLAB_T = 6;
+
+//////////////////// Building levels ////////////////////
+// A storey of the building. `y` is finished-floor elevation, `h` the clear
+// height to the underside of the deck above. Below-grade and low-clearance
+// storeys are first-class citizens, not an afterthought: crawlspaces, attics
+// and basements are where an enormous share of real cable actually runs, and a
+// model that can't represent them can't be followed on site.
+//
+// `route` marks a storey you route through but don't furnish — it gets a
+// reduced clear height and no ceiling grid.
+const LEVELS = [
+  { key: 'base',  name: 'Basement',   short: 'B',  y: -108, h: 102 },
+  { key: 'crawl', name: 'Crawlspace', short: 'CS', y: -42,  h: 36, route: true },
+  { key: 'l1',    name: 'Level 1',    short: '1',  y: 0,    h: WALL_H },
+  { key: 'l2',    name: 'Level 2',    short: '2',  y: 120,  h: WALL_H },
+  { key: 'l3',    name: 'Level 3',    short: '3',  y: 240,  h: WALL_H },
+  { key: 'l4',    name: 'Level 4',    short: '4',  y: 360,  h: WALL_H },
+  { key: 'attic', name: 'Attic',      short: 'A',  y: 480,  h: 84, route: true }
+].sort((a, b) => a.y - b.y);
+
+const GROUND_LEVEL = LEVELS.findIndex(l => l.key === 'l1');
+let activeLevel = GROUND_LEVEL;
+let showAllLevels = false;
+
+function level() { return LEVELS[activeLevel]; }
+function levelY() { return level().y; }
+
+// Top of the deck sitting on a storey's walls — its ceiling, and the floor of
+// whatever is above it.
+//
+// Deliberately derived from the storey's own clear height rather than by looking
+// up the next entry in LEVELS. Basement and crawlspace are alternatives, not a
+// stack: both are below grade, so "the next level up" from a basement is the
+// crawlspace elevation, which is wrong for every real building. Wall top plus
+// slab is right in all cases, and the level heights are chosen so it lands
+// exactly on the next storey's floor.
+function deckAbove(idx) {
+  const L = LEVELS[idx === undefined ? activeLevel : idx];
+  return L.y + L.h + SLAB_T;
+}
+
+// Which storey a given elevation belongs to: the highest level at or below it.
+function levelIndexForY(y) {
+  let idx = 0;
+  for (let i = 0; i < LEVELS.length; i++) if (LEVELS[i].y <= y + 0.5) idx = i;
+  return idx;
+}
 
 // Undo (Ctrl/Cmd+Z) — snapshot before every mutating action
 const undoStack = [];
@@ -202,6 +250,10 @@ const holeMeshes = [];           // raycast targets for drill holes
 const tieGroups = new Map();     // tieId -> Group
 const tieMeshes = [];            // raycast targets for ties
 const slabMeshes = new Map();    // slabId -> Mesh (upper-floor slabs)
+const stairGroups = new Map();   // stairId -> Group
+const stairMeshes = [];          // raycast targets for stairs
+const racewayGroups = new Map(); // racewayId -> Group
+const racewayMeshes = [];        // raycast targets for raceways
 const measureGroups = new Map(); // measureId -> Group
 const measureHits = [];          // raycast targets for measurements
 let measureStart = null;
@@ -485,6 +537,25 @@ let grid = new THREE.GridHelper(1200, 100, 0x2c3646, 0x222a36);
 grid.position.y = 0.02;
 scene.add(grid);
 
+// The work plane is what makes below-grade building possible at all. Every tool
+// used to raycast against the floor mesh or an existing slab, so you could only
+// draw where something already existed — which meant a basement was impossible,
+// because there is nothing down there to click on yet. This invisible plane sits
+// at the active storey's elevation and gives every tool a surface to hit.
+const workPlane = new THREE.Mesh(
+  new THREE.PlaneGeometry(1200, 1200),
+  new THREE.MeshBasicMaterial({ visible: false })
+);
+workPlane.rotation.x = -Math.PI / 2;
+workPlane.userData = { isWorkPlane: true, isFloor: true };
+scene.add(workPlane);
+
+// A faint grid drawn at the working elevation so you can see where "here" is
+// when the storey has no floor yet.
+let workGrid = new THREE.GridHelper(1200, 100, 0x4da3ff, 0x2b4468);
+workGrid.visible = false;
+scene.add(workGrid);
+
 //////////////////// Geometry builders ////////////////////
 
 const matCache = new Map();
@@ -604,6 +675,7 @@ function buildWall(w) {
   }
   scene.add(m);
   wallMeshes.set(w.id, m);
+  scheduleLevelVis();
   scheduleReroute();
   return m;
 }
@@ -768,22 +840,391 @@ function buildSlab(s) {
   m.userData = { isSlab: true, slabId: s.id, topY: s.y };
   scene.add(m);
   slabMeshes.set(s.id, m);
+  scheduleLevelVis();
   scheduleReroute();
   return m;
 }
 function buildRoom(x1, z1, x2, z2, y0) {
   undoPush();
+  // Wall height comes from the storey being built on, so a crawlspace gets 3 ft
+  // of clearance and a basement gets 8'6" — not one hardcoded 9'6" everywhere.
+  const L = LEVELS[levelIndexForY(y0)];
+  const wallH = L.h;
   const corners = [[x1, z1], [x2, z1], [x2, z2], [x1, z2], [x1, z1]];
   for (let i = 0; i < 4; i++) {
-    const w = { id: uid(), x1: corners[i][0], z1: corners[i][1], x2: corners[i + 1][0], z2: corners[i + 1][1], h: WALL_H, y0 };
+    const w = { id: uid(), x1: corners[i][0], z1: corners[i][1], x2: corners[i + 1][0], z2: corners[i + 1][1], h: wallH, y0 };
     state.walls.push(w);
     buildWall(w);
   }
-  // the ceiling IS the next level's floor slab — wall tops meet it exactly
-  const ceil = { id: uid(), x1, z1, x2, z2, y: y0 + LEVEL_H };
+  const ceilY = deckAbove(levelIndexForY(y0));
+  const ceil = { id: uid(), x1, z1, x2, z2, y: ceilY };
   state.slabs.push(ceil);
   buildSlab(ceil);
-  setStatus(`Room built: ${fmtLen(Math.abs(x2 - x1))} × ${fmtLen(Math.abs(z2 - z1))} with ceiling. X-ray (X) sees inside; the ceiling doubles as the floor above (Delete removes it if unwanted).`);
+  applyLevelVisibility();
+  setStatus(`${L.name} room: ${fmtLen(Math.abs(x2 - x1))} × ${fmtLen(Math.abs(z2 - z1))}, ${fmtLen(wallH)} clear, ceiling at ${fmtLen(ceilY)}. X-ray (X) sees inside; the ceiling doubles as the floor above.`);
+}
+
+//////////////////// Raceways: conduit, tray, surface raceway, J-hook ////////////////////
+// The pathway is a first-class object, not an incidental waypoint. On a real job
+// the raceway is designed first and the cables are pulled into it afterwards,
+// and its capacity is a hard constraint — you cannot will a 49th cable into a
+// 1" EMT. Modelling fill is the difference between a drawing that looks right
+// and one a contractor can actually order material from.
+//
+// Inside diameters are the real EMT figures from NEC Chapter 9, Table 4 — note
+// these are EMT specifically, not rigid (RMC), whose IDs differ by enough at the
+// larger trade sizes to change how many cables fit. Getting 3" wrong by using
+// the RMC figure costs you ~10 cables of capacity on paper.
+const RACEWAY_TYPES = {
+  emt050:  { label: '½" EMT',            kind: 'conduit', id: 0.622, round: true },
+  emt075:  { label: '¾" EMT',            kind: 'conduit', id: 0.824, round: true },
+  emt100:  { label: '1" EMT',            kind: 'conduit', id: 1.049, round: true },
+  emt125:  { label: '1¼" EMT',           kind: 'conduit', id: 1.380, round: true },
+  emt150:  { label: '1½" EMT',           kind: 'conduit', id: 1.610, round: true },
+  emt200:  { label: '2" EMT',            kind: 'conduit', id: 2.067, round: true },
+  emt250:  { label: '2½" EMT',           kind: 'conduit', id: 2.731, round: true },
+  emt300:  { label: '3" EMT',            kind: 'conduit', id: 3.356, round: true },
+  emt350:  { label: '3½" EMT',           kind: 'conduit', id: 3.834, round: true },
+  emt400:  { label: '4" EMT',            kind: 'conduit', id: 4.334, round: true },
+  tray06:  { label: '6" cable tray',     kind: 'tray', w: 6,  d: 4 },
+  tray12:  { label: '12" cable tray',    kind: 'tray', w: 12, d: 4 },
+  tray24:  { label: '24" cable tray',    kind: 'tray', w: 24, d: 6 },
+  ras075:  { label: '¾" surface raceway',kind: 'surface', w: 0.75, d: 0.5 },
+  ras150:  { label: '1½" surface raceway',kind: 'surface', w: 1.5, d: 0.75 },
+  jhook:   { label: 'J-hook (bridle ring)', kind: 'hook', w: 2, d: 2 }
+};
+
+// Usable cross-section, in². Conduit is limited by NEC Chapter 9 Table 1: 53%
+// for one conductor, 31% for two, 40% for three or more — the two-cable case
+// really is the tightest, because of the wedge of dead space a pair leaves.
+// Tray and surface raceway are governed by a 50% fill convention instead.
+function racewayCapacityIn2(type, cableCount) {
+  const t = RACEWAY_TYPES[type];
+  if (!t) return 0;
+  if (t.kind === 'conduit') {
+    const area = Math.PI * (t.id / 2) ** 2;
+    const pct = cableCount <= 1 ? 0.53 : cableCount === 2 ? 0.31 : 0.40;
+    return area * pct;
+  }
+  if (t.kind === 'hook') return Math.PI * 1.0 ** 2;      // a hook just carries a bundle
+  return t.w * t.d * 0.5;
+}
+
+function cableAreaIn2(n) { return n * Math.PI * (CABLE_R + 0.005) ** 2; }
+
+// Everything a fill readout needs. `over` is the thing that matters: it means
+// the design is not buildable as drawn.
+function racewayFill(rw) {
+  const n = (rw.cables || []).length;
+  const cap = racewayCapacityIn2(rw.type, n);
+  const used = cableAreaIn2(n);
+  const pct = cap > 0 ? (used / cap) * 100 : 0;
+  const t = RACEWAY_TYPES[rw.type] || {};
+  // how many more of the same cable fit before the limit bites
+  let room = 0;
+  while (cableAreaIn2(n + room + 1) <= racewayCapacityIn2(rw.type, n + room + 1)) {
+    room++;
+    if (room > 999) break;
+  }
+  return { count: n, capacityIn2: cap, usedIn2: used, pct, over: pct > 100, room, label: t.label || rw.type };
+}
+
+function racewayPath(rw) {
+  return [new THREE.Vector3(rw.x1, rw.y1, rw.z1), new THREE.Vector3(rw.x2, rw.y2, rw.z2)];
+}
+
+// Packing slot for cable `i` of `n` inside the raceway cross-section — this is
+// what lets 200 runs share one bore and still each come out somewhere different.
+function racewaySlot(rw, i, n) {
+  const t = RACEWAY_TYPES[rw.type] || {};
+  if (t.kind === 'tray' || t.kind === 'surface') {
+    // trays fill in layers, bottom-up, the way cable actually lies in one
+    const perRow = Math.max(1, Math.floor((t.w - 0.3) / (CABLE_R * 2.2)));
+    const row = Math.floor(i / perRow), col = i % perRow;
+    const x = -t.w / 2 + 0.15 + (col + 0.5) * (CABLE_R * 2.2);
+    const y = -t.d / 2 + 0.15 + (row + 0.5) * (CABLE_R * 2.2);
+    return [x, y];
+  }
+  // round conduit: concentric rings
+  if (n <= 1) return [0, 0];
+  let idx = i, ring = 0, cap = 1;
+  while (idx >= cap) { idx -= cap; ring++; cap = ring * 6; }
+  const a = (idx / cap) * Math.PI * 2 + ring * 0.4;
+  const r = CABLE_R * 2.15 * ring;
+  return [Math.cos(a) * r, Math.sin(a) * r];
+}
+
+function buildRaceway(rw) {
+  const g = new THREE.Group();
+  const [a, b] = racewayPath(rw);
+  const mid = a.clone().add(b).multiplyScalar(0.5);
+  const len = a.distanceTo(b);
+  g.position.copy(mid);
+  g.quaternion.setFromUnitVectors(new THREE.Vector3(0, 0, 1), b.clone().sub(a).normalize());
+  const t = RACEWAY_TYPES[rw.type] || RACEWAY_TYPES.emt100;
+  const fill = racewayFill(rw);
+  // overfilled pathways read red — a design error you can see across the room
+  const galv = fill.over
+    ? mat(0xd23b3b, { metalness: 0.5, roughness: 0.45, emissive: 0x3a0c0c, emissiveIntensity: 0.5 })
+    : mat(0xa8b0ba, { metalness: 0.82, roughness: 0.36 });
+  if (t.kind === 'conduit') {
+    const outer = t.id + 0.12;
+    const tube = new THREE.Mesh(new THREE.CylinderGeometry(outer / 2, outer / 2, len, 20, 1, true), galv);
+    tube.rotation.x = Math.PI / 2;
+    tube.material.side = THREE.DoubleSide;
+    tube.userData = { isRaceway: true, racewayId: rw.id };
+    tube.castShadow = true;
+    g.add(tube); racewayMeshes.push(tube);
+  } else if (t.kind === 'hook') {
+    const hook = new THREE.Mesh(new THREE.TorusGeometry(1.1, 0.09, 8, 20, Math.PI * 1.35), galv);
+    hook.rotation.y = Math.PI / 2;
+    hook.userData = { isRaceway: true, racewayId: rw.id };
+    g.add(hook); racewayMeshes.push(hook);
+  } else {
+    // tray / surface raceway: a U-channel
+    const wall = 0.1;
+    const base = new THREE.Mesh(new THREE.BoxGeometry(t.w, wall, len), galv);
+    base.position.y = -t.d / 2;
+    base.userData = { isRaceway: true, racewayId: rw.id };
+    base.castShadow = true;
+    g.add(base); racewayMeshes.push(base);
+    for (const s of [-1, 1]) {
+      const side = new THREE.Mesh(new THREE.BoxGeometry(wall, t.d, len), galv);
+      side.position.set(s * t.w / 2, 0, 0);
+      side.userData = { isRaceway: true, racewayId: rw.id };
+      side.castShadow = true;
+      g.add(side); racewayMeshes.push(side);
+    }
+  }
+  // fill label, so capacity is visible without clicking anything
+  const lbl = makeTextSprite(`${fill.label} · ${fill.pct.toFixed(0)}% · ${fill.count} cables`,
+    fill.over ? '#ff6b6b' : '#cfe0ff');
+  lbl.position.set(0, (t.kind === 'conduit' ? t.id / 2 : t.d / 2) + 2.5, 0);
+  g.add(lbl);
+  scene.add(g);
+  racewayGroups.set(rw.id, g);
+  collidersDirty = true;
+  scheduleLevelVis();
+  return g;
+}
+
+function rebuildRaceway(rw) {
+  const g = racewayGroups.get(rw.id);
+  if (g) {
+    scene.remove(g);
+    g.traverse(o => { if (o.geometry) o.geometry.dispose(); });
+    racewayGroups.delete(rw.id);
+  }
+  removeFromArr(racewayMeshes, m => m.userData.racewayId === rw.id);
+  buildRaceway(rw);
+}
+
+function deleteRaceway(id) {
+  const g = racewayGroups.get(id);
+  if (g) {
+    scene.remove(g);
+    g.traverse(o => { if (o.geometry) o.geometry.dispose(); });
+    racewayGroups.delete(id);
+  }
+  removeFromArr(racewayMeshes, m => m.userData.racewayId === id);
+  removeFromArr(state.raceways, r => r.id === id);
+  // cables pulled through it fall back to their own routing
+  for (const c of state.cables) {
+    if (c.raceways && c.raceways.includes(id)) {
+      c.raceways = c.raceways.filter(x => x !== id);
+      rebuildCable(c);
+    }
+  }
+  scheduleReroute();
+}
+
+// Pull a cable into a raceway: it takes the next free slot and follows the
+// pathway end to end.
+function pullIntoRaceway(cable, rw) {
+  rw.cables = rw.cables || [];
+  if (!rw.cables.includes(cable.id)) rw.cables.push(cable.id);
+  cable.raceways = cable.raceways || [];
+  if (!cable.raceways.includes(rw.id)) cable.raceways.push(rw.id);
+  rebuildRaceway(rw);
+  rebuildCable(cable);
+  return racewayFill(rw);
+}
+
+// Guide points that carry a cable through every raceway it's pulled into, in
+// its own slot. Entry and exit are separate points so the run enters the mouth
+// of the pathway rather than teleporting to the middle of it.
+function racewayGuide(cable) {
+  const pts = [];
+  for (const id of cable.raceways || []) {
+    const rw = (state.raceways || []).find(r => r.id === id);
+    if (!rw) continue;
+    const [a, b] = racewayPath(rw);
+    const dir = b.clone().sub(a).normalize();
+    const u = Math.abs(dir.y) > 0.9 ? new THREE.Vector3(1, 0, 0) : new THREE.Vector3(0, 1, 0);
+    const ax = new THREE.Vector3().crossVectors(dir, u).normalize();
+    const ay = new THREE.Vector3().crossVectors(dir, ax).normalize();
+    const idx = (rw.cables || []).indexOf(cable.id);
+    const [sx, sy] = racewaySlot(rw, Math.max(0, idx), (rw.cables || []).length);
+    const off = ax.clone().multiplyScalar(sx).add(ay.clone().multiplyScalar(sy));
+    pts.push(a.clone().add(off), b.clone().add(off));
+  }
+  return pts;
+}
+
+//////////////////// Stairs ////////////////////
+// Rise and run come from the building code every real stair is built to
+// (IRC R311.7): max 7¾" rise, min 10" tread. Given a floor-to-floor height the
+// tread count falls out of the max rise, which is exactly how a carpenter lays
+// one out — and it means a stair drawn here has the real footprint, so you can
+// see whether it actually fits the room before anyone frames it.
+const STAIR_MAX_RISE = 7.75, STAIR_MIN_TREAD = 10, STAIR_W = 36;
+
+function stairGeometry(totalRise) {
+  const steps = Math.max(1, Math.ceil(totalRise / STAIR_MAX_RISE));
+  const rise = totalRise / steps;
+  const tread = Math.max(STAIR_MIN_TREAD, 11);
+  return { steps, rise, tread, run: steps * tread };
+}
+
+function buildStair(st) {
+  const g = new THREE.Group();
+  g.position.set(st.x, st.y0, st.z);
+  g.rotation.y = st.rotY || 0;
+  const { steps, rise, tread } = stairGeometry(st.rise);
+  const wood = mat(0x8a7359, { roughness: 0.62, metalness: 0 });
+  const riserM = mat(0xe8e5df, { roughness: 0.7, metalness: 0 });
+  const w = st.w || STAIR_W;
+  for (let i = 0; i < steps; i++) {
+    const z = i * tread;
+    const t = new THREE.Mesh(new THREE.BoxGeometry(w, 1.1, tread + 1), wood);
+    t.position.set(0, (i + 1) * rise - 0.55, z + tread / 2);
+    t.castShadow = true; t.receiveShadow = true;
+    t.userData = { isStair: true, stairId: st.id, isStairTread: true };
+    g.add(t); stairMeshes.push(t);
+    const r = new THREE.Mesh(new THREE.BoxGeometry(w, rise, 0.8), riserM);
+    r.position.set(0, (i + 0.5) * rise, z);
+    r.receiveShadow = true;
+    r.userData = { isStair: true, stairId: st.id };
+    g.add(r); stairMeshes.push(r);
+  }
+  // stringers either side
+  for (const s of [-1, 1]) {
+    const str = new THREE.Mesh(new THREE.BoxGeometry(1.2, 1.5, steps * tread), mat(0x4a4038, { roughness: 0.7 }));
+    str.position.set(s * (w / 2 + 0.6), st.rise / 2, (steps * tread) / 2);
+    str.rotation.x = -Math.atan2(st.rise, steps * tread);
+    str.userData = { isStair: true, stairId: st.id };
+    g.add(str); stairMeshes.push(str);
+  }
+  scene.add(g);
+  stairGroups.set(st.id, g);
+  collidersDirty = true;
+  scheduleLevelVis();
+  return g;
+}
+
+function deleteStair(id) {
+  const g = stairGroups.get(id);
+  if (g) {
+    scene.remove(g);
+    g.traverse(o => { if (o.geometry) o.geometry.dispose(); });
+    stairGroups.delete(id);
+  }
+  removeFromArr(stairMeshes, m => m.userData.stairId === id);
+  removeFromArr(state.stairs, s => s.id === id);
+  scheduleReroute();
+}
+
+// Height of any stair tread under (x,z) — this is what lets walk mode climb.
+function stairHeightAt(x, z, belowY) {
+  let best = -Infinity;
+  for (const st of state.stairs || []) {
+    const { steps, rise, tread } = stairGeometry(st.rise);
+    // into the stair's local frame
+    const dx = x - st.x, dz = z - st.z;
+    const c = Math.cos(-(st.rotY || 0)), s = Math.sin(-(st.rotY || 0));
+    const lx = dx * c - dz * s, lz = dx * s + dz * c;
+    const w = st.w || STAIR_W;
+    if (Math.abs(lx) > w / 2 + 2 || lz < -2 || lz > steps * tread + 2) continue;
+    const step = Math.min(steps, Math.max(0, Math.ceil(lz / tread)));
+    const y = st.y0 + step * rise;
+    if (y <= belowY + 0.5 && y > best) best = y;
+  }
+  return best;
+}
+
+//////////////////// Level switching & visibility ////////////////////
+// Every building tool works one storey at a time and hides what's above it —
+// Revit, Homestyler and the Sims all do this for the same reason: from outside,
+// the storey above is a lid you cannot see or click past. Below stays visible so
+// you can line a riser up with the floor underneath.
+
+function objectLevel(o) {
+  const u = o.userData || {};
+  if (u.isWall) { const w = state.walls.find(x => x.id === u.wallId); return levelIndexForY(w ? (w.y0 || 0) : 0); }
+  if (u.isSlab) { const s = state.slabs.find(x => x.id === u.slabId); return levelIndexForY(s ? s.y : 0); }
+  return null;
+}
+
+function applyLevelVisibility() {
+  const top = showAllLevels ? LEVELS.length - 1 : activeLevel;
+  for (const [id, m] of wallMeshes) {
+    const w = state.walls.find(x => x.id === id);
+    m.visible = levelIndexForY(w ? (w.y0 || 0) : 0) <= top;
+  }
+  for (const [id, m] of slabMeshes) {
+    const s = state.slabs.find(x => x.id === id);
+    // a slab at the active storey's own elevation is its floor, so it stays;
+    // the one overhead belongs to the storey above and gets cut away
+    m.visible = levelIndexForY(s ? s.y : 0) <= top;
+  }
+  for (const [id, g] of deviceGroups) {
+    const d = deviceById(id);
+    if (!d) continue;
+    const y = d.mount === 'wall' ? (d.y || 0) : (d.y0 !== undefined ? d.y0 : (rackById(d.rackId) || {}).y0 || 0);
+    g.visible = levelIndexForY(y) <= top;
+  }
+  for (const [id, g] of rackGroups) {
+    const r = rackById(id);
+    g.visible = levelIndexForY(r ? (r.y0 || 0) : 0) <= top;
+  }
+  for (const [id, g] of stairGroups) {
+    const st = (state.stairs || []).find(x => x.id === id);
+    g.visible = levelIndexForY(st ? st.y0 : 0) <= top;
+  }
+  for (const [, m] of cableMeshes) m.visible = true;   // runs cross storeys by nature
+  // grade is a lid too when you're working underneath it
+  const below = levelY() < -0.5;
+  floorMesh.visible = !below || showAllLevels;
+  grid.visible = floorMesh.visible;
+  workPlane.position.y = levelY();
+  workGrid.position.y = levelY() + 0.05;
+  workGrid.visible = below || (level().route === true);
+  updateLevelUI();
+}
+
+// Coalesced to one pass per tick — restoring a 200-wall project would otherwise
+// re-scan every object once per wall.
+let _levelVisQueued = false;
+function scheduleLevelVis() {
+  if (_levelVisQueued) return;
+  _levelVisQueued = true;
+  Promise.resolve().then(() => { _levelVisQueued = false; applyLevelVisibility(); });
+}
+
+function setLevel(i) {
+  activeLevel = Math.max(0, Math.min(LEVELS.length - 1, i));
+  applyLevelVisibility();
+  const L = level();
+  setStatus(`${L.name} — floor at ${fmtLen(L.y)}, ${fmtLen(L.h)} clear.` +
+    (L.route ? ' Route-only storey: low clearance, no ceiling grid — this is where the wire actually goes.' : '') +
+    ' Storeys above are hidden so you can see in; [ and ] change level.');
+}
+
+function updateLevelUI() {
+  const sel = document.getElementById('level-sel');
+  if (sel && sel.value !== String(activeLevel)) sel.value = String(activeLevel);
+  const b = document.getElementById('btn-alllevels');
+  if (b) b.classList.toggle('active', showAllLevels);
 }
 
 function deleteSlab(id) {
@@ -792,16 +1233,54 @@ function deleteSlab(id) {
   removeFromArr(state.slabs, s => s.id === id);
   scheduleReroute();
 }
-function groundTargets() { return [floorMesh, ...slabMeshes.values()]; }
-function groundYFromHit(hit) { return hit.object.userData.isSlab ? hit.object.userData.topY : 0; }
+// Drawing targets: the floors you can currently see, plus the work plane so a
+// storey with nothing built on it yet is still clickable.
+//
+// Hidden floors are excluded explicitly rather than relying on the raycaster to
+// respect `visible` — it does not. Without this, building a basement is
+// impossible: the ray from the camera reaches grade (y=0) long before the work
+// plane at -108, so every click would snap back to the ground floor.
+function groundTargets() {
+  const t = [];
+  if (floorMesh.visible) t.push(floorMesh);
+  for (const m of slabMeshes.values()) if (m.visible) t.push(m);
+  t.push(workPlane);
+  return t;
+}
+function groundYFromHit(hit) {
+  if (hit.object.userData.isSlab) return hit.object.userData.topY;
+  if (hit.object.userData.isWorkPlane) return levelY();
+  return 0;
+}
+
+// Highest walkable surface at (x,z) at or below `belowY`.
+//
+// This used to start at 0 and never return anything lower, which quietly made
+// basements impossible: you could place a slab at -108 but you would still stand
+// on grade and cables would still bottom out at zero. Grade is now just another
+// surface, and it only counts where the ground hasn't been excavated.
 function groundAt(x, z, belowY) {
-  let g = 0;
+  let g = -Infinity;
   for (const s of state.slabs || []) {
     const x1 = Math.min(s.x1, s.x2) - 2, x2 = Math.max(s.x1, s.x2) + 2;
     const z1 = Math.min(s.z1, s.z2) - 2, z2 = Math.max(s.z1, s.z2) + 2;
-    if (x >= x1 && x <= x2 && z >= z1 && z <= z2 && s.y <= belowY && s.y > g) g = s.y;
+    if (x >= x1 && x <= x2 && z >= z1 && z <= z2 && s.y <= belowY + 0.5 && s.y > g) g = s.y;
   }
-  return g;
+  // grade counts unless we're inside an excavation (a slab below zero here)
+  if (belowY >= -0.5 && !excavatedAt(x, z)) g = Math.max(g, 0);
+  return g === -Infinity ? 0 : g;
+}
+
+// True where a below-grade slab exists — i.e. the ground has been dug out, so
+// grade is a hole rather than a floor.
+function excavatedAt(x, z) {
+  for (const s of state.slabs || []) {
+    if (s.y >= -0.5) continue;
+    const x1 = Math.min(s.x1, s.x2), x2 = Math.max(s.x1, s.x2);
+    const z1 = Math.min(s.z1, s.z2), z2 = Math.max(s.z1, s.z2);
+    if (x >= x1 && x <= x2 && z >= z1 && z <= z2) return true;
+  }
+  return false;
 }
 
 function buildMeasure(m) {
@@ -918,6 +1397,7 @@ function buildRackGroup(rack) {
   scene.add(g);
   rackGroups.set(rack.id, g);
   collidersDirty = true;
+  scheduleLevelVis();
   return g;
 }
 
@@ -1432,6 +1912,7 @@ function buildDeviceGroup(dev) {
     scene.add(g);
     deviceGroups.set(dev.id, g);
     refreshPortTints();
+    scheduleLevelVis();
     return g;
   }
 
@@ -1806,6 +2287,29 @@ function tieTargetsFor(cableId) {
   return out;
 }
 
+// Is this sample inside a pathway this cable has been pulled into? Cables in a
+// conduit are packed shoulder to shoulder by design — the generic keep-apart
+// rule and the wall colliders both have to stand down in there, or the run gets
+// squeezed straight back out of the pipe it is supposed to be inside.
+const _rwq = new THREE.Vector3(), _rwab = new THREE.Vector3();
+function inOwnRaceway(cable, p) {
+  for (const id of cable.raceways || []) {
+    const rw = (state.raceways || []).find(r => r.id === id);
+    if (!rw) continue;
+    const [a, b] = racewayPath(rw);
+    _rwab.subVectors(b, a);
+    const denom = _rwab.lengthSq() || 1;
+    const t = Math.max(0, Math.min(1, _rwq.subVectors(p, a).dot(_rwab) / denom));
+    _rwq.copy(a).addScaledVector(_rwab, t);
+    const rt = RACEWAY_TYPES[rw.type] || {};
+    const rad = rt.kind === 'conduit' ? rt.id / 2 + 0.2
+      : rt.kind === 'hook' ? 1.4
+      : Math.max(rt.w, rt.d) / 2 + 0.2;
+    if (p.distanceTo(_rwq) <= rad) return true;
+  }
+  return false;
+}
+
 // Deterministic settle: analytic catenary-style droop between supports, then a
 // few relaxation passes that push every free sample out of walls / racks / gear
 // and away from other cables, smoothing kinks as it goes. No simulation, no
@@ -1832,6 +2336,32 @@ function settleCable(pts, pins, cable) {
   }
   ensureColliders();
   const hash = buildRouteHash(cable.id);
+  const hasRaceways = !!(cable.raceways && cable.raceways.length);
+
+  // Cable inside a conduit does not hang. The pipe carries it, so the span
+  // between entry and exit is dead straight along that cable's own slot — no
+  // catenary, no separation, no collision. Without this the droop applied
+  // between the two raceway pins bellies the run nine inches below a pipe with a
+  // one-inch bore, and the cable renders outside the conduit it is supposedly in.
+  const piped = new Map();                            // sample index -> exact point
+  if (hasRaceways) {
+    const gpts = racewayGuide(cable);
+    for (let k = 0; k + 1 < gpts.length; k += 2) {
+      const entry = gpts[k], exit = gpts[k + 1];
+      let i0 = -1, i1 = -1, d0 = Infinity, d1 = Infinity;
+      for (let i = 0; i < N; i++) {
+        const a0 = pts[i].distanceToSquared(entry); if (a0 < d0) { d0 = a0; i0 = i; }
+        const a1 = pts[i].distanceToSquared(exit);  if (a1 < d1) { d1 = a1; i1 = i; }
+      }
+      if (i0 < 0 || i1 < 0) continue;
+      const lo = Math.min(i0, i1), hi = Math.max(i0, i1);
+      const from = lo === i0 ? entry : exit, to = lo === i0 ? exit : entry;
+      for (let i = lo; i <= hi; i++) {
+        piped.set(i, from.clone().lerp(to, hi === lo ? 0 : (i - lo) / (hi - lo)));
+      }
+    }
+    for (const [i, p] of piped) pts[i].copy(p);
+  }
 
   // Claim the sample nearest each tie and hold it in that tie's packing slot.
   // Neighbours within a few samples get drawn in proportionally so the cable
@@ -1860,7 +2390,7 @@ function settleCable(pts, pins, cable) {
 
   for (let it = 0; it < 10; it++) {
     for (let i = 1; i < N - 1; i++) {
-      if (pins.has(i) || tied.has(i)) continue;
+      if (pins.has(i) || tied.has(i) || piped.has(i)) continue;
       _cv.copy(pts[i - 1]).add(pts[i + 1]).multiplyScalar(0.5);
       pts[i].lerp(_cv, 0.12);                          // relax kinks (min bend radius)
       if (pts[i].y < CABLE_R) pts[i].y = CABLE_R;
@@ -1874,10 +2404,12 @@ function settleCable(pts, pins, cable) {
       // Tied samples are exempt from separation outright: inside a strap the
       // cables are *supposed* to be touching, and the generic keep-apart rule
       // would fight the tie forever and win.
-      if (!tied.has(i)) separateFromRoutes(pts[i], hash);
-      if (!pins.has(i) && !tied.has(i)) collidePoint(pts[i]);
+      const inPipe = piped.has(i);
+      if (!tied.has(i) && !inPipe) separateFromRoutes(pts[i], hash);
+      if (!pins.has(i) && !tied.has(i) && !inPipe) collidePoint(pts[i]);
     }
     applyTies();                                       // the strap has the last word
+    for (const [i, p] of piped) pts[i].copy(p);         // and so does the pipe
   }
   cableRoutes.set(cable.id, pts.map(p => p.clone()));
 }
@@ -1919,8 +2451,14 @@ function cableCurve(cable) {
   // switch↔patch runs make a clean staple instead of overshooting into a loop.
   const lead = Math.min(2.6, Math.max(CONN_LEN, span * 0.32));
   const guide = [a.pos.clone(), a.pos.clone().addScaledVector(a.normal, lead)];
-  // hand-placed waypoints always win — auto-routing only fills in the default
-  if (cable.waypoints.length) {
+  // Precedence: a raceway is a physical pathway, so being pulled into one beats
+  // both hand waypoints and auto-routing — the cable is inside the pipe, it has
+  // no say in where it goes. Hand waypoints come next, and auto-routing only
+  // fills in when nothing else has an opinion.
+  const rwGuide = racewayGuide(cable);
+  if (rwGuide.length) {
+    for (const w of rwGuide) guide.push(w);
+  } else if (cable.waypoints.length) {
     for (const w of cable.waypoints) guide.push(new THREE.Vector3(w.x, w.y, w.z));
   } else if (cable.autoRoute !== false) {
     for (const w of plenumRoute(a, b)) guide.push(w);
@@ -2330,6 +2868,12 @@ function deleteCable(id) {
   const m = cableMeshes.get(id);
   if (m) { disposeCableObj(m); cableMeshes.delete(id); }
   cableRoutes.delete(id);          // stop steering other cables around a gap
+  for (const rw of state.raceways || []) {   // free its slot in every pathway
+    if (rw.cables && rw.cables.includes(id)) {
+      rw.cables = rw.cables.filter(x => x !== id);
+      rebuildRaceway(rw);
+    }
+  }
   removeFromArr(state.cables, c => c.id === id);
   refreshPortTints();
 }
@@ -2657,24 +3201,73 @@ function updateHover(cx, cy) {
     return;
   }
 
+  if (mode === 'raceway') {
+    const hit = firstHit(groundTargets());
+    if (hit) {
+      const x = Math.round(hit.point.x / 6) * 6, z = Math.round(hit.point.z / 6) * 6;
+      // pathways run at the plenum by default — that's where they actually go
+      const y = levelY() + level().h - 6;
+      const type = document.getElementById('raceway-type').value;
+      const t = RACEWAY_TYPES[type];
+      hoverInfo = { x, z, y, type };
+      if (racewayStart) {
+        const len = Math.hypot(x - racewayStart.x, z - racewayStart.z);
+        if (len > 6) {
+          const size = t.kind === 'conduit' ? t.id + 0.12 : Math.max(t.w, t.d);
+          makeGhost(size, size, len, true);
+          ghost.position.set((racewayStart.x + x) / 2, y, (racewayStart.z + z) / 2);
+          ghost.rotation.y = Math.atan2(x - racewayStart.x, z - racewayStart.z);
+          const fits = racewayFill({ type, cables: [] }).room;
+          setStatus(`${t.label}: ${fmtLen(len)} at ${fmtLen(y)} — holds ${fits} cat6 at NEC fill. Click to finish.`);
+        }
+      } else {
+        setStatus(`${t.label} — click the start of the run. It lands at ${fmtLen(y)} on ${level().name}.`);
+      }
+    }
+    return;
+  }
+
+  if (mode === 'stairs') {
+    const hit = firstHit(groundTargets());
+    if (hit) {
+      const x = Math.round(hit.point.x / 6) * 6, z = Math.round(hit.point.z / 6) * 6;
+      // a flight climbs from this floor to the deck resting on its walls
+      const deck = deckAbove();
+      const rise = deck - levelY();
+      if (rise <= 0) { setStatus('Nothing above this storey to climb to — pick a lower level.'); return; }
+      const geo = stairGeometry(rise);
+      const upName = LEVELS[levelIndexForY(deck)].name;
+      hoverInfo = { x, z, y0: levelY(), rise, rotY: pendingRackRot };
+      makeGhost(STAIR_W, rise, geo.run, true);
+      ghost.position.set(x, levelY() + rise / 2, z);
+      ghost.rotation.y = pendingRackRot;
+      setStatus(`Stairs ${level().name} → ${upName}: ${geo.steps} risers at ${geo.rise.toFixed(2)}" ` +
+        `on ${geo.tread}" treads — ${fmtLen(geo.run)} of run. Q rotates · click to place.`);
+    }
+    return;
+  }
+
   if (mode === 'slab') {
-    const hit = firstHit([floorMesh]);
+    // the work plane means this hits at the active storey's elevation even when
+    // nothing has been built there yet — which is the whole point for a basement
+    const hit = firstHit([workPlane, floorMesh]);
     if (hit) {
       const x = Math.round(hit.point.x / 12) * 12, z = Math.round(hit.point.z / 12) * 12;
-      const elev = parseInt(document.getElementById('level-sel').value, 10);
+      const elev = levelY();
       hoverInfo = { x, z, y: elev };
       if (slabStart) {
         const wX = Math.abs(x - slabStart.x), wZ = Math.abs(z - slabStart.z);
         if (wX > 6 && wZ > 6) {
-          makeGhost(wX, 6, wZ, true);
-          ghost.position.set((slabStart.x + x) / 2, elev - 3, (slabStart.z + z) / 2);
+          makeGhost(wX, SLAB_T, wZ, true);
+          ghost.position.set((slabStart.x + x) / 2, elev - SLAB_T / 2, (slabStart.z + z) / 2);
           ghost.rotation.y = 0;
-          setStatus(`Floor slab: ${fmtLen(wX)} × ${fmtLen(wZ)} at level height ${fmtLen(elev)} — click to finish.`);
+          setStatus(`${level().name} floor: ${fmtLen(wX)} × ${fmtLen(wZ)} at ${fmtLen(elev)} — click to finish.`);
         }
       } else {
-        makeGhost(12, 6, 12, true);
-        ghost.position.set(x, elev - 3, z);
-        setStatus(`Click to set the first corner of the level-${Math.round(elev / 120) + 1} floor slab.`);
+        makeGhost(12, SLAB_T, 12, true);
+        ghost.position.set(x, elev - SLAB_T / 2, z);
+        setStatus(`First corner of the ${level().name} floor slab (${fmtLen(elev)}).` +
+          (elev < 0 ? ' Below grade — this excavates, so grade stops being a floor here.' : ''));
       }
     }
     return;
@@ -2911,6 +3504,43 @@ function handleClick() {
     return;
   }
 
+  if (mode === 'raceway') {
+    if (!hoverInfo) return;
+    if (!racewayStart) {
+      racewayStart = { x: hoverInfo.x, z: hoverInfo.z, y: hoverInfo.y };
+      setStatus('Start set — click the far end of the run.');
+    } else if (Math.hypot(hoverInfo.x - racewayStart.x, hoverInfo.z - racewayStart.z) > 6) {
+      undoPush();
+      const rw = {
+        id: uid(), type: hoverInfo.type,
+        x1: racewayStart.x, y1: racewayStart.y, z1: racewayStart.z,
+        x2: hoverInfo.x, y2: hoverInfo.y, z2: hoverInfo.z, cables: []
+      };
+      state.raceways.push(rw);
+      buildRaceway(rw);
+      racewayStart = null;
+      const f = racewayFill(rw);
+      setStatus(`${f.label} run placed — holds ${f.room} cat6 at NEC fill. ` +
+        `In Cable mode, click the raceway while drawing to pull a run into it.`);
+    }
+    return;
+  }
+
+  if (mode === 'stairs') {
+    if (!hoverInfo || hoverInfo.rise === undefined) return;
+    undoPush();
+    const st = {
+      id: uid(), x: hoverInfo.x, z: hoverInfo.z, y0: hoverInfo.y0,
+      rise: hoverInfo.rise, rotY: hoverInfo.rotY || 0, w: STAIR_W
+    };
+    state.stairs.push(st);
+    buildStair(st);
+    const geo = stairGeometry(st.rise);
+    setStatus(`Stairs placed — ${geo.steps} risers at ${geo.rise.toFixed(2)}", ${fmtLen(geo.run)} of run. ` +
+      `Walk mode (V) climbs them. Cables route around them, not through.`);
+    return;
+  }
+
   if (mode === 'slab') {
     if (!hoverInfo) return;
     if (!slabStart) {
@@ -2963,9 +3593,14 @@ function handleClick() {
         const cable = {
           id: uid(), a, b: { deviceId, port, side },
           waypoints: cableDraft.waypoints,
+          raceways: cableDraft.raceways || [],
           color: document.getElementById('cable-color').value
         };
         state.cables.push(cable);
+        for (const rid of cable.raceways) {
+          const rw = state.raceways.find(r => r.id === rid);
+          if (rw) { rw.cables = rw.cables || []; rw.cables.push(cable.id); rebuildRaceway(rw); }
+        }
         buildCableMesh(cable);
         cableDraft = null;
         clearPreview();
@@ -2991,6 +3626,20 @@ function handleClick() {
           const far = hp.clone().addScaledVector(n, -side * ht);
           cableDraft.waypoints.push({ x: near.x, y: near.y, z: near.z }, { x: far.x, y: far.y, z: far.z });
           setStatus('Cable routed through the wall hole. Click destination port to finish.');
+          return;
+        }
+      }
+      // pull the run into a raceway — it takes the next free slot in the pathway
+      const rwh = firstHit(racewayMeshes);
+      if (rwh) {
+        const rw = state.raceways.find(r => r.id === rwh.object.userData.racewayId);
+        if (rw) {
+          cableDraft.raceways = cableDraft.raceways || [];
+          if (!cableDraft.raceways.includes(rw.id)) cableDraft.raceways.push(rw.id);
+          const would = racewayFill({ type: rw.type, cables: [...(rw.cables || []), 'draft'] });
+          setStatus(would.over
+            ? `⚠ ${would.label} would be ${would.pct.toFixed(0)}% full — over NEC limit. Upsize the raceway or split the run.`
+            : `Pulled into ${would.label} — ${would.count} cables, ${would.pct.toFixed(0)}% fill, room for ${would.room} more. Click the destination port.`);
           return;
         }
       }
@@ -3037,6 +3686,15 @@ function handleClick() {
     }
     const hh = firstHit(holeMeshes);
     if (hh) { undoPush(); deleteHole(hh.object.userData.holeId); setStatus('Hole removed. (Ctrl+Z undoes)'); return; }
+    const sth = firstHit(stairMeshes);
+    if (sth) { undoPush(); deleteStair(sth.object.userData.stairId); setStatus('Stairs removed. (Ctrl+Z undoes)'); return; }
+    const rwd = firstHit(racewayMeshes);
+    if (rwd) {
+      undoPush();
+      deleteRaceway(rwd.object.userData.racewayId);
+      setStatus('Raceway removed — the cables in it fall back to their own routes. (Ctrl+Z undoes)');
+      return;
+    }
     const wh = firstHit([...wallMeshes.values()]);
     if (wh) {
       if (confirm('Delete this wall (and its drilled holes)?')) {
@@ -3298,9 +3956,45 @@ const toolButtons = {
   tie: document.getElementById('tool-tie'),
   measure: document.getElementById('tool-measure'),
   slab: document.getElementById('tool-slab'),
-  room: document.getElementById('tool-room')
+  room: document.getElementById('tool-room'),
+  stairs: document.getElementById('tool-stairs'),
+  raceway: document.getElementById('tool-raceway')
 };
 let wallStart = null;
+let racewayStart = null;
+
+(function initRacewayUI() {
+  const sel = document.getElementById('raceway-type');
+  if (!sel) return;
+  for (const [k, t] of Object.entries(RACEWAY_TYPES)) {
+    const o = document.createElement('option');
+    o.value = k;
+    // show what it actually holds — sizing a pathway is a capacity decision
+    const fits = racewayFill({ type: k, cables: [] }).room;
+    o.textContent = `${t.label} · fits ${fits}`;
+    sel.appendChild(o);
+  }
+  sel.value = 'emt100';
+})();
+
+// Level selector: populated from LEVELS so adding a storey is a data edit.
+// Listed top-down the way a building section is drawn, so Attic is at the top of
+// the list and Basement at the bottom — reading it should feel like the building.
+(function initLevelUI() {
+  const sel = document.getElementById('level-sel');
+  if (!sel) return;
+  for (let i = LEVELS.length - 1; i >= 0; i--) {
+    const L = LEVELS[i];
+    const o = document.createElement('option');
+    o.value = String(i);
+    o.textContent = `${L.name}${L.route ? ' · route' : ''}`;
+    sel.appendChild(o);
+  }
+  sel.value = String(activeLevel);
+  sel.onchange = e => setLevel(parseInt(e.target.value, 10));
+  const all = document.getElementById('btn-alllevels');
+  if (all) all.onclick = () => { showAllLevels = !showAllLevels; applyLevelVisibility(); };
+})();
 
 function setMode(m, type) {
   mode = m;
@@ -3309,6 +4003,7 @@ function setMode(m, type) {
   wallStart = null;
   slabStart = null;
   roomStart = null;
+  racewayStart = null;
   measureStart = null;
   clearMeasurePreview();
   if (m !== 'place') placeExistingId = null;
@@ -3428,6 +4123,9 @@ window.addEventListener('keydown', e => {
   else if (e.key === 'p' || e.key === 'P') setPhys(!physOn);
   else if (e.key === 't' || e.key === 'T') setMode('tie');
   else if (e.key === 'q' || e.key === 'Q') { if (mode === 'rack') pendingRackRot = (pendingRackRot + Math.PI / 2) % (Math.PI * 2); }
+  else if (e.key === '[') setLevel(activeLevel - 1);      // down a storey
+  else if (e.key === ']') setLevel(activeLevel + 1);      // up a storey
+  else if (e.key === '\\') { showAllLevels = !showAllLevels; applyLevelVisibility(); }
 });
 
 //////////////////// Walk mode (first-person) ////////////////////
@@ -3676,6 +4374,22 @@ function rebuildRopeColliders() {
         hx: _bbs.x / 2 + R, hy: _bbs.y / 2 + R, hz: _bbs.z / 2 + R
       });
     });
+  }
+  // Stairs: one box per tread. A stair is a solid object in a building — cable
+  // runs go under, over or beside it, never through the flight.
+  for (const st of state.stairs || []) {
+    const { steps, rise, tread } = stairGeometry(st.rise);
+    const g = stairGroups.get(st.id);
+    if (!g) continue;
+    g.updateMatrixWorld(true);
+    const inv = g.matrixWorld.clone().invert(), mtx = g.matrixWorld.clone();
+    for (let i = 0; i < steps; i++) {
+      ropeColliders.push({
+        inv, mat: mtx,
+        cx: 0, cy: (i + 0.5) * rise, cz: i * tread + tread / 2,
+        hx: (st.w || STAIR_W) / 2 + R, hy: (i + 0.5) * rise + R, hz: tread / 2 + R
+      });
+    }
   }
   for (const c of ropeColliders) finalizeCollider(c);
 }
@@ -3955,8 +4669,10 @@ function clearScene() {
   for (const t of [...state.ties]) deleteTie(t.id);
   for (const m of [...(state.measures || [])]) deleteMeasure(m.id);
   for (const s of [...(state.slabs || [])]) deleteSlab(s.id);
+  for (const st of [...(state.stairs || [])]) deleteStair(st.id);
+  for (const rw of [...(state.raceways || [])]) deleteRaceway(rw.id);
   cableRoutes.clear();
-  state = { racks: [], devices: [], cables: [], walls: [], holes: [], links: [], ties: [], measures: [], slabs: [], customTypes: state.customTypes || {} };
+  state = { racks: [], devices: [], cables: [], walls: [], holes: [], links: [], ties: [], measures: [], slabs: [], stairs: [], raceways: [], customTypes: state.customTypes || {} };
 }
 
 // Saves written before endpoints carried a side: everything defaults to the
@@ -3986,7 +4702,7 @@ function restore(json) {
   state = {
     racks: data.racks || [], devices: data.devices || [], cables: data.cables || [],
     walls: data.walls || [], holes: data.holes || [], links: data.links || [], ties: data.ties || [],
-    measures: data.measures || [], slabs: data.slabs || [], customTypes: data.customTypes || {}
+    measures: data.measures || [], slabs: data.slabs || [], stairs: data.stairs || [], raceways: data.raceways || [], customTypes: data.customTypes || {}
   };
   nextId = data.nextId || 1000;
   migrateCableSides(state.cables);
@@ -3994,6 +4710,8 @@ function restore(json) {
   Object.assign(DEVICE_TYPES, state.customTypes);
   populateLibrary();
   for (const s of state.slabs) buildSlab(s);
+  for (const st of state.stairs) buildStair(st);
+  for (const rw of state.raceways) buildRaceway(rw);
   for (const m of state.measures) buildMeasure(m);
   for (const w of state.walls) buildWall(w);
   for (const h of state.holes) buildHole(h);
@@ -5047,6 +5765,7 @@ function demo() {
 }
 
 // boot into the project launcher — no auto-loaded demo
+applyLevelVisibility();   // settle work plane / grade before anything loads
 openLauncher();
 
 // debug/verification handle (used by the automated physics test harness)
@@ -5086,8 +5805,13 @@ const clock = new THREE.Clock();
       if (walkKeys['KeyC']) camera.position.y -= speed * dt;
       camera.position.y = Math.max(6, camera.position.y);
     } else {
-      // grounded walking with a jump — floor height comes from whichever slab you're on
-      const eye = groundAt(camera.position.x, camera.position.z, camera.position.y - 30) + EYE_H;
+      // Grounded walking with a jump. Floor height is whichever is higher under
+      // you — the slab you're standing on, or a stair tread. Taking the max is
+      // what makes a stair climbable in both directions without any special
+      // case: walking up, the tread wins; walking off the top, the slab does.
+      const floorY = groundAt(camera.position.x, camera.position.z, camera.position.y - 30);
+      const stepY = stairHeightAt(camera.position.x, camera.position.z, camera.position.y - 30);
+      const eye = Math.max(floorY, stepY) + EYE_H;
       if (walkKeys['Space'] && camera.position.y <= eye + 0.01) walkVy = 105;
       walkVy -= 420 * dt;
       camera.position.y += walkVy * dt;
