@@ -19,9 +19,7 @@ run fits in the conduit, which side of the patch panel it lands on, or how much
 cable to put on the truck. Building tools model space beautifully but know
 nothing about a network.
 
-NetMap3D is the overlap. Everything is inches, nothing is decorative:
-
-
+NetMap3D is the overlap. Everything is inches, nothing is decorative.
 
 ---
 
