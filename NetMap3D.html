@@ -304,6 +304,10 @@ select:focus, input:focus { border-color: var(--accent); }
 .sim-matrix .mx-no { color: var(--bad); background: rgba(255, 69, 58, 0.08); }
 .sim-matrix .mx-self { color: var(--faint); }
 
+/* ---------- cable route edit ---------- */
+.cbl-edit-hint { font-size: 11px; color: var(--faint); line-height: 1.5; margin: 8px 0 4px; }
+.cbl-edit-hint b { color: var(--muted); }
+
 /* ---------- help ---------- */
 #help {
   position: fixed; inset: 0; z-index: 60; background: rgba(5, 6, 8, 0.72);
@@ -400,7 +404,7 @@ select:focus, input:focus { border-color: var(--accent); }
        Row 2 carries options for whichever tool is active, so the palette can
        keep growing without the bar ever running off the screen again. -->
   <div id="toolbar">
-    <span class="logo">NetMap<b>3D</b><span class="ver">v0.12.0</span></span>
+    <span class="logo">NetMap<b>3D</b><span class="ver">v0.13.0</span></span>
     <span id="proj-name"></span>
     <span class="sep"></span>
     <div id="modescroll">
@@ -8288,43 +8292,69 @@ function plenumRoute(a, b) {
   ];
 }
 
+// Grid an installer routes on. Waypoints snap here so runs read as deliberately
+// dressed, not hand-wobbled. 1" is fine enough to look placed, coarse enough to
+// stay tidy. CABLE_BEND_R is a generous stand-in for cat6's ~1" min bend radius.
+const CABLE_SNAP = 1;
+const CABLE_BEND_R = 1.4;
+function snapCable(v) {
+  return new THREE.Vector3(
+    Math.round(v.x / CABLE_SNAP) * CABLE_SNAP,
+    Math.round(v.y / CABLE_SNAP) * CABLE_SNAP,
+    Math.round(v.z / CABLE_SNAP) * CABLE_SNAP);
+}
+
+// A clean routed path: straight between control points, a rounded fillet at each
+// corner. This is what replaced the physics droop — real dressed cable runs in
+// straight pulls with radiused bends, and the user controls the shape by placing
+// waypoints, so the route is deterministic and editable instead of simulated.
+function roundedCablePath(raw, radius) {
+  const p = [];
+  for (const v of raw) if (!p.length || p[p.length - 1].distanceToSquared(v) > 1e-5) p.push(v.clone());
+  if (p.length < 2) return null;
+  const path = new THREE.CurvePath();
+  if (p.length === 2) { path.add(new THREE.LineCurve3(p[0], p[1])); return path; }
+  let start = p[0].clone();
+  for (let i = 1; i < p.length - 1; i++) {
+    const cur = p[i];
+    const dIn = cur.distanceTo(p[i - 1]), dOut = cur.distanceTo(p[i + 1]);
+    const r = Math.min(radius, dIn * 0.45, dOut * 0.45);
+    if (r < 0.02) { // segment too short to fillet — keep the sharp vertex
+      if (start.distanceToSquared(cur) > 1e-5) path.add(new THREE.LineCurve3(start.clone(), cur.clone()));
+      start = cur.clone();
+      continue;
+    }
+    const inDir = new THREE.Vector3().subVectors(p[i - 1], cur).normalize();
+    const outDir = new THREE.Vector3().subVectors(p[i + 1], cur).normalize();
+    const cutIn = cur.clone().addScaledVector(inDir, r);
+    const cutOut = cur.clone().addScaledVector(outDir, r);
+    if (start.distanceToSquared(cutIn) > 1e-5) path.add(new THREE.LineCurve3(start.clone(), cutIn));
+    path.add(new THREE.QuadraticBezierCurve3(cutIn, cur.clone(), cutOut));
+    start = cutOut;
+  }
+  path.add(new THREE.LineCurve3(start, p[p.length - 1].clone()));
+  return path;
+}
+
 function cableCurve(cable) {
   const ep = cablePorts(cable);
   if (!ep) return null;
   const { a, b } = ep;
-  const span = a.pos.distanceTo(b.pos);
-  // lead-out clears the connector boot but shrinks on short jumpers so adjacent
-  // switch↔patch runs make a clean staple instead of overshooting into a loop.
-  const lead = Math.min(2.6, Math.max(CONN_LEN, span * 0.32));
-  const guide = [a.pos.clone(), a.pos.clone().addScaledVector(a.normal, lead)];
-  // Precedence: a raceway is a physical pathway, so being pulled into one beats
-  // both hand waypoints and auto-routing — the cable is inside the pipe, it has
-  // no say in where it goes. Hand waypoints come next, and auto-routing only
-  // fills in when nothing else has an opinion.
+  // a short straight lead-out so the jacket leaves the jack square, then the run
+  const lead = CONN_LEN + 0.7;
+  const pts = [a.pos.clone(), a.pos.clone().addScaledVector(a.normal, lead)];
+  // Precedence: a raceway physically carries the cable (overrides everything);
+  // then the user's own waypoints; then a default plenum route for long hauls.
   const rwGuide = racewayGuide(cable);
   if (rwGuide.length) {
-    for (const w of rwGuide) guide.push(w);
-  } else if (cable.waypoints.length) {
-    for (const w of cable.waypoints) guide.push(new THREE.Vector3(w.x, w.y, w.z));
+    for (const w of rwGuide) pts.push(w.clone ? w.clone() : new THREE.Vector3(w.x, w.y, w.z));
+  } else if (cable.waypoints && cable.waypoints.length) {
+    for (const w of cable.waypoints) pts.push(new THREE.Vector3(w.x, w.y, w.z));
   } else if (cable.autoRoute !== false) {
-    for (const w of plenumRoute(a, b)) guide.push(w);
+    for (const w of plenumRoute(a, b)) pts.push(w);
   }
-  // Short same-facing direct jumper (switch↔patch sandwich): give it the little
-  // forward-and-down service loop a real slack patch cable makes, instead of a
-  // cramped boot-to-boot stub.
-  if (cable.waypoints.length === 0 && span < 16 && a.normal.dot(b.normal) > 0.55) {
-    const mid = a.pos.clone().add(b.pos).multiplyScalar(0.5);
-    const outN = a.normal.clone().add(b.normal).normalize();
-    mid.addScaledVector(outN, Math.max(1.6, span * 0.42));
-    mid.y -= Math.min(span * 0.5, 2.4);
-    guide.push(mid);
-  }
-  guide.push(b.pos.clone().addScaledVector(b.normal, lead), b.pos.clone());
-  const { pts, pins } = resampleGuide(guide);
-  settleCable(pts, pins, cable);
-  // centripetal Catmull-Rom never cusps or self-loops on uneven spacing —
-  // this is what kills the old glitchy short-cable knots.
-  return new THREE.CatmullRomCurve3(pts, false, 'centripetal', 0.5);
+  pts.push(b.pos.clone().addScaledVector(b.normal, lead), b.pos.clone());
+  return roundedCablePath(pts, CABLE_BEND_R);
 }
 
 // Molded RJ45 plug (frosty polycarbonate) + colored strain-relief boot, aimed
@@ -8376,8 +8406,10 @@ function buildConnector(port, color, isPower) {
 function buildCableMesh(cable) {
   const curve = cableCurve(cable);
   if (!curve) return;
-  const pts = curve.points;
-  const segs = Math.max(24, Math.min(240, pts.length * 3));
+  // segment density from run length — a CurvePath has no fixed point list, and
+  // the tube needs enough rings that the rounded corners stay smooth
+  const len = curve.getLength();
+  const segs = Math.max(24, Math.min(320, Math.round(len / 1.5)));
   const geo = new THREE.TubeGeometry(curve, segs, CABLE_R, CABLE_RADIAL, false);
   const col = new THREE.Color(cable.color);
   // PVC jacket: matte-satin, faint sheen — not the wet-noodle clearcoat it was.
@@ -9436,6 +9468,136 @@ renderer.domElement.addEventListener('pointermove', e => {
   updateHover(e.clientX, e.clientY);
 });
 
+//////////////////// Cable route editing ////////////////////
+// A selected cable shows draggable handles: yellow spheres on each bend point,
+// blue spheres at segment midpoints to add one. This is the "pull the wire"
+// interaction — grab a bend and slide it, everything re-routes live, snapped to
+// the same 1" grid the router uses. No physics, fully deterministic.
+
+let cableEdit = null;          // { cableId }
+const cableHandleMeshes = [];  // raycast targets (both yellow and blue)
+let handleDrag = null;         // active drag: { wpIndex, cable, snap, moved }
+const _dragPlane = new THREE.Plane();
+const _dragHit = new THREE.Vector3();
+const _UP = new THREE.Vector3(0, 1, 0);
+
+function clearCableHandles() {
+  for (const m of cableHandleMeshes) { scene.remove(m); if (m.geometry) m.geometry.dispose(); }
+  cableHandleMeshes.length = 0;
+  cableEdit = null;
+}
+const HANDLE_YEL = new THREE.MeshBasicMaterial({ color: 0xffd23e, depthTest: false });
+const HANDLE_BLU = new THREE.MeshBasicMaterial({ color: 0x4da3ff, transparent: true, opacity: 0.75, depthTest: false });
+
+function showCableHandles(cable) {
+  clearCableHandles();
+  cableEdit = { cableId: cable.id };
+  const wps = cable.waypoints || [];
+  wps.forEach((w, i) => {
+    const m = new THREE.Mesh(new THREE.SphereGeometry(0.6, 16, 12), HANDLE_YEL);
+    m.position.set(w.x, w.y, w.z);
+    m.renderOrder = 999;
+    m.userData = { cableHandle: true, wpIndex: i };
+    m.updateMatrixWorld();
+    scene.add(m); cableHandleMeshes.push(m);
+  });
+  // add-point handles at midpoints of the control chain (portA, wps…, portB)
+  const ep = cablePorts(cable);
+  if (ep) {
+    const chain = [ep.a.pos.clone(), ...wps.map(w => new THREE.Vector3(w.x, w.y, w.z)), ep.b.pos.clone()];
+    for (let i = 0; i < chain.length - 1; i++) {
+      const mid = chain[i].clone().add(chain[i + 1]).multiplyScalar(0.5);
+      const m = new THREE.Mesh(new THREE.SphereGeometry(0.38, 12, 8), HANDLE_BLU);
+      m.position.copy(mid);
+      m.renderOrder = 999;
+      m.userData = { cableAddHandle: true, insertIndex: i };
+      m.updateMatrixWorld();
+      scene.add(m); cableHandleMeshes.push(m);
+    }
+  }
+}
+
+// Capture phase so this beats OrbitControls: if the click grabbed a handle we
+// disable orbit before its own pointerdown handler reads controls.enabled.
+renderer.domElement.addEventListener('pointerdown', e => {
+  if (!cableEdit || walkActive) return;
+  setMouse(e);
+  const hit = firstHit(cableHandleMeshes);
+  if (!hit) return;
+  const cable = state.cables.find(c => c.id === cableEdit.cableId);
+  if (!cable) return;
+  if (e.button === 2) {                       // right-click a bend removes it
+    if (hit.object.userData.cableHandle) {
+      undoPush();
+      cable.waypoints.splice(hit.object.userData.wpIndex, 1);
+      rebuildCable(cable); showCableHandles(cable);
+      e.stopPropagation(); e.preventDefault();
+    }
+    return;
+  }
+  if (e.button !== 0) return;
+  controls.enabled = false;
+  let wpIndex;
+  if (hit.object.userData.cableAddHandle) {    // insert a new bend, then drag it
+    wpIndex = hit.object.userData.insertIndex;
+    const p = snapCable(hit.object.position);
+    cable.waypoints.splice(wpIndex, 0, { x: p.x, y: p.y, z: p.z });
+  } else {
+    wpIndex = hit.object.userData.wpIndex;
+  }
+  handleDrag = { wpIndex, cable, snap: serialize(), moved: false };
+  rebuildCable(cable); showCableHandles(cable);
+  e.stopPropagation();
+}, true);
+
+window.addEventListener('pointermove', e => {
+  if (!handleDrag) return;
+  setMouse(e);   // sets mouseNDC and the raycaster
+  const w = handleDrag.cable.waypoints[handleDrag.wpIndex];
+  const cur = new THREE.Vector3(w.x, w.y, w.z);
+  let np = null;
+  if (e.shiftKey) {
+    // vertical: plane through the point, facing the camera horizontally — take Y
+    const n = camera.getWorldDirection(new THREE.Vector3()); n.y = 0; n.normalize();
+    _dragPlane.setFromNormalAndCoplanarPoint(n, cur);
+    if (raycaster.ray.intersectPlane(_dragPlane, _dragHit)) np = new THREE.Vector3(cur.x, _dragHit.y, cur.z);
+  } else {
+    // horizontal: slide across the floor plane at the point's height
+    _dragPlane.setFromNormalAndCoplanarPoint(_UP, cur);
+    if (raycaster.ray.intersectPlane(_dragPlane, _dragHit)) np = new THREE.Vector3(_dragHit.x, cur.y, _dragHit.z);
+  }
+  if (!np) return;
+  np = snapCable(np);
+  if (np.x === w.x && np.y === w.y && np.z === w.z) return;
+  w.x = np.x; w.y = np.y; w.z = np.z;
+  handleDrag.moved = true;
+  rebuildCable(handleDrag.cable);
+  const h = cableHandleMeshes.find(m => m.userData.cableHandle && m.userData.wpIndex === handleDrag.wpIndex);
+  if (h) { h.position.copy(np); h.updateMatrixWorld(); }
+});
+
+window.addEventListener('pointerup', () => {
+  if (!handleDrag) return;
+  const cable = handleDrag.cable;
+  if (handleDrag.moved) undoStack.push(handleDrag.snap);   // pre-drag snapshot
+  handleDrag = null;
+  controls.enabled = true;
+  showCableHandles(cable);                                  // re-place midpoint handles
+  // refresh the panel's route-point count / length without rebuilding handles twice
+  if (selected && selected.kind === 'cable' && selected.id === cable.id) {
+    const rp = propsBody.querySelector('.row:nth-child(3) span:last-child');
+    updateCablePropStats(cable);
+  }
+});
+
+// Light refresh of just the numbers in an open cable panel (avoids re-running
+// showCableProps, which would rebuild the handles mid-interaction).
+function updateCablePropStats(c) {
+  const rows = propsBody.querySelectorAll('.row');
+  if (rows[2]) rows[2].querySelector('span:last-child').textContent = c.waypoints.length;
+  if (rows[3]) rows[3].querySelector('span:last-child').textContent = (c.lengthIn / 12).toFixed(1) + ' ft';
+}
+
 //////////////////// Click handling ////////////////////
 
 let pendingRackRot = 0;
@@ -9734,9 +9896,21 @@ function handleClick() {
       const mh = firstHit(managerMeshes);
       if (mh) {
         const n = mh.face.normal.clone().transformDirection(mh.object.matrixWorld);
-        const p = mh.point.clone().addScaledVector(n, 0.6);
+        const p = snapCable(mh.point.clone().addScaledVector(n, 0.6));
         cableDraft.waypoints.push({ x: p.x, y: p.y, z: p.z });
-        setStatus(`Route point added (${cableDraft.waypoints.length}). Click destination port to finish.`);
+        setStatus(`Route point added (${cableDraft.waypoints.length}). Click the destination port, a manager, a wall, or the floor to keep routing.`);
+        return;
+      }
+      // click any surface — floor, slab, wall, rack, gear — to drop a route
+      // point there. This is what makes you feel like you're pulling the wire:
+      // click the port, click where it should run, click the far port.
+      const sh = firstHit([...groundTargets(), ...wallMeshes.values(), ...rackFrames, ...collectDeviceBodies()]);
+      if (sh) {
+        // lift off the surface by a jacket radius so the run rides on it, not in it
+        const n = sh.face ? sh.face.normal.clone().transformDirection(sh.object.matrixWorld) : new THREE.Vector3(0, 1, 0);
+        const p = snapCable(sh.point.clone().addScaledVector(n, CABLE_R + 0.3));
+        cableDraft.waypoints.push({ x: p.x, y: p.y, z: p.z });
+        setStatus(`Route point added (${cableDraft.waypoints.length}). Keep clicking to route, or click the destination port to finish.`);
       }
     }
     return;
@@ -9841,11 +10015,12 @@ const propsTitle = document.getElementById('props-title');
 const propsBody = document.getElementById('props-body');
 document.getElementById('props-close').onclick = hideProps;
 
-function hideProps() { propsEl.classList.add('hidden'); selected = null; }
+function hideProps() { propsEl.classList.add('hidden'); selected = null; clearCableHandles(); }
 
 function row(k, v) { return `<div class="row"><span class="k">${k}</span><span>${v}</span></div>`; }
 
 function showDeviceProps(id) {
+  clearCableHandles();
   const dev = deviceById(id);
   if (!dev) return;
   const def = DEVICE_TYPES[dev.type];
@@ -9891,6 +10066,7 @@ function showDeviceProps(id) {
 }
 
 function showPortProps(deviceId, port, side) {
+  clearCableHandles();
   const dev = deviceById(deviceId);
   if (!dev) return;
   const def = DEVICE_TYPES[dev.type];
@@ -9971,23 +10147,26 @@ function showCableProps(id) {
     ${row('Route points', c.waypoints.length)}
     ${row('Est. length', (c.lengthIn / 12).toFixed(1) + ' ft')}
     <div class="row"><span class="k">Color</span><select id="cbl-color">${opts}</select></div>
-    <div class="row"><span class="k">Slack %</span><input type="number" id="cbl-slack" min="0" max="40" style="width:64px" value="${c.slack === undefined ? 2 : c.slack}"></div>
+    <p class="cbl-edit-hint">Drag a <b>yellow</b> handle to move a bend · drag a <b>blue</b>
+      handle to add one · Shift-drag raises/lowers · right-click a yellow handle to remove it.</p>
+    <button id="cbl-clear">Clear route points</button>
     <button id="cbl-del" class="danger">Delete cable</button>`;
   propsEl.classList.remove('hidden');
   selected = { kind: 'cable', id };
+  showCableHandles(c);
   document.getElementById('cbl-color').onchange = e => {
     c.color = e.target.value;
     rebuildCable(c);
     refreshPortTints();
   };
-  document.getElementById('cbl-slack').onchange = e => {
-    c.slack = Math.max(0, Math.min(40, parseFloat(e.target.value) || 0));
-    if (physOn) buildRope(c);
+  document.getElementById('cbl-clear').onclick = () => {
+    undoPush(); c.waypoints = []; rebuildCable(c); showCableProps(id);
   };
   document.getElementById('cbl-del').onclick = () => { undoPush(); deleteCable(id); hideProps(); };
 }
 
 function showWallProps(id) {
+  clearCableHandles();
   const w = state.walls.find(w => w.id === id);
   if (!w) return;
   const len = Math.hypot(w.x2 - w.x1, w.z2 - w.z1);
@@ -10006,6 +10185,7 @@ function showWallProps(id) {
 }
 
 function showRackProps(id) {
+  clearCableHandles();
   const r = rackById(id);
   if (!r) return;
   const devs = state.devices.filter(d => d.rackId === id).length;
@@ -10159,6 +10339,7 @@ function currentBitDiameter() {
 
 function setMode(m, type) {
   mode = m;
+  if (typeof clearCableHandles === 'function') clearCableHandles();
   pendingType = type || null;
   cableDraft = null;
   wallStart = null;
