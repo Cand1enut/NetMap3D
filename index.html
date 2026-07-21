@@ -10,7 +10,7 @@
        Row 2 carries options for whichever tool is active, so the palette can
        keep growing without the bar ever running off the screen again. -->
   <div id="toolbar">
-    <span class="logo">NetMap<b>3D</b><span class="ver">v0.10.1</span></span>
+    <span class="logo">NetMap<b>3D</b><span class="ver">v0.11.0</span></span>
     <span id="proj-name"></span>
     <span class="sep"></span>
     <div id="modescroll">
@@ -117,6 +117,16 @@
     <div class="ai-row">
       <button id="ai-analyze">Analyze map</button>
       <button id="ai-design">Auto-design from layout</button>
+    </div>
+    <div class="ai-row" id="sim-row">
+      <select id="sim-src" title="Source host"></select>
+      <span class="sim-arrow">→</span>
+      <select id="sim-dst" title="Destination host"></select>
+    </div>
+    <div class="ai-row">
+      <button id="sim-ping">Ping</button>
+      <button id="sim-trace">Trace</button>
+      <button id="sim-matrix">Matrix</button>
     </div>
     <div class="ai-row">
       <input type="text" id="ai-devq" placeholder="Need a device? e.g. Catalyst 9300 48-port">

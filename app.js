@@ -2888,6 +2888,236 @@ function setVlanFocus(f) {
   refreshPortTints();
 }
 
+//////////////////// Network simulation (L2/L3 reachability) ////////////////////
+// Answers the question a diagram can't: can host A actually reach host B, and if
+// not, exactly why. Built on the same VLAN model the rest of the app uses — a
+// port carries an access VLAN plus optional tagged trunks, a switch bridges every
+// port on a VLAN, a patch panel is a straight passthrough — plus an IP/subnet
+// layer and gateway-based routing on top. This is the Packet-Tracer core: the
+// value is the honest failure reason, not just red/green.
+
+const COPPER_LIMIT_FT = 328;   // 100 m TIA/EIA channel limit for twisted pair
+
+// ---- IP / subnet math (v4) ----
+function parseIp(str) {
+  if (!str) return null;
+  const s = String(str).trim();
+  let cidr = 24, addr = s, mask = null;
+  let m = s.match(/^(\d+\.\d+\.\d+\.\d+)\s*\/\s*(\d+)$/);
+  if (m) { addr = m[1]; cidr = parseInt(m[2], 10); }
+  else if ((m = s.match(/^(\d+\.\d+\.\d+\.\d+)\s+(\d+\.\d+\.\d+\.\d+)$/))) { addr = m[1]; mask = m[2]; }
+  else if (!/^\d+\.\d+\.\d+\.\d+$/.test(s)) return null;
+  const oct = addr.split('.').map(Number);
+  if (oct.length !== 4 || oct.some(o => o < 0 || o > 255 || Number.isNaN(o))) return null;
+  const int = ((oct[0] << 24) | (oct[1] << 16) | (oct[2] << 8) | oct[3]) >>> 0;
+  if (mask) {
+    const mo = mask.split('.').map(Number);
+    const mi = ((mo[0] << 24) | (mo[1] << 16) | (mo[2] << 8) | mo[3]) >>> 0;
+    cidr = 0; let mm = mi; while (mm & 0x80000000) { cidr++; mm = (mm << 1) >>> 0; }
+  }
+  if (cidr < 0 || cidr > 32) return null;
+  const maskInt = cidr === 0 ? 0 : (0xffffffff << (32 - cidr)) >>> 0;
+  return { addr, int, cidr, mask: maskInt, network: (int & maskInt) >>> 0 };
+}
+function ipStr(int) { return [(int >>> 24) & 255, (int >>> 16) & 255, (int >>> 8) & 255, int & 255].join('.'); }
+function sameSubnet(a, b) {
+  if (!a || !b) return false;
+  const m = Math.min(a.mask, b.mask) >>> 0;   // compare on the wider mask
+  return ((a.int & m) >>> 0) === ((b.int & m) >>> 0) && a.cidr === b.cidr;
+}
+function subnetLabel(ip) { return ip ? `${ipStr(ip.network)}/${ip.cidr}` : '—'; }
+
+// ---- device role in the network graph ----
+function netClass(dev) {
+  const def = DEVICE_TYPES[dev.type];
+  if (!def) return 'other';
+  if (def.manager) return 'manager';
+  if (def.powerDevice) return 'power';
+  if (def.passthrough) return 'patch';
+  const hasWan = !!def.wan || (def.roleMap && Object.values(def.roleMap).includes('WAN'));
+  if (hasWan || dev.type === 'router' || dev.type === 'firewall') return 'router';
+  if (/switch/i.test(def.cat || '') || /^switch/.test(dev.type) || (def.ports || 0) >= 8) return 'switch';
+  return 'host';                                // servers, APs, cameras, workstations, phones
+}
+function isHostDev(dev) { return isPlaced(dev) && dev.ip && netClass(dev) === 'host'; }
+function hostIp(dev) { return parseIp(dev.ip); }
+
+// data (non-power) port a host actually uses — its first real port
+function hostPort(dev) {
+  const def = DEVICE_TYPES[dev.type];
+  for (let p = 1; p <= (def.ports || 1); p++) {
+    if (portRole(def, p) !== 'PWR') return p;
+  }
+  return 1;
+}
+function accessVlanOf(dev, port) {
+  const cfg = (dev.portCfg && dev.portCfg[port]) || {};
+  return parseInt(cfg.vlan, 10) || 1;
+}
+
+// The neighbour on the far end of a jack, stepping straight through any patch
+// panels (front↔rear is one circuit) so a drop lands on the switch it patches to.
+function hopThroughPatches(dev, port, side) {
+  let d = dev, p = port, s = side, guard = 0;
+  while (guard++ < 40) {
+    const cbl = state.cables.find(c =>
+      (c.a.deviceId === d.id && c.a.port === p && epSide(c.a) === s) ||
+      (c.b.deviceId === d.id && c.b.port === p && epSide(c.b) === s));
+    if (!cbl) return null;
+    const far = (cbl.a.deviceId === d.id && cbl.a.port === p && epSide(cbl.a) === s) ? cbl.b : cbl.a;
+    const fd = deviceById(far.deviceId);
+    if (!fd) return null;
+    if (netClass(fd) === 'patch') { d = fd; p = far.port; s = epSide(far) === REAR ? FRONT : REAR; continue; }
+    return { dev: fd, port: far.port, side: epSide(far), cable: cbl };
+  }
+  return null;
+}
+
+// The VLAN a host lives in = the access VLAN of the switch/router port it lands on.
+function hostVlan(dev) {
+  const n = hopThroughPatches(dev, hostPort(dev), FRONT);
+  return n ? accessVlanOf(n.dev, n.port) : accessVlanOf(dev, hostPort(dev));
+}
+
+// Breadth-first walk of the layer-2 domain from a host's data jack. Honors VLAN
+// membership and the copper length limit unless told to relax them (the relaxed
+// runs are how we diagnose *why* a ping failed). Returns which host and router
+// devices were reached, and a predecessor map for path reconstruction.
+function l2Walk(startDev, opts = {}) {
+  const vlan = opts.vlan;
+  const fromPort = opts.startPort || hostPort(startDev);
+  const reachedHosts = new Set(), reachedRouters = new Map(); // routerId -> jack it was reached on
+  const prev = new Map();                                     // "devId:port:side" -> previous key
+  const seen = new Set();
+  const start = hopThroughPatches(startDev, fromPort, FRONT);
+  if (!start) return { hosts: reachedHosts, routers: reachedRouters, prev, start: null };
+  const startKey = `${start.dev.id}:${start.port}:${start.side}`;
+  const q = [{ dev: start.dev, port: start.port, side: start.side, key: startKey }];
+  prev.set(startKey, `${startDev.id}:${fromPort}:${FRONT}`);
+  while (q.length) {
+    const cur = q.shift();
+    if (seen.has(cur.key)) continue;
+    seen.add(cur.key);
+    const cls = netClass(cur.dev);
+    if (cls === 'router') { if (!reachedRouters.has(cur.dev.id)) reachedRouters.set(cur.dev.id, cur); continue; }
+    if (cls === 'host') { reachedHosts.add(cur.dev.id); continue; }
+    // switch (or multi-port bridge): spread to every other port on this VLAN,
+    // then hop each to its neighbour through any patch panels
+    if (cls === 'switch' || cls === 'patch') {
+      // the frame must be admitted at the ingress port too — a trunk configured
+      // on one end only drops it right here, which is a real misconfiguration
+      // this walk needs to reproduce rather than paper over
+      if (!opts.ignoreVlan && vlan !== undefined && !portCarries(cur.dev, cur.port, vlan)) continue;
+      const def = DEVICE_TYPES[cur.dev.type];
+      const nports = def.ports || 0;
+      for (let q2 = 1; q2 <= nports; q2++) {
+        if (q2 === cur.port) continue;
+        if (!opts.ignoreVlan && vlan !== undefined && !portCarries(cur.dev, q2, vlan)) continue;
+        const nb = hopThroughPatches(cur.dev, q2, FRONT);
+        if (!nb) continue;
+        if (!opts.ignoreLength && ((nb.cable && (nb.cable.lengthIn || 0) / 12) > COPPER_LIMIT_FT)) continue;
+        const k = `${nb.dev.id}:${nb.port}:${nb.side}`;
+        if (!prev.has(k)) prev.set(k, cur.key);
+        q.push({ dev: nb.dev, port: nb.port, side: nb.side, key: k });
+      }
+    }
+  }
+  return { hosts: reachedHosts, routers: reachedRouters, prev, start };
+}
+
+// Layer-2 reachable? Plus the reason it isn't, discovered by relaxing rules.
+function l2Reachable(a, b) {
+  const v = hostVlan(a);
+  const strict = l2Walk(a, { vlan: v });
+  if (strict.hosts.has(b.id)) return { ok: true, routers: strict.routers };
+  // relax length: a too-long copper run is the only thing stopping it?
+  if (l2Walk(a, { vlan: v, ignoreLength: true }).hosts.has(b.id))
+    return { ok: false, reason: `a cable on the path exceeds the ${COPPER_LIMIT_FT} ft copper limit`, routers: strict.routers };
+  // relax VLAN: physically connected but on a different VLAN / trunk gap
+  if (l2Walk(a, { ignoreVlan: true, ignoreLength: true }).hosts.has(b.id))
+    return { ok: false, reason: `VLAN mismatch — ${a.name} is on VLAN ${v}, ${b.name} is on VLAN ${hostVlan(b)} (or a trunk between them doesn't carry it)`, routers: strict.routers };
+  return { ok: false, reason: 'no physical cable path between them', routers: strict.routers };
+}
+
+// Full ping verdict, L2 + L3.
+function pingHosts(aId, bId) {
+  const a = deviceById(aId), b = deviceById(bId);
+  if (!a || !b) return { ok: false, reason: 'device not found' };
+  if (a.id === b.id) return { ok: true, mode: 'self', hops: [a.id], detail: 'loopback' };
+  const ipA = hostIp(a), ipB = hostIp(b);
+  if (!ipA) return { ok: false, reason: `${a.name} has no valid IP` };
+  if (!ipB) return { ok: false, reason: `${b.name} has no valid IP` };
+
+  if (sameSubnet(ipA, ipB)) {
+    const l2 = l2Reachable(a, b);
+    return l2.ok
+      ? { ok: true, mode: 'l2', subnet: subnetLabel(ipA), hops: [a.id, b.id], detail: `same subnet ${subnetLabel(ipA)} — ARP resolves directly` }
+      : { ok: false, mode: 'l2', reason: `same subnet, but ${l2.reason}` };
+  }
+
+  // different subnets → routing. Each host needs a router (default gateway) in
+  // its own L2 broadcast domain, and those routers must be able to reach each
+  // other (the common case is one gateway doing inter-VLAN routing).
+  const l2A = l2Walk(a, { vlan: hostVlan(a) });
+  const l2B = l2Walk(b, { vlan: hostVlan(b) });
+  if (l2A.routers.size === 0) return { ok: false, mode: 'l3', reason: `${a.name}'s subnet ${subnetLabel(ipA)} has no router / default gateway reachable` };
+  if (l2B.routers.size === 0) return { ok: false, mode: 'l3', reason: `${b.name}'s subnet ${subnetLabel(ipB)} has no router / default gateway reachable` };
+
+  const rA = [...l2A.routers.keys()], rB = [...l2B.routers.keys()];
+  const shared = rA.find(r => rB.includes(r));
+  if (shared) {
+    const g = deviceById(shared);
+    return { ok: true, mode: 'l3', hops: [a.id, shared, b.id], detail: `routed across subnets by ${g.name} (inter-VLAN)` };
+  }
+  // distinct gateways: is there a router path between them? (transit link)
+  const path = routerPath(rA, rB);
+  if (path) return { ok: true, mode: 'l3', hops: [a.id, ...path, b.id], detail: `routed via ${path.map(id => deviceById(id).name).join(' → ')}` };
+  return { ok: false, mode: 'l3', reason: `${a.name} and ${b.name} are on different subnets and their gateways aren't connected — no route between them` };
+}
+
+// Shortest path between any router in set A and any in set B, over a graph where
+// two routers are adjacent if they share a layer-2 segment (a transit LAN).
+function routerAdjacency() {
+  const routers = state.devices.filter(d => isPlaced(d) && netClass(d) === 'router');
+  const adj = new Map(routers.map(r => [r.id, new Set()]));
+  for (const r of routers) {
+    const def = DEVICE_TYPES[r.type];
+    for (let p = 1; p <= (def.ports || 0); p++) {
+      if (portRole(def, p) === 'PWR') continue;
+      const seg = l2Walk(r, { startPort: p, ignoreVlan: true });   // physical segment off this port
+      for (const other of routers) {
+        if (other.id !== r.id && seg.routers.has(other.id)) { adj.get(r.id).add(other.id); adj.get(other.id).add(r.id); }
+      }
+    }
+  }
+  return adj;
+}
+function routerPath(fromSet, toSet) {
+  const adj = routerAdjacency();
+  const q = fromSet.map(id => [id]);
+  const seen = new Set(fromSet);
+  while (q.length) {
+    const path = q.shift();
+    const last = path[path.length - 1];
+    if (toSet.includes(last)) return path;
+    for (const nb of (adj.get(last) || [])) {
+      if (!seen.has(nb)) { seen.add(nb); q.push([...path, nb]); }
+    }
+  }
+  return null;
+}
+
+// Every host that can talk to itself/others — used for the reachability matrix.
+function allHosts() { return state.devices.filter(isHostDev); }
+function reachabilityMatrix() {
+  const hosts = allHosts();
+  const rows = hosts.map(a => ({
+    id: a.id, name: a.name, ip: a.ip,
+    reach: hosts.map(b => a.id === b.id ? 'self' : (pingHosts(a.id, b.id).ok ? 'ok' : 'no'))
+  }));
+  return { hosts, rows };
+}
+
 // `side` is optional: omit it to ask "is anything plugged into this port at all",
 // pass it to ask about one specific face of a patch panel.
 function portConnection(deviceId, port, side) {
@@ -5330,7 +5560,10 @@ planCanvas.addEventListener('mouseup', e => {
 //////////////////// Design assistant (local, no cloud) ////////////////////
 
 const aiEl = document.getElementById('ai');
-document.getElementById('btn-ai').onclick = () => aiEl.classList.toggle('hidden');
+document.getElementById('btn-ai').onclick = () => {
+  aiEl.classList.toggle('hidden');
+  if (!aiEl.classList.contains('hidden')) refreshSimPickers();
+};
 document.getElementById('ai-close').onclick = () => aiEl.classList.add('hidden');
 const aiOut = document.getElementById('ai-out');
 function aiPrint(html) { aiOut.innerHTML = html; }
@@ -5411,6 +5644,101 @@ function analyzeMap() {
     `<p class="ai-meta">${state.devices.length} devices · ${state.cables.length} cables · ${state.walls.length} walls · ${state.slabs.length} upper floors</p>`);
 }
 document.getElementById('ai-analyze').onclick = analyzeMap;
+
+//////////////////// Connectivity panel (ping / trace / matrix) ////////////////////
+
+// The pickers hold every placed device with an IP. Rebuilt each time the panel
+// opens so they never go stale against the map.
+function refreshSimPickers() {
+  const hosts = allHosts();
+  for (const id of ['sim-src', 'sim-dst']) {
+    const sel = document.getElementById(id);
+    if (!sel) continue;
+    const cur = sel.value;
+    sel.innerHTML = hosts.map(h => `<option value="${h.id}">${h.name} (${h.ip})</option>`).join('');
+    if (hosts.some(h => String(h.id) === cur)) sel.value = cur;
+  }
+  // default to two different hosts so the first click means something
+  const src = document.getElementById('sim-src'), dst = document.getElementById('sim-dst');
+  if (src && dst && hosts.length > 1 && src.value === dst.value) dst.selectedIndex = 1;
+  return hosts.length;
+}
+
+// Flash the cables along a verdict's hop path. Uses the same VLAN-focus dimmer
+// the rest of the app uses, so a ping visually IS a highlighted path.
+function showPingPath(hops) {
+  if (!hops || hops.length < 2) return;
+  const cables = new Set();
+  // cable chain from one hop device to the next, trying every data port of the
+  // source — a router's transit link can hang off any of its ports
+  const collect = (fromDev, toId) => {
+    const def = DEVICE_TYPES[fromDev.type];
+    for (let p = 1; p <= (def.ports || 1); p++) {
+      if (portRole(def, p) === 'PWR') continue;
+      const walk = l2Walk(fromDev, { startPort: p, ignoreVlan: true });
+      let key = null;
+      for (const [k] of walk.prev) if (k.startsWith(toId + ':')) { key = k; break; }
+      if (!key) continue;
+      while (key) {
+        const [dId, pp, sd] = key.split(':');
+        const c = portConnection(parseInt(dId, 10), isNaN(+pp) ? pp : +pp, sd);
+        if (c) cables.add(c.id);
+        key = walk.prev.get(key);
+      }
+      return true;
+    }
+    return false;
+  };
+  for (let i = 0; i + 1 < hops.length; i++) collect(deviceById(hops[i]), hops[i + 1]);
+  if (!simOn) setSim(true);
+  setVlanFocus({ vlan: -1, cables, devices: new Set(hops), ports: new Set() });
+}
+
+function runPing() {
+  const a = parseInt(document.getElementById('sim-src').value, 10);
+  const b = parseInt(document.getElementById('sim-dst').value, 10);
+  const r = pingHosts(a, b);
+  const da = deviceById(a), db = deviceById(b);
+  if (r.ok) {
+    showPingPath(r.hops);
+    aiPrint(`<h4 class="ai-good">PING ${da.name} → ${db.name}: reply</h4><p>${r.detail}</p>` +
+      (r.hops.length > 2 ? `<p class="ai-meta">${r.hops.map(id => deviceById(id).name).join(' → ')}</p>` : ''));
+  } else {
+    setVlanFocus(null);
+    aiPrint(`<h4 class="ai-bad">PING ${da.name} → ${db.name}: unreachable</h4><p>${r.reason}</p>`);
+  }
+}
+
+function runTrace() {
+  const a = parseInt(document.getElementById('sim-src').value, 10);
+  const b = parseInt(document.getElementById('sim-dst').value, 10);
+  const r = pingHosts(a, b);
+  const da = deviceById(a), db = deviceById(b);
+  if (!r.ok) { setVlanFocus(null); aiPrint(`<h4 class="ai-bad">TRACE ${da.name} → ${db.name}</h4><p>* * * — ${r.reason}</p>`); return; }
+  showPingPath(r.hops);
+  const rows = r.hops.map((id, i) => {
+    const d = deviceById(id);
+    return `<tr><td>${i === 0 ? '' : i}</td><td>${d.name}</td><td>${d.ip || netClass(d)}</td></tr>`;
+  }).join('');
+  aiPrint(`<h4 class="ai-good">TRACE ${da.name} → ${db.name}</h4><table class="sim-table">${rows}</table><p class="ai-meta">${r.detail}</p>`);
+}
+
+function runMatrix() {
+  const { hosts, rows } = reachabilityMatrix();
+  if (hosts.length < 2) { aiPrint('<p>Fewer than two hosts with IPs — assign IPs in device properties first.</p>'); return; }
+  const head = `<tr><th></th>${hosts.map(h => `<th title="${h.name}">${h.name.slice(0, 6)}</th>`).join('')}</tr>`;
+  const body = rows.map(r =>
+    `<tr><th title="${r.name} (${r.ip})">${r.name.slice(0, 10)}</th>` +
+    r.reach.map(v => `<td class="mx-${v}">${v === 'self' ? '·' : v === 'ok' ? '✓' : '✗'}</td>`).join('') + '</tr>').join('');
+  const bad = rows.reduce((n, r) => n + r.reach.filter(v => v === 'no').length, 0);
+  aiPrint(`<h4>Reachability — ${hosts.length} hosts</h4><table class="sim-table sim-matrix">${head}${body}</table>` +
+    (bad ? `<p class="ai-bad">${bad} failing pair${bad === 1 ? '' : 's'} — click Ping on one for the reason.</p>`
+         : '<p class="ai-good">Every host reaches every other host.</p>'));
+}
+
+document.getElementById('sim-ping').onclick = runPing;
+document.getElementById('sim-trace').onclick = runTrace;
+document.getElementById('sim-matrix').onclick = runMatrix;
 
 function autoDesign() {
   if (!state.walls.length) { aiPrint('<p>Draw the building outline first (Wall tool) — the designer works from your layout.</p>'); return; }
@@ -6019,6 +6347,9 @@ function demo() {
   // in-rack and adjacent gear patches straight to the switch — no panel needed
   mkCable(sw, 42, srv, 1, '#22c55e');
   mkCable(sw, 17, ws1, 1, '#3b82f6');
+  // gateway uplink: the UDM routes between subnets, so it must be in the L2
+  // domain — without this every cross-subnet ping correctly reports "no gateway"
+  mkCable(sw, 2, udm, 1, '#e5e7eb');
   // power cords: rear inlets → UPS outlets, like a real rack
   mkCable(sw, 'PWR', ups1, 1, '#111827');
   mkCable(udm, 'PWR', ups1, 2, '#111827');
