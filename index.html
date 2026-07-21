@@ -10,7 +10,7 @@
        Row 2 carries options for whichever tool is active, so the palette can
        keep growing without the bar ever running off the screen again. -->
   <div id="toolbar">
-    <span class="logo">NetMap<b>3D</b><span class="ver">v0.11.0</span></span>
+    <span class="logo">NetMap<b>3D</b><span class="ver">v0.12.0</span></span>
     <span id="proj-name"></span>
     <span class="sep"></span>
     <div id="modescroll">
@@ -239,23 +239,9 @@
   </div>
   <div id="status">Select mode — click a device or cable to inspect. Orbit: drag · Pan: right-drag · Zoom: scroll</div>
 
-  <script src="./node_modules/three/build/three.min.js"></script>
-  <script src="./node_modules/three/examples/js/controls/OrbitControls.js"></script>
-  <script src="./node_modules/three/examples/js/environments/RoomEnvironment.js"></script>
-  <script src="./node_modules/three/examples/js/geometries/RoundedBoxGeometry.js"></script>
-  <script src="./node_modules/three/examples/js/shaders/CopyShader.js"></script>
-  <script src="./node_modules/three/examples/js/shaders/LuminosityHighPassShader.js"></script>
-  <script src="./node_modules/three/examples/js/shaders/SAOShader.js"></script>
-  <script src="./node_modules/three/examples/js/shaders/DepthLimitedBlurShader.js"></script>
-  <script src="./node_modules/three/examples/js/shaders/UnpackDepthRGBAShader.js"></script>
-  <script src="./node_modules/three/examples/js/shaders/FXAAShader.js"></script>
-  <script src="./node_modules/three/examples/js/postprocessing/Pass.js"></script>
-  <script src="./node_modules/three/examples/js/postprocessing/MaskPass.js"></script>
-  <script src="./node_modules/three/examples/js/postprocessing/ShaderPass.js"></script>
-  <script src="./node_modules/three/examples/js/postprocessing/EffectComposer.js"></script>
-  <script src="./node_modules/three/examples/js/postprocessing/RenderPass.js"></script>
-  <script src="./node_modules/three/examples/js/postprocessing/SAOPass.js"></script>
-  <script src="./node_modules/three/examples/js/postprocessing/UnrealBloomPass.js"></script>
+  <!-- modern three (r185) + addons bundled to a classic script exposing
+       window.THREE — rebuild with `node build-vendor.js` -->
+  <script src="./vendor/three-bundle.js"></script>
   <script src="./app.js"></script>
 </body>
 </html>

@@ -442,16 +442,20 @@ camera.position.set(85, 70, 115);
 const renderer = new THREE.WebGLRenderer({ antialias: true });
 renderer.setSize(innerWidth, innerHeight);
 renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
-renderer.outputEncoding = THREE.sRGBEncoding;
-renderer.toneMapping = THREE.ACESFilmicToneMapping;
-renderer.toneMappingExposure = 1.12;
+// AgX (r160+): film-stock highlight rolloff. ACES clipped the troffer lenses
+// and white gear to paper; AgX holds colour into the brightest stops, which is
+// most of why the r185 build reads photographic instead of "3D app".
+renderer.toneMapping = THREE.AgXToneMapping;
+renderer.toneMappingExposure = 1.0;
 renderer.shadowMap.enabled = true;
 renderer.shadowMap.type = THREE.PCFSoftShadowMap;
 document.body.appendChild(renderer.domElement);
 
-// Image-based lighting: gives metals/plastics realistic reflections
+// Image-based lighting: gives metals/plastics realistic reflections. In r185 the
+// environment reads hotter, so hold it back or every plastic bezel blows white.
 const pmrem = new THREE.PMREMGenerator(renderer);
 scene.environment = pmrem.fromScene(new THREE.RoomEnvironment(), 0.04).texture;
+scene.environmentIntensity = 0.45;
 
 // Post-processing: ambient occlusion + LED bloom + FXAA.
 // Fully guarded — any failure falls straight back to plain rendering.
@@ -471,19 +475,24 @@ try {
   });
   composer = new THREE.EffectComposer(renderer, rt);
   composer.addPass(new THREE.RenderPass(scene, camera));
-  const sao = new THREE.SAOPass(scene, camera, false, true);
-  sao.params.saoIntensity = 0.012;
-  sao.params.saoScale = 120;
-  sao.params.saoKernelRadius = 40;
-  sao.params.saoBlur = true;
-  composer.addPass(sao);
-  const bloom = new THREE.UnrealBloomPass(new THREE.Vector2(innerWidth, innerHeight), 0.3, 0.55, 0.88);
+  // GTAO (ground-truth AO, r157+): the real contact-shadow depth SAO faked.
+  // Scene units are inches, so the radius is ~1 ft of occlusion reach.
+  const gtao = new THREE.GTAOPass(scene, camera, innerWidth, innerHeight);
+  gtao.updateGtaoMaterial({ radius: 14, distanceExponent: 1.6, thickness: 2, scale: 1.4,
+    samples: 16, distanceFallOff: 1, screenSpaceRadius: false });
+  gtao.blendIntensity = 0.9;
+  composer.addPass(gtao);
+  const bloom = new THREE.UnrealBloomPass(new THREE.Vector2(innerWidth, innerHeight), 0.2, 0.5, 0.95);
   composer.addPass(bloom);
+  // OutputPass owns tone mapping + sRGB in modern three; everything before it
+  // works in linear HDR, FXAA after it works on final display pixels.
+  composer.addPass(new THREE.OutputPass());
   fxaaPass = new THREE.ShaderPass(THREE.FXAAShader);
   fxaaPass.material.uniforms.resolution.value.set(1 / innerWidth, 1 / innerHeight);
   composer.addPass(fxaaPass);
   composer.setSize(innerWidth, innerHeight);
-} catch (e) { composer = null; }
+  window.__gtao = gtao;
+} catch (e) { console.error('composer setup failed, plain rendering:', e); composer = null; }
 
 const controls = new THREE.OrbitControls(camera, renderer.domElement);
 controls.target.set(0, 32, 0);
@@ -512,7 +521,7 @@ sc.left = -150; sc.right = 150; sc.top = 150; sc.bottom = -150; sc.near = 20; sc
 scene.add(sun);
 // Bounce: a room's floor and walls throw a lot of light back up under desks and
 // into rack bays. Without it, every underside crushes to flat black.
-const bounce = new THREE.DirectionalLight(0xd8e2f0, 0.16);
+const bounce = new THREE.DirectionalLight(0xd8e2f0, 0.3);
 bounce.position.set(-40, -120, 60);
 scene.add(bounce);
 
@@ -675,7 +684,7 @@ function floorCanvas(p, mode) {
 function makeFloorTexture(p) {
   p = p || ['#242b37', '#1a202a', '#11151c', 'rgba(0,0,0,0.35)'];
   const t = new THREE.CanvasTexture(floorCanvas(p, 'albedo'));
-  t.encoding = THREE.sRGBEncoding;
+  t.colorSpace = THREE.SRGBColorSpace;
   t.wrapS = t.wrapT = THREE.RepeatWrapping;
   t.repeat.set(FLOOR_REPEAT, FLOOR_REPEAT);
   t.anisotropy = 16;
@@ -768,7 +777,7 @@ function wallCanvas(mode) {
 const wallNormal = normalFromHeight(wallCanvas('height'), 0.7);
 function makeWallTexture() {
   const t = new THREE.CanvasTexture(wallCanvas('albedo'));
-  t.encoding = THREE.sRGBEncoding;
+  t.colorSpace = THREE.SRGBColorSpace;
   t.wrapS = t.wrapT = THREE.RepeatWrapping;
   t.anisotropy = 8;
   return t;
@@ -791,7 +800,7 @@ const wallMat = new THREE.MeshStandardMaterial({
 // alias, which is exactly why the real product is that thin.
 const BASE_H = 4, BASE_T = 0.125;
 const baseboardMat = new THREE.MeshStandardMaterial({
-  color: 0xe6e2da, roughness: 0.88, metalness: 0, envMapIntensity: 0.1,
+  color: 0xe6e2da, roughness: 0.96, metalness: 0, envMapIntensity: 0.04,
   transparent: true, opacity: 1
 });
 // Each wall gets its own material so texture repeat can follow its real size —
@@ -915,7 +924,7 @@ function makeTextSprite(text, color = '#ffd23e') {
   g.textBaseline = 'middle';
   g.fillText(text, 18, 39);
   const t = new THREE.CanvasTexture(c);
-  t.encoding = THREE.sRGBEncoding;
+  t.colorSpace = THREE.SRGBColorSpace;
   const s = new THREE.Sprite(new THREE.SpriteMaterial({ map: t, depthTest: false }));
   s.scale.set(w / 11, 6.5, 1);
   return s;
@@ -937,7 +946,7 @@ function makeSlabTexture() {
     g.beginPath(); g.moveTo(0, i); g.lineTo(512, i); g.stroke();
   }
   const t = new THREE.CanvasTexture(c);
-  t.encoding = THREE.sRGBEncoding;
+  t.colorSpace = THREE.SRGBColorSpace;
   t.wrapS = t.wrapT = THREE.RepeatWrapping;
   t.repeat.set(2, 2);
   return t;
@@ -980,7 +989,7 @@ let _ceilMat = null;
 function ceilingMaterial() {
   if (_ceilMat) return _ceilMat;
   const alb = new THREE.CanvasTexture(ceilingCanvas('albedo'));
-  alb.encoding = THREE.sRGBEncoding;
+  alb.colorSpace = THREE.SRGBColorSpace;
   alb.wrapS = alb.wrapT = THREE.RepeatWrapping;
   alb.anisotropy = 8;
   const nrm = normalFromHeight(ceilingCanvas('height'), 1.6);
@@ -989,6 +998,52 @@ function ceilingMaterial() {
     roughness: 0.97, metalness: 0, envMapIntensity: 0.25
   });
   return _ceilMat;
+}
+
+// ---- ceiling troffers ----
+// Every commercial lay-in ceiling has 2×4 fluorescent/LED troffers on an 8 ft
+// grid. The lens is an emissive quad (bloom picks it up); the light it throws is
+// a RectAreaLight, which is what makes desks and the VCT floor pick up soft
+// rectangular reflections instead of looking lit "from nowhere". Area lights are
+// per-fragment expensive, so only the first MAX_AREA_LIGHTS slabs get real
+// lights — the rest keep the glowing lenses, which carry most of the look.
+const MAX_AREA_LIGHTS = 6;
+let areaLightCount = 0;
+const trofferLens = new THREE.MeshStandardMaterial({
+  color: 0xf4f7fa, emissive: 0xf0f4f8, emissiveIntensity: 2.2, roughness: 0.4
+});
+const trofferFrame = new THREE.MeshStandardMaterial({ color: 0xd9dde2, roughness: 0.5, metalness: 0.35 });
+
+function addTroffers(slabMesh, wX, wZ) {
+  if (wX < 60 || wZ < 60) return;                 // closets don't get fixtures
+  const yUnder = -3.06;                            // just proud of the tile plane
+  const nx = Math.max(1, Math.round(wX / 96)), nz = Math.max(1, Math.round(wZ / 96));
+  let lit = false;
+  for (let ix = 0; ix < nx; ix++) {
+    for (let iz = 0; iz < nz; iz++) {
+      const lx = -wX / 2 + (ix + 0.5) * (wX / nx);
+      const lz = -wZ / 2 + (iz + 0.5) * (wZ / nz);
+      const frame = new THREE.Mesh(new THREE.BoxGeometry(49, 0.5, 25), trofferFrame);
+      frame.position.set(lx, yUnder + 0.2, lz);
+      slabMesh.add(frame);
+      const lens = new THREE.Mesh(new THREE.PlaneGeometry(46, 22), trofferLens);
+      lens.rotation.x = Math.PI / 2;               // facing down
+      lens.position.set(lx, yUnder - 0.06, lz);
+      slabMesh.add(lens);
+    }
+  }
+  // one area light per slab, centred — enough for the reflection read
+  if (areaLightCount < MAX_AREA_LIGHTS) {
+    const area = new THREE.RectAreaLight(0xf5f8ff, 3.5, Math.min(wX * 0.6, 200), Math.min(wZ * 0.6, 140));
+    area.position.set(0, yUnder - 0.4, 0);
+    area.lookAt(0, -100, 0);                       // straight down, local space
+    slabMesh.add(area);
+    slabMesh.userData.hasAreaLight = true;
+    areaLightCount++;
+    lit = true;
+  }
+  slabMesh.userData.hasTroffers = true;
+  return lit;
 }
 
 function buildSlab(s) {
@@ -1008,6 +1063,7 @@ function buildSlab(s) {
   m.castShadow = true;
   m.receiveShadow = true;
   m.userData = { isSlab: true, slabId: s.id, topY: s.y };
+  addTroffers(m, Math.max(wX, 1), Math.max(wZ, 1));
   scene.add(m);
   slabMeshes.set(s.id, m);
   scheduleLevelVis();
@@ -1399,7 +1455,10 @@ function updateLevelUI() {
 
 function deleteSlab(id) {
   const m = slabMeshes.get(id);
-  if (m) { scene.remove(m); m.geometry.dispose(); slabMeshes.delete(id); }
+  if (m) {
+    if (m.userData.hasAreaLight) areaLightCount--;   // free the slot
+    scene.remove(m); m.geometry.dispose(); slabMeshes.delete(id);
+  }
   removeFromArr(state.slabs, s => s.id === id);
   scheduleReroute();
 }
@@ -1512,7 +1571,7 @@ function getRailTexture() {
   _railTex = new THREE.CanvasTexture(c);
   _railTex.wrapS = _railTex.wrapT = THREE.RepeatWrapping;
   _railTex.repeat.set(1, RACK_UNITS);
-  _railTex.encoding = THREE.sRGBEncoding;
+  _railTex.colorSpace = THREE.SRGBColorSpace;
   return _railTex;
 }
 
@@ -1748,7 +1807,7 @@ function makeFaceplateTexture(dev, def) {
   g.fillStyle = '#38e07d';
   g.beginPath(); g.arc(W - 40, H * 0.24, 5, 0, 7); g.fill();
   const t = new THREE.CanvasTexture(c);
-  t.encoding = THREE.sRGBEncoding;
+  t.colorSpace = THREE.SRGBColorSpace;
   t.anisotropy = 8;
   return t;
 }
@@ -1770,7 +1829,7 @@ function makeScreenTexture(dev) {
   g.font = '500 22px -apple-system, "Segoe UI", sans-serif';
   g.fillText(dev.ip || DEVICE_TYPES[dev.type].label, 16, 88, 224);
   const t = new THREE.CanvasTexture(c);
-  t.encoding = THREE.sRGBEncoding;
+  t.colorSpace = THREE.SRGBColorSpace;
   return t;
 }
 
@@ -5993,16 +6052,18 @@ bmenuEl.addEventListener('mousedown', e => { if (e.target === bmenuEl) closeBuil
 // to paper and flattened every surface — the fastest way to make a 3D scene look
 // fake. Mid-gray VCT with the exposure pulled under 1.0 keeps the whole range on
 // screen, so shadows, tile seams and gear all read.
+// Intensities are for r155+ physically-correct lighting (no legacy π scaling),
+// displayed through AgX. Roughly the old numbers ×π, then tuned by screenshot.
 const THEMES = {
   studio: {
-    bg: 0xc7cfd8, fog: [0xc7cfd8, 620, 1900], hemi: [0xdae6ff, 0x9c9184, 0.40],
-    sun: [0xfff4e2, 1.12], rim: 0.20, exposure: 0.95,
+    bg: 0xc7cfd8, fog: [0xc7cfd8, 620, 1900], hemi: [0xdae6ff, 0x9c9184, 0.7],
+    sun: [0xfff4e2, 2.6], rim: 0.5, exposure: 0.82,
     floor: ['#c2c7ce', '#b3b9c1', '#a6acb5', 'rgba(38,44,54,0.42)'],
     gridC: [0x8d959f, 0xa2a9b3], wall: 0xe7e3dc, slab: 0xc2c6cc
   },
   dark: {
-    bg: 0x11151b, fog: [0x11151b, 420, 1000], hemi: [0xa9c4f0, 0x2a231b, 0.30],
-    sun: [0xffeed6, 0.95], rim: 0.34, exposure: 1.02,
+    bg: 0x11151b, fog: [0x11151b, 420, 1000], hemi: [0xa9c4f0, 0x2a231b, 0.55],
+    sun: [0xffeed6, 2.2], rim: 0.85, exposure: 0.92,
     floor: ['#2b323e', '#232935', '#1b202a', 'rgba(0,0,0,0.55)'],
     gridC: [0x323d4e, 0x27303e], wall: 0xb9bec7, slab: 0xa6abb3
   }
