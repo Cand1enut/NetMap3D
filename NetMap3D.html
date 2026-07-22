@@ -8791,6 +8791,114 @@ function portRole(def, port) {
   return 'LAN';
 }
 
+//////////////////// Interface state: speed, duplex, admin ////////////////////
+// IEEE 802.3 Clause 28 autonegotiation: both ends advertise what they can do
+// and the highest common capability wins. A 1 G port cabled to a 100 M port
+// trains to 100 M — the link comes up, just slower, and both ends report the
+// negotiated value rather than their own maximum.
+//
+// The duplex-mismatch case is the one worth modelling carefully because it is
+// the classic real fault: if one end has speed/duplex hardcoded it stops
+// autonegotiating, and the end still negotiating cannot detect the partner's
+// duplex, so it falls back to half. The link comes UP and passes traffic while
+// throwing late collisions — which is why it is so often misdiagnosed as a
+// cable fault.
+function portMaxSpeed(dev, port) {
+  const def = DEVICE_TYPES[dev.type];
+  if (!def) return null;
+  for (const p of portGrid(def)) if (p.port === port) return p.speed || SPEED.ge;
+  return def.portSpeed || SPEED.ge;
+}
+function portCfgOf(dev, port) { return (dev.portCfg && dev.portCfg[port]) || {}; }
+function portAdminDown(dev, port) { return !!portCfgOf(dev, port).shutdown; }
+// Configured speed/duplex, or 'auto'.
+function portConfiguredSpeed(dev, port) {
+  const v = portCfgOf(dev, port).speed;
+  return v === undefined || v === '' || v === 'auto' ? null : parseFloat(v);
+}
+function portConfiguredDuplex(dev, port) {
+  const v = portCfgOf(dev, port).duplex;
+  return v === 'half' || v === 'full' ? v : null;
+}
+
+// Negotiate one link. Returns speed in Gbps, duplex, and any fault.
+function negotiateLink(cable) {
+  const da = deviceById(cable.a.deviceId), db = deviceById(cable.b.deviceId);
+  if (!da || !db) return null;
+  if (cable.a.port === 'PWR' || cable.b.port === 'PWR') return null;
+  const aAdmin = portAdminDown(da, cable.a.port), bAdmin = portAdminDown(db, cable.b.port);
+  if (aAdmin || bAdmin) {
+    return { up: false, admin: true,
+      reason: `${(aAdmin ? da : db).name} port ${aAdmin ? cable.a.port : cable.b.port} is administratively down (shutdown)` };
+  }
+  const capA = portMaxSpeed(da, cable.a.port), capB = portMaxSpeed(db, cable.b.port);
+  const fixA = portConfiguredSpeed(da, cable.a.port), fixB = portConfiguredSpeed(db, cable.b.port);
+  const dupA = portConfiguredDuplex(da, cable.a.port), dupB = portConfiguredDuplex(db, cable.b.port);
+  // A hardcoded speed the partner cannot reach means no link at all.
+  if (fixA && fixA > capB) return { up: false, reason: `${da.name} port ${cable.a.port} is forced to ${fmtSpeed(fixA)} but ${db.name} port ${cable.b.port} tops out at ${fmtSpeed(capB)} — no link` };
+  if (fixB && fixB > capA) return { up: false, reason: `${db.name} port ${cable.b.port} is forced to ${fmtSpeed(fixB)} but ${da.name} port ${cable.a.port} tops out at ${fmtSpeed(capA)} — no link` };
+  const speed = Math.min(fixA || capA, fixB || capB);
+  let duplex = 'full', mismatch = null;
+  if (dupA && dupB && dupA !== dupB) {
+    duplex = 'half';
+    mismatch = `duplex mismatch: ${da.name} port ${cable.a.port} is ${dupA}, ${db.name} port ${cable.b.port} is ${dupB}`;
+  } else if (dupA && !dupB && !fixB) {
+    // One side hardcoded, the other autonegotiating → the auto side falls to half.
+    duplex = dupA;
+    if (dupA === 'full') mismatch = `duplex mismatch: ${da.name} port ${cable.a.port} is hardcoded full, ${db.name} port ${cable.b.port} autonegotiates and will fall back to half`;
+  } else if (dupB && !dupA && !fixA) {
+    duplex = dupB;
+    if (dupB === 'full') mismatch = `duplex mismatch: ${db.name} port ${cable.b.port} is hardcoded full, ${da.name} port ${cable.a.port} autonegotiates and will fall back to half`;
+  } else if (dupA || dupB) {
+    duplex = dupA || dupB;
+  }
+  let downshift = null;
+  if (speed < Math.max(capA, capB)) {
+    // Name whatever actually held the link back: a forced speed, or the slower
+    // port. Blaming capability when someone hardcoded the port sends the reader
+    // looking at the wrong end.
+    const forced = (fixA && fixA === speed && capA > speed) ? `${da.name} port ${cable.a.port} is forced to ${fmtSpeed(speed)}`
+                 : (fixB && fixB === speed && capB > speed) ? `${db.name} port ${cable.b.port} is forced to ${fmtSpeed(speed)}`
+                 : null;
+    const slower = capA < capB ? `${da.name} port ${cable.a.port}` : `${db.name} port ${cable.b.port}`;
+    downshift = forced
+      ? `trained to ${fmtSpeed(speed)} — ${forced}, though both ends could do ${fmtSpeed(Math.max(capA, capB))}`
+      : `trained to ${fmtSpeed(speed)} — ${slower} tops out there, so the faster end steps down`;
+  }
+  return { up: true, speed, duplex, mismatch, negotiated: !fixA && !fixB, downshift };
+}
+function fmtSpeed(g) {
+  if (g === null || g === undefined) return '—';
+  return g < 1 ? `${Math.round(g * 1000)}M` : `${g}G`;
+}
+// The link a port is on, negotiated. Cached per sim run via flushL2Tables.
+let _linkState = new Map();
+function linkFor(devId, port) {
+  const key = `${devId}:${port}`;
+  if (_linkState.has(key)) return _linkState.get(key);
+  const c = state.cables.find(x =>
+    (x.a.deviceId === devId && x.a.port === port) || (x.b.deviceId === devId && x.b.port === port));
+  const res = c ? negotiateLink(c) : null;
+  _linkState.set(key, res);
+  return res;
+}
+// `show interfaces status`
+function showInterfacesStatus(dev) {
+  const def = DEVICE_TYPES[dev.type];
+  if (!def || !def.ports) return `${dev.name} has no interfaces`;
+  const out = ['Port      Status        Vlan     Duplex  Speed Type'];
+  for (let p = 1; p <= def.ports; p++) {
+    if (portRole(def, p) === 'PWR') continue;
+    const l = linkFor(dev.id, p);
+    const status = !l ? 'notconnect' : (l.admin ? 'disabled' : (l.up ? 'connected' : 'notconnect'));
+    const vlan = portMode(dev, p) === 'trunk' ? 'trunk' : String(nativeVlanOf(dev, p));
+    const dup = l && l.up ? (l.negotiated ? 'a-' : '') + l.duplex : 'auto';
+    const spd = l && l.up ? (l.negotiated ? 'a-' : '') + fmtSpeed(l.speed) : 'auto';
+    out.push(`${('Gi0/' + p).padEnd(9)} ${status.padEnd(13)} ${vlan.padEnd(8)} ${dup.padEnd(7)} ${spd.padEnd(5)} ${portRole(def, p) === 'SFP+' ? 'SFP' : '10/100/1000'}`);
+  }
+  return out.join('\n');
+}
+
 //////////////////// Functional VLAN engine ////////////////////
 // Ports carry an untagged/access VLAN (default 1) plus optional tagged trunks.
 // Patch panels are true 1:1 passthroughs: front and rear share a port number.
@@ -9319,7 +9427,7 @@ function dhcpExchange(client, opts = {}) {
   if (!walk.start) {
     return { ok: false, reason: walk.overLength
       ? `${client.name}'s drop cable is over the 100 m channel limit — no link, so no DHCP`
-      : `${client.name} isn't cabled to anything`, log };
+      : (linkDownReason(client, hostPort(client)) || `${client.name} isn't cabled to anything`), log };
   }
   // Three ways a client asks, and they are genuinely different exchanges:
   //   INIT      full DORA, broadcast, any server may answer
@@ -9555,6 +9663,16 @@ function gatewayForHost(host, walk, hostIpParsed) {
 }
 
 // data (non-power) port a host actually uses — its first real port
+// Why a port has no usable link, for messages that would otherwise say "not
+// cabled" about a cable that is plugged in at both ends.
+function linkDownReason(dev, port) {
+  const c = state.cables.find(x =>
+    (x.a.deviceId === dev.id && x.a.port === port) || (x.b.deviceId === dev.id && x.b.port === port));
+  if (!c) return `${dev.name} port ${port} has nothing plugged into it`;
+  const l = negotiateLink(c);
+  if (l && !l.up) return l.reason;
+  return null;
+}
 function hostPort(dev) {
   const def = DEVICE_TYPES[dev.type];
   for (let p = 1; p <= (def.ports || 1); p++) {
@@ -9578,6 +9696,12 @@ function hopThroughPatches(dev, port, side) {
     const far = (cbl.a.deviceId === d.id && cbl.a.port === p && epSide(cbl.a) === s) ? cbl.b : cbl.a;
     const fd = deviceById(far.deviceId);
     if (!fd) return null;
+    // A shutdown port, or one whose speed cannot be negotiated with its
+    // partner, has no link — the cable is there and the light is not.
+    if (cbl.a.port !== 'PWR' && cbl.b.port !== 'PWR') {
+      const link = negotiateLink(cbl);
+      if (link && !link.up) return null;
+    }
     if (netClass(fd) === 'patch') { d = fd; p = far.port; s = epSide(far) === REAR ? FRONT : REAR; continue; }
     return { dev: fd, port: far.port, side: epSide(far), cable: cbl };
   }
@@ -9691,7 +9815,7 @@ function arpLearn(hostId, ip, mac) {
 }
 // Topology or addressing changed — a real switch would age these out; we clear
 // them, because a stale table pointing at a deleted cable is worse than empty.
-function flushL2Tables() { macTables.clear(); arpCaches.clear(); _stp = null; }
+function flushL2Tables() { macTables.clear(); arpCaches.clear(); _stp = null; _linkState = new Map(); }
 
 // The chain of jacks a frame crosses from a to b, or null if it can't get there.
 function l2PathJacks(a, b) {

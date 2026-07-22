@@ -782,8 +782,15 @@ this order — the first one is foundational and several others depend on it.
     access vs trunk modes, explicit native VLAN, allowed-list pruning, and
     detection of native-VLAN mismatch and ports in undeclared VLANs. VTP still
     absent (deliberately — it is a distinct mechanism, spec it before building).
-12. **Link speed/duplex is never negotiated** — a 1G port cabled to a 100M port
-    should train to 100M and both ends should report it.
+12. ~~**Link speed/duplex is never negotiated**~~ — FIXED v0.28.0. IEEE 802.3
+    Clause 28 autonegotiation from the catalog's per-port speeds: highest common
+    capability wins, a forced speed the partner cannot reach brings the link
+    down, and downshift names whatever actually limited it. Duplex mismatch is
+    modelled including the classic case — one end hardcoded stops negotiating,
+    the other falls back to half, link stays UP and throws late collisions.
+    Admin state (`shutdown`) is separate from operational state and a shutdown
+    port genuinely carries nothing. `show interfaces status` in IOS format with
+    a- prefixes for negotiated values.
 13. ~~**Cable length affects nothing but a warning**~~ — FIXED v0.22.0. Channel
     limit (100 m) fails the link; permanent link (90 m) warns with the remaining
     patch-cord allowance. Fixing it exposed that the first hop was never
