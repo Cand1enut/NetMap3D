@@ -404,7 +404,7 @@ select:focus, input:focus { border-color: var(--accent); }
        Row 2 carries options for whichever tool is active, so the palette can
        keep growing without the bar ever running off the screen again. -->
   <div id="toolbar">
-    <span class="logo">NetMap<b>3D</b><span class="ver">v0.14.1</span></span>
+    <span class="logo">NetMap<b>3D</b><span class="ver">v0.15.0</span></span>
     <span id="proj-name"></span>
     <span class="sep"></span>
     <div id="modescroll">
@@ -10179,6 +10179,56 @@ function hideProps() { propsEl.classList.add('hidden'); selected = null; clearCa
 
 function row(k, v) { return `<div class="row"><span class="k">${k}</span><span>${v}</span></div>`; }
 
+// DHCP server config, shown on router-class devices only. A real gateway hands
+// out addresses on the subnets it serves; here one pool per device covers the
+// common case and keeps the config honest rather than pretending to more.
+function dhcpPropsHtml(dev) {
+  if (netClass(dev) !== 'router') return '';
+  const d = dev.dhcp || {};
+  const on = !!d.enabled;
+  return `
+    <div class="row" style="margin-top:10px"><span class="k">DHCP server</span>
+      <input type="checkbox" id="dev-dhcp-on" ${on ? 'checked' : ''}></div>
+    <div id="dev-dhcp-cfg" style="${on ? '' : 'display:none'}">
+      <div class="row"><span class="k">Pool start</span>
+        <input type="text" id="dev-dhcp-a" style="width:118px" value="${d.poolStart || ''}" placeholder="10.0.10.100"></div>
+      <div class="row"><span class="k">Pool end</span>
+        <input type="text" id="dev-dhcp-b" style="width:118px" value="${d.poolEnd || ''}" placeholder="10.0.10.200"></div>
+      <p class="cbl-edit-hint">Hosts with IP set to <b>dhcp</b> on this segment lease from here.</p>
+    </div>`;
+}
+
+function wireDhcpProps(dev) {
+  const cb = document.getElementById('dev-dhcp-on');
+  if (!cb) return;
+  const cfg = document.getElementById('dev-dhcp-cfg');
+  const a = document.getElementById('dev-dhcp-a'), b = document.getElementById('dev-dhcp-b');
+  const save = () => {
+    dev.dhcp = {
+      enabled: cb.checked,
+      poolStart: (a.value || '').trim(),
+      poolEnd: (b.value || '').trim()
+    };
+    resolveDhcp();
+    refreshSimPickers();
+  };
+  cb.onchange = () => {
+    cfg.style.display = cb.checked ? '' : 'none';
+    // sensible starting pool so enabling it does something immediately
+    if (cb.checked && !a.value) {
+      const seed = state.devices.map(d => d.ip).filter(ip => ip && ip !== 'dhcp').map(parseIp).filter(Boolean)[0];
+      if (seed) {
+        const net = seed.network >>> 0;
+        a.value = ipStr(net + 100);
+        b.value = ipStr(net + 200);
+      }
+    }
+    save();
+  };
+  a.onchange = save;
+  b.onchange = save;
+}
+
 function showDeviceProps(id) {
   clearCableHandles();
   const dev = deviceById(id);
@@ -10204,6 +10254,7 @@ function showDeviceProps(id) {
     <input type="text" id="dev-ip" placeholder="e.g. 10.0.20.4" value="${dev.ip || ''}">
     <div class="row" style="margin-top:6px"><span class="k">Notes</span></div>
     <input type="text" id="dev-notes" placeholder="VLAN, location, model…" value="${dev.notes || ''}">
+    ${dhcpPropsHtml(dev)}
     ${!isPlaced(dev) ? '<button id="dev-place">Place in 3D map</button>' : ''}
     <button id="dev-del" class="danger">Delete device</button>`;
   propsEl.classList.remove('hidden');
@@ -10214,6 +10265,7 @@ function showDeviceProps(id) {
   };
   document.getElementById('dev-ip').onchange = e => { dev.ip = e.target.value.trim(); };
   document.getElementById('dev-notes').onchange = e => { dev.notes = e.target.value.trim(); };
+  wireDhcpProps(dev);
   const placeBtn = document.getElementById('dev-place');
   if (placeBtn) placeBtn.onclick = () => {
     hideProps();
@@ -12325,7 +12377,8 @@ function demo() {
   const hcm1 = mk('hcm', 41);
   const sw = mk('switch48', 40, { ip: '10.0.0.2' });
   const rtr = mk('router', 38, { ip: '10.0.0.1' });
-  const udm = mk('u_udmpromax', 35, { ip: '10.0.0.254', notes: 'core gateway' });
+  const udm = mk('u_udmpromax', 35, { ip: '10.0.0.254', notes: 'core gateway',
+    dhcp: { enabled: true, poolStart: '10.0.10.100', poolEnd: '10.0.10.200' } });
   const pmax = mk('u_promax24', 33, { ip: '10.0.0.4', notes: 'Etherlighting demo' });
   mk('firewall', 37, { ip: '10.0.0.254' });
   const srv = mk('server', 20, { ip: '10.0.10.5' });
@@ -12354,7 +12407,8 @@ function demo() {
   state.slabs.push(slab2);
   buildSlab(slab2);
   const apUp = mk('u_u7pro', 0, { x: -100, z: 20, y0: 120, ip: '10.0.20.13', notes: 'Level 2 WiFi' });
-  const ws1 = mk('o_ws', 0, { x: 80, z: 30, rotY: -0.7, ip: '10.0.10.21', notes: 'front desk PC' });
+  // front desk PC leases from the gateway — shows DHCP working out of the box
+  const ws1 = mk('o_ws', 0, { x: 80, z: 30, rotY: -0.7, ip: 'dhcp', notes: 'front desk PC (DHCP)' });
   mk('o_chair', 0, { x: 92, z: 44, rotY: 2.4 });
   mk('person', 0, { x: 40, z: 60 });
 

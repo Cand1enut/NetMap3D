@@ -1,6 +1,6 @@
 {
   "name": "netmap3d",
-  "version": "0.14.1",
+  "version": "0.15.0",
   "description": "3D network map designer - rack layout, port-level cabling, cable management routing",
   "main": "main.js",
   "scripts": {
