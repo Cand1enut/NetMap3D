@@ -32,20 +32,24 @@ GitHub).
 6. When the owner reports a bug, find the root cause. The report "can't
    change wire colors" was actually a toolbar-layout bug hiding the control.
 
-## Current state (v0.11.0, Jul 2026)
+## Current state (v0.14.0, Jul 2026)
 
-Single-page app: `app.js` (~6k lines, no bundler, three.js r147 UMD, pinned),
+Single-page app: `app.js` (~6k lines, no bundler, three.js **r185** bundled to
+`vendor/three-bundle.js` by `build-vendor.js` and exposed as window.THREE),
 `index.html` (two-tier toolbar), `style.css` (UniFi-ish tokens),
 `build-portable.js` → `NetMap3D.html`. Electron wrapper also works
 (`npm start`). Repo root doubles as the web root (`npx serve .`).
 
 Done and verified:
 
-- **Cable routing.** Collision-aware (walls/gear/furniture/stairs, per-mesh
-  AABB colliders + broadphase), cable-vs-cable separation, ties as a routing
-  constraint (hex-packed bundles, work with Physics off), plenum auto-route
-  for runs > 5 ft, raceways (EMT ½"–4"/tray/surface/J-hook) with NEC Ch.9
-  Table 4 fill — all ten EMT trade sizes match the table exactly.
+- **Cable routing.** Deterministic, no physics: orthogonal 90° legs
+  (`orthLegs`), rack dressing via the vertical manager (`rackDressRoute`),
+  rounded corners at a per-cable bend radius, waypoints snapped to a 1" grid
+  and draggable (yellow = move, blue = add, right-click = remove). Collision
+  colliders + cable-vs-cable separation still apply outside pathways.
+  23 pathway types (EMT, tray, surface, J-hook, buried PVC, direct burial,
+  riser sleeve, wall cavity) with NEC Ch.9 Table 4 fill; `pathwayY()` places
+  each run in its real space (plenum / attic / crawlspace / trench).
 - **Patch panels.** Endpoint = `(device, port, side)`. Front jack and rear
   punchdown are separate jacks, one plug each; VLAN trace bridges front↔rear
   as one circuit. Legacy saves migrate via `migrateCableSides`.
@@ -83,76 +87,70 @@ Architecture invariants (each has bitten once when broken):
 
 ## Ordered plan
 
-One item = one version, committed and pushed, acceptance check passing in the
-browser harness before commit.
+Owner-set priority order (stated Jul 2026). Work them in this order.
 
-### Phase 1 — Packet Tracer core (in progress)
+### 1. Cable running + rack management  ← CURRENT
 
-1. **v0.12 DHCP.** Router-class devices get `dhcp: {enabled, poolStart,
-   poolEnd}` in props (default: serve their own subnet). Hosts may set
-   ip = `dhcp`; resolution broadcasts in the host's L2 domain and leases the
-   next free address; leases visible in device props and a DHCP table in the
-   Assistant. Accept: host with ip=dhcp pings a static host; removing the
-   server produces the verdict "no DHCP server in broadcast domain".
-2. **v0.13 MAC + ARP tables.** Ping/trace populate per-switch MAC tables
-   (port → learned MACs; deterministic fake MACs derived from device id) and
-   per-host ARP caches. Click a switch → MAC table in props. Accept: after a
-   ping, the access switch maps both hosts to the correct ports; tables
-   flush when a cable is deleted.
-3. **v0.14 STP.** Redundant switch↔switch links elect a root (lowest device
-   id wins), blocked ports computed and rendered dashed amber; `l2Walk` uses
-   the spanning tree so loops terminate and redundancy reads as standby.
-   Accept: a triangle of three switches yields exactly one blocked link;
-   cutting a forwarding link makes the walk succeed over the standby.
-4. **v0.15 ACLs.** Per-router ordered rules (allow/deny, src/dst subnet).
-   `pingHosts` consults them on routed paths; verdict names the matching
-   rule. Accept: a deny rule turns the matrix cell red with
-   "blocked by ACL <name> rule <n>".
-5. **v0.16 NAT + WAN.** New "Internet" catalog node; a router with a cabled
-   WAN port NATs its inside subnets. Add a "ping 8.8.8.8" preset. Accept:
-   host→internet succeeds iff some gateway has WAN cabling; verdict explains
-   the NAT path.
-6. **v0.17 Device CLI.** Terminal in router/switch props. Read commands
-   first, IOS-flavoured, all reading live sim state: `show ip interface
-   brief`, `show mac address-table`, `show vlan`, `show spanning-tree`,
-   `show access-lists`, `show running-config`, `ping`. Config commands
-   (vlan, access-list, ip address, shutdown) as a second pass. Accept:
-   every show command agrees with the panels.
+Not done until any install method looks clean and hand-adjustable. The owner's
+bar: "no weird angles or messed up cable management." Reference real cable
+management photos when unsure what good looks like.
 
-### Phase 2 — catalog depth
+Every one of these must work and look right — none is more important than the
+others, they are alternatives an installer picks between:
 
-7. **v0.18** Speed/PoE verification pass for Aruba, Netgear, Omada, MikroTik
-   (the treatment Cisco got in commit dcf80e6); add MX68 (deferred: its LAN
-   table needed confirming), ISR/Catalyst 8000 routers (deferred: onboard
-   port counts unconfirmed), and anything the owner names. Keep
-   `SPEC_SOURCES` complete. Accept: every rack SKU's laid-out port count
-   equals its declared count.
-8. **v0.19** Structure/furniture depth: doors + windows as wall cutouts that
-   cables route around, elevators as walkable shafts, more
-   office/warehouse/retail furniture, per-room floor/wall/ceiling material
-   picker. The Sims-style building variety the owner asked for.
+- in walls (stud cavity, floor to floor)   - on walls (surface raceway)
+- in ceilings (plenum, attic, crawlspace)  - on ceilings (surface mount)
+- outside (aerial / exterior)              - underground (trench)
+- in racks (vertical + horizontal managers)
 
-### Phase 3 — platform
+Done so far: orthogonal 90-degree routing, rack dress route via vertical
+manager, per-cable bend radius, drag-to-edit waypoint handles, buried/riser/
+wall-cavity pathway types, per-space elevations (pathwayY).
 
-9. **v0.20** three.js r147 → current, via Vite + ES modules, zero feature
-   changes in the same version so regressions are attributable. Keep the
-   multisampled target, the portable single-file output (Vite single-file
-   plugin), and Electron. Unlocks WebGPURenderer as an optional path later.
-10. **v0.21** Scan import: RoomPlan USDZ/JSON (iPhone LiDAR) and
-    photogrammetry floor plans → `state.walls`/`state.slabs` + cleanup UI.
-    Integrate external scanners' output; do NOT attempt in-app video
-    reconstruction.
+Still to do:
+- In-wall routing as a first-class action: click a wall while cabling to drop a
+  waypoint on the wall centerline; run vertically in the cavity; pass floors
+  through a sleeve. Must look clean with X-ray on.
+- Bundling: parallel runs sharing a pathway should lie side by side and break
+  out cleanly, not overlap. (Tie system packs bundles; extend to pathways.)
+- Service loops (12-24in copper) stored in managers, figure-8, respecting bend
+  radius.
+- Slack/length realism + TIA 90 m permanent-link warning (separate from the
+  existing 100 m channel check).
+- Verify each method visually against reference photos before calling done.
 
-### Phase 4 — collaboration (owner sequenced this last)
+### 2. Packet Tracer functionality — 100%
 
-11. Op-log over the single JSON `state` (all mutations already funnel through
-    it), CRDT sync (Yjs or Automerge) over WebSocket, presence cursors, share
-    links with roles. PLATFORM.md holds the earlier architecture sketch
-    (rooms, auth, hosting, pricing).
+Existing: L2/L3 reachability, ping/trace/matrix, DHCP (v0.14 partial).
+Remaining, roughly in order:
+- MAC + ARP tables, inspectable per device
+- STP with blocked-port rendering
+- ACLs, NAT + an Internet node
+- Device CLI (IOS-flavoured show commands first, then config)
+- Routing protocols, VLAN trunk depth, LACP/HA/failover
+All of it must derive from catalog data via netClass() so new devices inherit
+simulation for free.
 
-Also wanted, slot when convenient: team tasks pinned to objects ("drill this
-hole"), GLTF product models, LACP/HA/failover simulation (cut a link, watch
-traffic reroute), BOM export.
+### 3. Challenges / practice mode
+
+Packet-Tracer-style scenarios the user can attempt: a broken network to fix, a
+spec to build to, graded on the sim's own verdicts. Needs a scenario file
+format and a checker built on reachabilityMatrix + the analyzer.
+
+### 4. Multiplayer, Google-Docs style
+
+Real-time collaborative editing so people plan and learn together. Op-log over
+the single JSON state, CRDT (Yjs/Automerge) over WebSocket, presence cursors,
+share links. PLATFORM.md has the earlier architecture sketch.
+
+### 5. Graphics: Xbox-360 era quality
+
+Target: looks like a game from ~10 years ago. Size is not a constraint (up to
+10 GB) as long as it stays a double-click app.
+Done: three.js r185, AgX tone mapping, GTAO, ceiling troffers with area lights,
+procedural PBR surfaces.
+Next: real product models (GLTF) instead of primitives, better materials, baked
+or screen-space GI, richer furniture/environment, texture detail.
 
 ## Traps already hit once (don't repeat)
 
