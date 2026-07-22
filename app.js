@@ -3238,7 +3238,14 @@ function resolveDhcp() {
     let server = null;
     for (const sid of walk.routers.keys()) {
       const sv = deviceById(sid);
-      if (sv && sv.dhcp && sv.dhcp.enabled && dhcpPool(sv)) { server = sv; break; }
+      if (!sv || !sv.dhcp || !sv.dhcp.enabled) continue;
+      const pool = dhcpPool(sv);
+      if (!pool) continue;
+      // A DHCP server hands out addresses on subnets it has an interface in —
+      // otherwise the offer could never be delivered or routed back.
+      const iface = ifaceIp(sv, walk.routers.get(sid).port, hostVlan(h));
+      if (!iface || !sameSubnet(iface.ip, pool.ip)) continue;
+      server = sv; break;
     }
     if (!server) continue;                       // no lease → host stays unaddressed
     const pool = dhcpPool(server);
@@ -3266,6 +3273,76 @@ function hostIp(dev) {
 function hostAddr(dev) {
   if (dev.ip === 'dhcp') { const l = _dhcpLeases.get(dev.id); return l ? `${l.ip} (DHCP)` : 'dhcp (no lease)'; }
   return dev.ip || '—';
+}
+
+//////////////////// Layer-3 interface addressing ////////////////////
+// A router does not have "an IP" — it has an address on every interface, and
+// that is what makes it a gateway for a given subnet. Treating a router as a
+// single address meant any router on a segment was assumed to route any subnet,
+// which is not how routing works and hid real misconfigurations.
+//
+// Two ways an L3 device addresses a segment, both real:
+//   * routed port  — portCfg[port].ip, e.g. a WAN port or a point-to-point link
+//   * SVI          — dev.svi[vlan], the "interface Vlan20" a gateway uses to
+//                    route between VLANs (router-on-a-stick, or an L3 switch)
+// If a device has neither on a segment, it is NOT a gateway there, full stop.
+function ifaceIp(dev, port, vlan) {
+  const pc = (dev.portCfg && dev.portCfg[port]) || {};
+  if (pc.ip) { const p = parseIp(pc.ip); if (p) return { ip: p, kind: 'routed', port }; }
+  if (vlan !== undefined && dev.svi && dev.svi[vlan]) {
+    const p = parseIp(dev.svi[vlan]);
+    if (p) return { ip: p, kind: 'svi', vlan };
+  }
+  return null;
+}
+
+// Every addressed interface on a device — for inspectors and "show ip int br".
+function deviceInterfaces(dev) {
+  const out = [];
+  const def = DEVICE_TYPES[dev.type] || {};
+  for (let p = 1; p <= (def.ports || 0); p++) {
+    const pc = (dev.portCfg && dev.portCfg[p]) || {};
+    if (pc.ip) { const ip = parseIp(pc.ip); if (ip) out.push({ name: `Port ${p}`, port: p, ip, kind: 'routed' }); }
+  }
+  for (const [v, addr] of Object.entries(dev.svi || {})) {
+    const ip = parseIp(addr);
+    if (ip) out.push({ name: `Vlan${v}`, vlan: +v, ip, kind: 'svi' });
+  }
+  return out;
+}
+
+// The gateway serving a host: a router reachable at L2 that actually holds an
+// address inside the host's subnet. Returns { id, iface } or a reason it fails,
+// so the verdict can name the real problem instead of "no route".
+function gatewayForHost(host, walk, hostIpParsed) {
+  const vlan = hostVlan(host);
+  const candidates = [];
+  for (const rid of walk.routers.keys()) {
+    const r = deviceById(rid);
+    const jack = walk.routers.get(rid);
+    const iface = ifaceIp(r, jack.port, vlan);
+    if (iface && sameSubnet(iface.ip, hostIpParsed)) candidates.push({ id: rid, iface, router: r });
+  }
+  // An explicitly configured default gateway must actually exist on the segment
+  // — a wrong or stale gateway address is one of the most common real faults.
+  if (host.gateway) {
+    const want = parseIp(host.gateway);
+    if (!want) return { error: `${host.name} has an invalid default gateway "${host.gateway}"` };
+    const match = candidates.find(c => c.iface.ip.int === want.int);
+    if (!match) {
+      return { error: candidates.length
+        ? `${host.name}'s default gateway ${host.gateway} isn't on this segment — the router here answers on ${candidates.map(c => ipStr(c.iface.ip.int)).join(', ')}`
+        : `${host.name}'s default gateway ${host.gateway} is unreachable — no router on this segment holds that address` };
+    }
+    return match;
+  }
+  if (!candidates.length) {
+    const seen = [...walk.routers.keys()].map(id => deviceById(id).name);
+    return { error: seen.length
+      ? `${seen.join(', ')} ${seen.length === 1 ? 'is' : 'are'} reachable but ${seen.length === 1 ? 'has' : 'have'} no interface in ${subnetLabel(hostIpParsed)} — no gateway for this subnet`
+      : `${host.name}'s subnet ${subnetLabel(hostIpParsed)} has no router reachable` };
+  }
+  return candidates[0];
 }
 
 // data (non-power) port a host actually uses — its first real port
@@ -3432,9 +3509,10 @@ function learnFromExchange(a, b) {
     } else {
       for (const [h, other] of [[a, b], [b, a]]) {
         const w = l2Walk(h, { vlan: hostVlan(h) });
-        const gwId = w.routers.keys().next().value;
-        const gw = gwId !== undefined ? deviceById(gwId) : null;
-        if (gw && gw.ip) arpLearn(h.id, gw.ip, deviceMac(gw));
+        const hip = hostIp(h);
+        const g = hip ? gatewayForHost(h, w, hip) : null;
+        // a host ARPs for its gateway's address on THIS segment
+        if (g && !g.error) arpLearn(h.id, ipStr(g.iface.ip.int), deviceMac(g.router));
       }
     }
   }
@@ -3554,8 +3632,10 @@ function pingInternet(host) {
   const walk = l2Walk(host, { vlan: hostVlan(host) });
   if (!walk.routers.size) return { ok: false, reason: `${host.name}'s subnet ${subnetLabel(ip)} has no router / default gateway reachable` };
 
+  const gw = gatewayForHost(host, walk, ip);
+  if (gw.error) return { ok: false, reason: gw.error };
   let lastReason = null;
-  for (const rid of walk.routers.keys()) {
+  for (const rid of [gw.id]) {
     const r = deviceById(rid);
     const up = wanUplink(r);
     if (!up.ok) { lastReason = up.reason; continue; }
@@ -3848,27 +3928,27 @@ function pingHosts(aId, bId) {
       : { ok: false, mode: 'l2', reason: `same subnet, but ${l2.reason}` };
   }
 
-  // different subnets → routing. Each host needs a router (default gateway) in
-  // its own L2 broadcast domain, and those routers must be able to reach each
-  // other (the common case is one gateway doing inter-VLAN routing).
+  // Different subnets → routing. Each host needs a gateway that genuinely holds
+  // an address in that host's subnet, and the two gateways must be able to
+  // reach each other. A router merely sitting on the segment is not a gateway.
   const l2A = l2Walk(a, { vlan: hostVlan(a) });
   const l2B = l2Walk(b, { vlan: hostVlan(b) });
-  if (l2A.routers.size === 0) return { ok: false, mode: 'l3', reason: `${a.name}'s subnet ${subnetLabel(ipA)} has no router / default gateway reachable` };
-  if (l2B.routers.size === 0) return { ok: false, mode: 'l3', reason: `${b.name}'s subnet ${subnetLabel(ipB)} has no router / default gateway reachable` };
+  const gwA = gatewayForHost(a, l2A, ipA);
+  if (gwA.error) return { ok: false, mode: 'l3', reason: gwA.error };
+  const gwB = gatewayForHost(b, l2B, ipB);
+  if (gwB.error) return { ok: false, mode: 'l3', reason: gwB.error };
 
-  const rA = [...l2A.routers.keys()], rB = [...l2B.routers.keys()];
-  // Interfaces the packet actually enters and leaves each router on — needed so
-  // an ACL applied "in" on one port isn't wrongly evaluated against the other.
   const ifOf = (walk, rid) => { const j = walk.routers.get(rid); return j ? j.port : null; };
-  const shared = rA.find(r => rB.includes(r));
-  if (shared) {
-    const g = deviceById(shared);
-    const acl = aclCheck(g, { in: ifOf(l2A, shared), out: ifOf(l2B, shared) }, ipA.int, ipB.int);
+  if (gwA.id === gwB.id) {
+    const g = deviceById(gwA.id);
+    const acl = aclCheck(g, { in: ifOf(l2A, gwA.id), out: ifOf(l2B, gwB.id) }, ipA.int, ipB.int);
     if (acl.blocked) return { ok: false, mode: 'l3', reason: acl.reason, acl };
-    return { ok: true, mode: 'l3', hops: [a.id, shared, b.id], detail: `routed across subnets by ${g.name} (inter-VLAN)` };
+    return { ok: true, mode: 'l3', hops: [a.id, gwA.id, b.id],
+      detail: `routed by ${g.name}: ${ipStr(gwA.iface.ip.int)} (${gwA.iface.kind === 'svi' ? 'Vlan' + gwA.iface.vlan : 'port ' + gwA.iface.port})` +
+              ` → ${ipStr(gwB.iface.ip.int)} (${gwB.iface.kind === 'svi' ? 'Vlan' + gwB.iface.vlan : 'port ' + gwB.iface.port})` };
   }
   // distinct gateways: is there a router path between them? (transit link)
-  const path = routerPath(rA, rB);
+  const path = routerPath([gwA.id], [gwB.id]);
   if (path) {
     for (const rid of path) {
       const r = deviceById(rid);
@@ -7449,9 +7529,9 @@ document.getElementById('launch-new').onclick = async () => {
   await saveProject(true);
   setStatus(`Project “${name}” — draw the building with Room/Wall, or drop a rack to begin.`);
 };
-document.getElementById('launch-demo').onclick = () => {
+document.getElementById('launch-sample').onclick = () => {
   clearScene();
-  demo();
+  referenceSite();
   setProject('Sample Project');
   setStatus('Sample project — a complete working site to explore and edit.');
 };
@@ -7493,7 +7573,11 @@ function maybeShowHelp() {
 
 //////////////////// Demo scene ////////////////////
 
-function demo() {
+// A fully worked reference installation: correct VLAN-to-subnet design, a
+// gateway routing between them on SVIs, structured cabling landing on the patch
+// panel rear with short leads to the switch. Everything here is how it would be
+// built on site — it is a starting point to edit, not a showcase.
+function referenceSite() {
   const rack = { id: uid(), x: 0, z: 0, rotY: 0, name: 'Rack-1' };
   state.racks.push(rack);
   buildRackGroup(rack);
@@ -7510,15 +7594,19 @@ function demo() {
   const hcm1 = mk('hcm', 41);
   const sw = mk('switch48', 40, { ip: '10.0.0.2' });
   const rtr = mk('router', 38, { ip: '10.0.0.1' });
+  // Core gateway. It routes between VLANs on SVIs — one interface per VLAN, each
+  // holding the .1 of that subnet. That is what makes it the default gateway for
+  // those subnets; a router merely sitting on the wire routes nothing.
   const udm = mk('u_udmpromax', 35, { ip: '10.0.0.254', notes: 'core gateway',
+    svi: { 10: '10.0.10.1/24', 20: '10.0.20.1/24', 30: '10.0.30.1/24' },
     dhcp: { enabled: true, poolStart: '10.0.10.100', poolEnd: '10.0.10.200' } });
   const pmax = mk('u_promax24', 33, { ip: '10.0.0.4', notes: 'Etherlighting demo' });
   mk('firewall', 37, { ip: '10.0.0.254' });
-  const srv = mk('server', 20, { ip: '10.0.10.5' });
+  const srv = mk('server', 20, { ip: '10.0.10.5', gateway: '10.0.10.1' });
   const ups1 = mk('ups', 1);
   mk('vcm', 0, { side: 'R' });
-  const ap1 = mk('ap', 0, { x: 66, z: -36, ip: '10.0.20.11', notes: 'VLAN 20 - WiFi' });
-  const cam1 = mk('camera', 0, { x: -60, z: -48, ip: '10.0.30.21', notes: 'VLAN 30 - CCTV' });
+  const ap1 = mk('ap', 0, { x: 66, z: -36, ip: '10.0.20.11', gateway: '10.0.20.1', notes: 'VLAN 20 - WiFi' });
+  const cam1 = mk('camera', 0, { x: -60, z: -48, ip: '10.0.30.21', gateway: '10.0.30.1', notes: 'VLAN 30 - CCTV' });
 
   // walls with a drilled pass-through, a wall-mounted camera, and an AP beyond the wall
   const wallA = { id: uid(), x1: -144, z1: -84, x2: 144, z2: -84, h: WALL_H };
@@ -7528,8 +7616,8 @@ function demo() {
   const hole1 = { id: uid(), wallId: wallA.id, x: -30, y: 80, z: -84, nx: 0, nz: 1 };
   state.holes.push(hole1);
   buildHole(hole1);
-  const wallCam = mk('camera', 0, { mount: 'wall', x: 50, y: 84, z: -81.6, rotY: 0, ip: '10.0.30.22', notes: 'VLAN 30 - CCTV' });
-  const apFar = mk('ap', 0, { x: -30, z: -170, ip: '10.0.20.12', notes: 'VLAN 20 - warehouse' });
+  const wallCam = mk('camera', 0, { mount: 'wall', x: 50, y: 84, z: -81.6, rotY: 0, ip: '10.0.30.22', gateway: '10.0.30.1', notes: 'VLAN 30 - CCTV' });
+  const apFar = mk('ap', 0, { x: -30, z: -170, ip: '10.0.20.12', gateway: '10.0.20.1', notes: 'VLAN 20 - warehouse' });
 
   // a planned-only device and link for the 2D view
   state.devices.push({ id: uid(), type: 'switch24', name: 'Switch-IDF', ip: '10.0.0.3', notes: 'planned IDF closet' });
@@ -7539,7 +7627,7 @@ function demo() {
   const slab2 = { id: uid(), x1: -160, z1: -60, x2: -40, z2: 100, y: 120 };
   state.slabs.push(slab2);
   buildSlab(slab2);
-  const apUp = mk('u_u7pro', 0, { x: -100, z: 20, y0: 120, ip: '10.0.20.13', notes: 'Level 2 WiFi' });
+  const apUp = mk('u_u7pro', 0, { x: -100, z: 20, y0: 120, ip: '10.0.20.13', gateway: '10.0.20.1', notes: 'Level 2 WiFi' });
   // front desk PC leases from the gateway — shows DHCP working out of the box
   const ws1 = mk('o_ws', 0, { x: 80, z: 30, rotY: -0.7, ip: 'dhcp', notes: 'front desk PC (DHCP)' });
   mk('o_chair', 0, { x: 92, z: 44, rotY: 2.4 });
@@ -7581,14 +7669,36 @@ function demo() {
   // in-rack and adjacent gear patches straight to the switch — no panel needed
   mkCable(sw, 42, srv, 1, '#22c55e');
   mkCable(sw, 17, ws1, 1, '#3b82f6');
-  // gateway uplink: the UDM routes between subnets, so it must be in the L2
-  // domain — without this every cross-subnet ping correctly reports "no gateway"
+  // Gateway uplink. This is a trunk: it has to carry every VLAN the gateway
+  // routes for, otherwise the SVI for a missing VLAN is unreachable and that
+  // subnet has no default gateway.
   mkCable(sw, 2, udm, 1, '#e5e7eb');
+
+  // Port VLAN assignment. Each access port is placed in the VLAN matching the
+  // subnet of the device on it — one VLAN per subnet, which is the design the
+  // gateway's SVIs assume. Without this every device sits in VLAN 1 and the
+  // separation the addressing implies would be fictional.
+  const setAccess = (dev, port, vlan) => {
+    dev.portCfg = dev.portCfg || {};
+    dev.portCfg[port] = { ...(dev.portCfg[port] || {}), vlan: String(vlan) };
+  };
+  // port -> VLAN, matched to the subnet of the device actually on that port:
+  //   42 server 10.0.10.5 · 17 workstation (DHCP 10.0.10.x)      -> VLAN 10
+  //   1 AP-1 .20.11 · 18 AP upstairs .20.13 · 14 AP warehouse .20.12 -> VLAN 20
+  //   26 Cam-1 .30.21 · 12 wall camera .30.22                    -> VLAN 30
+  const VLAN_OF = { 10: [42, 17], 20: [1, 18, 14], 30: [26, 12] };
+  for (const [vlan, ports] of Object.entries(VLAN_OF)) {
+    for (const p of ports) setAccess(sw, p, vlan);
+  }
+  // the uplink to the gateway trunks all three
+  sw.portCfg[2] = { vlan: '10', tagged: '20,30' };
+  udm.portCfg = udm.portCfg || {};
+  udm.portCfg[1] = { vlan: '10', tagged: '20,30' };
   // power cords: rear inlets → UPS outlets, like a real rack
   mkCable(sw, 'PWR', ups1, 1, '#111827');
   mkCable(udm, 'PWR', ups1, 2, '#111827');
   mkCable(pmax, 'PWR', ups1, 3, '#111827');
-  setStatus('Demo rack loaded — field runs land on the patch panel REAR, short leads patch the FRONT to the switch. Hover any port to see both faces.');
+  setStatus('Reference site loaded — field runs land on the patch panel REAR, short leads patch the FRONT to the switch. Hover any port to see both faces.');
 }
 
 // boot into the project launcher — no auto-loaded demo
