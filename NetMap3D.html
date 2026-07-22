@@ -404,7 +404,7 @@ select:focus, input:focus { border-color: var(--accent); }
        Row 2 carries options for whichever tool is active, so the palette can
        keep growing without the bar ever running off the screen again. -->
   <div id="toolbar">
-    <span class="logo">NetMap<b>3D</b><span class="ver">v0.16.0</span></span>
+    <span class="logo">NetMap<b>3D</b><span class="ver">v0.17.0</span></span>
     <span id="proj-name"></span>
     <span class="sep"></span>
     <div id="modescroll">
@@ -522,6 +522,7 @@ select:focus, input:focus { border-color: var(--accent); }
       <button id="sim-trace">Trace</button>
       <button id="sim-matrix">Matrix</button>
       <button id="sim-dhcp">DHCP</button>
+      <button id="sim-stp">STP</button>
     </div>
     <div class="ai-row">
       <input type="text" id="ai-devq" placeholder="Need a device? e.g. Catalyst 9300 48-port">
@@ -8511,6 +8512,13 @@ function buildConnector(port, color, isPower) {
   return g;
 }
 
+// Is this cable a blocked STP link? True when either end's port is blocking.
+function cableStpBlocked(cable) {
+  try {
+    return stpBlocked(cable.a.deviceId, cable.a.port) || stpBlocked(cable.b.deviceId, cable.b.port);
+  } catch (e) { return false; }
+}
+
 function buildCableMesh(cable) {
   const curve = cableCurve(cable);
   if (!curve) return;
@@ -8529,6 +8537,14 @@ function buildCableMesh(cable) {
   }));
   m.castShadow = true;
   m.userData = { isCable: true, cableId: cable.id, curve };
+  // A link STP has blocked is up but not forwarding. Real switches show this as
+  // an amber/blocked port, so tint the run instead of leaving it look live.
+  if (cableStpBlocked(cable)) {
+    m.material.color.set(0xffb020);
+    m.material.emissive = new THREE.Color(0x3a2600);
+    m.material.transparent = true;
+    m.material.opacity = 0.55;
+  }
   const ep = cablePorts(cable);
   if (ep) {
     m.add(buildConnector(ep.a, col, isPowerPort(cable.a.deviceId, cable.a.port)));
@@ -8872,9 +8888,13 @@ function l2Walk(startDev, opts = {}) {
       if (!opts.ignoreVlan && vlan !== undefined && !portCarries(cur.dev, cur.port, vlan)) continue;
       const def = DEVICE_TYPES[cur.dev.type];
       const nports = def.ports || 0;
+      // a blocked port drops the frame — that's the whole point of STP, and it
+      // is also what stops this walk looping forever on a redundant topology
+      if (!opts.ignoreStp && cls === 'switch' && stpBlocked(cur.dev.id, cur.port)) continue;
       for (let q2 = 1; q2 <= nports; q2++) {
         if (q2 === cur.port) continue;
         if (!opts.ignoreVlan && vlan !== undefined && !portCarries(cur.dev, q2, vlan)) continue;
+        if (!opts.ignoreStp && cls === 'switch' && stpBlocked(cur.dev.id, q2)) continue;
         const nb = hopThroughPatches(cur.dev, q2, FRONT);
         if (!nb) continue;
         if (!opts.ignoreLength && ((nb.cable && (nb.cable.lengthIn || 0) / 12) > COPPER_LIMIT_FT)) continue;
@@ -8917,7 +8937,7 @@ function arpLearn(hostId, ip, mac) {
 }
 // Topology or addressing changed — a real switch would age these out; we clear
 // them, because a stale table pointing at a deleted cable is worse than empty.
-function flushL2Tables() { macTables.clear(); arpCaches.clear(); }
+function flushL2Tables() { macTables.clear(); arpCaches.clear(); _stp = null; }
 
 // The chain of jacks a frame crosses from a to b, or null if it can't get there.
 function l2PathJacks(a, b) {
@@ -8972,6 +8992,130 @@ function learnFromExchange(a, b) {
   }
   return true;
 }
+
+//////////////////// Spanning Tree (802.1D) ////////////////////
+// Redundant switch-to-switch links create a loop; STP blocks all but one path.
+// Modelled on IEEE 802.1D: lowest bridge ID wins root, every other bridge picks
+// the port with the lowest cost back to root, each segment elects a designated
+// port, and whatever is left blocks.
+//
+// Path costs use the 802.1D-2004 formula, cost = 20,000,000 / speed in Mbps
+// (1G = 20000, 10G = 2000, 100M = 200000). Note Cisco still defaults to the
+// legacy 802.1D-1998 short costs (1G = 4, 100M = 19, 10G = 2) — when the IOS
+// CLI lands, `show spanning-tree` must print short costs to be faithful, so
+// keep STP_SHORT_COST below in sync rather than deriving it.
+const STP_PRIO_DEFAULT = 32768;             // 802.1D default bridge priority
+const STP_SHORT_COST = { 0.01: 100, 0.1: 19, 1: 4, 10: 2 };  // 802.1D-1998, Cisco default
+function stpCost(speedGbps) {
+  const mbps = (speedGbps || 1) * 1000;
+  return Math.max(1, Math.round(20000000 / mbps));
+}
+function bridgePriority(dev) {
+  const p = dev.stpPriority;
+  return (p === undefined || p === null || isNaN(+p)) ? STP_PRIO_DEFAULT : +p;
+}
+// Comparable bridge ID: priority first, then MAC — exactly 802.1D's ordering.
+function bridgeIdKey(dev) {
+  return String(bridgePriority(dev)).padStart(6, '0') + '|' + deviceMac(dev);
+}
+// A link runs at the slower of its two ends.
+function linkSpeed(cable) {
+  const sp = (ep) => {
+    const d = deviceById(ep.deviceId);
+    if (!d) return 1;
+    const g = portGrid(DEVICE_TYPES[d.type]).find(p => p.port === ep.port);
+    return (g && g.speed) || 1;
+  };
+  return Math.min(sp(cable.a), sp(cable.b));
+}
+
+let _stp = null;   // cached result; invalidated with the L2 tables
+function stpState() {
+  if (_stp) return _stp;
+  const switches = state.devices.filter(d => isPlaced(d) && netClass(d) === 'switch');
+  const roles = new Map();     // "devId:port" -> role
+  if (switches.length < 2) return (_stp = { rootId: switches[0] && switches[0].id, roles, cost: new Map() });
+
+  // switch-to-switch links only; host and router ports are edge ports
+  const links = [];
+  for (const c of state.cables) {
+    const da = deviceById(c.a.deviceId), db = deviceById(c.b.deviceId);
+    if (!da || !db) continue;
+    const ea = hopThroughPatches(da, c.a.port, epSide(c.a));
+    if (!ea) continue;
+    if (netClass(da) !== 'switch' || netClass(ea.dev) !== 'switch') continue;
+    if (da.id === ea.dev.id) continue;
+    links.push({ aId: da.id, aPort: c.a.port, bId: ea.dev.id, bPort: ea.port, cost: stpCost(linkSpeed(c)), cable: c });
+  }
+  if (!links.length) return (_stp = { rootId: switches[0].id, roles, cost: new Map() });
+
+  // Each connected component elects its own root — an isolated group of
+  // switches is its own L2 island with its own spanning tree, not a set of
+  // rootless bridges. Running one global tree blocks every port on any island
+  // that can't reach the global root, which is wrong and was caught by test.
+  const adj = new Map(switches.map(d => [d.id, []]));
+  for (const l of links) { adj.get(l.aId).push(l); adj.get(l.bId).push(l); }
+  const cost = new Map(switches.map(d => [d.id, Infinity]));
+  const via = new Map();
+  const seenComp = new Set();
+  let globalRoot = null;
+
+  for (const seed of switches) {
+    if (seenComp.has(seed.id)) continue;
+    // collect this component
+    const comp = [];
+    const stack = [seed.id];
+    seenComp.add(seed.id);
+    while (stack.length) {
+      const id = stack.pop();
+      comp.push(id);
+      for (const l of adj.get(id) || []) {
+        const far = l.aId === id ? l.bId : l.aId;
+        if (!seenComp.has(far)) { seenComp.add(far); stack.push(far); }
+      }
+    }
+    // 1. root of this component = lowest bridge ID within it
+    const root = comp.map(deviceById).sort((x, y) => bridgeIdKey(x) < bridgeIdKey(y) ? -1 : 1)[0];
+    if (!globalRoot) globalRoot = root;
+    cost.set(root.id, 0);
+    // 2. least-cost path to that root (Dijkstra over this component)
+    const todo = new Set(comp);
+    while (todo.size) {
+      let cur = null;
+      for (const id of todo) if (cur === null || cost.get(id) < cost.get(cur)) cur = id;
+      todo.delete(cur);
+      if (cost.get(cur) === Infinity) break;
+      for (const l of adj.get(cur) || []) {
+        const far = l.aId === cur ? l.bId : l.aId;
+        const farPort = l.aId === cur ? l.bPort : l.aPort;
+        if (!todo.has(far)) continue;
+        const nc = cost.get(cur) + l.cost;
+        const better = nc < cost.get(far) ||
+          (nc === cost.get(far) && via.get(far) &&
+            bridgeIdKey(deviceById(cur)) < bridgeIdKey(deviceById(via.get(far).peerId)));
+        if (better) { cost.set(far, nc); via.set(far, { link: l, port: farPort, peerId: cur }); }
+      }
+    }
+  }
+  // 3. root port on every non-root bridge
+  for (const [devId, v] of via) roles.set(`${devId}:${v.port}`, 'root');
+  // 4. designated port per segment: the end closer to its root (tie -> lower BID)
+  for (const l of links) {
+    const ca = cost.get(l.aId), cb = cost.get(l.bId);
+    let desig;
+    if (ca !== cb) desig = ca < cb ? 'a' : 'b';
+    else desig = bridgeIdKey(deviceById(l.aId)) < bridgeIdKey(deviceById(l.bId)) ? 'a' : 'b';
+    const dKey = desig === 'a' ? `${l.aId}:${l.aPort}` : `${l.bId}:${l.bPort}`;
+    const oKey = desig === 'a' ? `${l.bId}:${l.bPort}` : `${l.aId}:${l.aPort}`;
+    if (roles.get(dKey) !== 'root') roles.set(dKey, 'designated');
+    // 5. anything neither root nor designated blocks
+    if (!roles.has(oKey)) roles.set(oKey, 'blocking');
+  }
+  _stp = { rootId: globalRoot && globalRoot.id, roles, cost, links };
+  return _stp;
+}
+function stpRole(devId, port) { return stpState().roles.get(`${devId}:${port}`) || null; }
+function stpBlocked(devId, port) { return stpRole(devId, port) === 'blocking'; }
 
 // Layer-2 reachable? Plus the reason it isn't, discovered by relaxing rules.
 function l2Reachable(a, b) {
@@ -9386,8 +9530,10 @@ function updateHover(cx, cy) {
     const face = dev && DEVICE_TYPES[dev.type].passthrough
       ? (side === REAR ? ' · rear punchdown' : ' · front') : '';
     const spec = portSpecLabel(portHit.object.userData);
+    const stpr = stpRole(deviceId, port);
     let txt = `${dev ? dev.name : '?'}${dev && dev.ip ? ' (' + dev.ip + ')' : ''} · ${portLabel(dev, port)}${face}`
       + (spec ? ` · ${spec}` : '')
+      + (stpr ? ` · STP ${stpr}` : '')
       + (role !== 'LAN' && role !== 'PWR' ? ` (${role})` : '')
       + (pcfg && pcfg.vlan ? ` · VLAN ${pcfg.vlan}` : '')
       + (pcfg && pcfg.label ? ` · ${pcfg.label}` : '');
@@ -11956,6 +12102,55 @@ function runDhcp() {
   aiPrint(html);
 }
 document.getElementById('sim-dhcp').onclick = runDhcp;
+
+function runStp() {
+  flushL2Tables();
+  const st = stpState();
+  const switches = state.devices.filter(d => isPlaced(d) && netClass(d) === 'switch');
+  if (switches.length < 2) { aiPrint('<p>Spanning tree needs at least two switches.</p>'); return; }
+  if (!st.links || !st.links.length) {
+    aiPrint('<p>No switch-to-switch links — nothing for spanning tree to do. ' +
+            'Add a redundant link between two switches to see a port block.</p>');
+    return;
+  }
+  // group by component root so isolated islands read as separate trees
+  const byRoot = new Map();
+  for (const d of switches) {
+    let r = d.id, guard = 0;
+    // walk to the root of this device's tree
+    while (st.cost.get(r) > 0 && guard++ < 64) {
+      const k = [...st.roles].find(([kk, v]) => v === 'root' && kk.startsWith(r + ':'));
+      if (!k) break;
+      const link = st.links.find(l => (l.aId === r && String(l.aPort) === k[0].split(':')[1]) ||
+                                      (l.bId === r && String(l.bPort) === k[0].split(':')[1]));
+      if (!link) break;
+      r = link.aId === r ? link.bId : link.aId;
+    }
+    if (!byRoot.has(r)) byRoot.set(r, []);
+    byRoot.get(r).push(d);
+  }
+  let html = '';
+  for (const [rootId, members] of byRoot) {
+    const root = deviceById(rootId);
+    html += `<h4>Spanning tree · root ${root ? root.name : '?'}</h4>` +
+      `<p class="ai-meta">bridge ID ${bridgePriority(root)}.${deviceMac(root)} · ` +
+      `802.1D-2004 costs (1G = 20000)</p><table class="sim-table">` +
+      `<tr><th>Switch</th><th>Cost to root</th><th>Port roles</th></tr>`;
+    for (const d of members.sort((x, y) => st.cost.get(x.id) - st.cost.get(y.id))) {
+      const roles = [...st.roles].filter(([k]) => k.startsWith(d.id + ':'))
+        .map(([k, v]) => `${k.split(':')[1]}=${v === 'blocking' ? '<b class="ai-bad">block</b>' : v}`).join(', ');
+      html += `<tr><td>${d.name}${d.id === rootId ? ' <b>(root)</b>' : ''}</td>` +
+        `<td>${st.cost.get(d.id) === 0 ? '0' : (st.cost.get(d.id) || '—')}</td><td>${roles || '—'}</td></tr>`;
+    }
+    html += '</table>';
+  }
+  const blocked = [...st.roles].filter(([, v]) => v === 'blocking').length;
+  html += blocked
+    ? `<p class="ai-meta">${blocked} port${blocked === 1 ? '' : 's'} blocking — those links are up but not forwarding (shown amber).</p>`
+    : `<p class="ai-meta">No blocked ports — the topology has no loop.</p>`;
+  aiPrint(html);
+}
+document.getElementById('sim-stp').onclick = runStp;
 
 function autoDesign() {
   if (!state.walls.length) { aiPrint('<p>Draw the building outline first (Wall tool) — the designer works from your layout.</p>'); return; }
