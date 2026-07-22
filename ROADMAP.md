@@ -266,6 +266,56 @@ procedural PBR surfaces.
 Next: real product models (GLTF) instead of primitives, better materials, baked
 or screen-space GI, richer furniture/environment, texture detail.
 
+## Known shortcuts — FIX THESE, they are simulation errors
+
+Owner standard: "literally zero shortcuts, everything needs to be true to life
+100% with not a single thing left to the imagination, 1:1. Corner cutting
+results in an inaccurate simulation."
+
+Audited honestly after being caught shipping "a cable reaching the Internet node
+means internet access" (fixed in v0.19.1). These are the remaining known
+divergences from reality. Each is a defect, not a backlog nicety. Fix in roughly
+this order — the first one is foundational and several others depend on it.
+
+1. **Routers have one `ip` field, not per-interface addresses.** Real routers
+   address every interface separately, and that is what makes a default gateway,
+   inter-VLAN routing (SVIs), and NAT inside/outside meaningful. Everything below
+   is compromised until this is fixed. Needs `portCfg[port].ip` on routers, SVIs
+   per VLAN, and hostIp/gateway logic reading them.
+2. **`netClass()` guesses device role from port count** (>=8 ports = switch).
+   Role must come from the catalog entry, not a heuristic. A 5-port switch or a
+   multi-NIC server is currently misclassified.
+3. **DHCP serves one pool per device.** Real gateways serve a scope per
+   subnet/VLAN, with lease time, reservations, and options (gateway, DNS).
+4. **No DHCP lease lifecycle** — no lease time, renewal, or expiry.
+5. **ACLs match addresses only.** Real ACLs match protocol and ports
+   (`permit tcp any host x eq 80`), established, ICMP types. Named ACLs are
+   currently treated as extended rather than having their own syntax.
+6. **NAT has no translation table and no PAT.** Real NAT tracks
+   inside-local/inside-global/outside-local/outside-global per flow and
+   overloads many inside hosts onto one public address by port. Also missing:
+   static NAT, port forwarding.
+7. **STP converges instantly with no port states.** Real 802.1D moves
+   blocking -> listening -> learning -> forwarding on timers (hello 2s,
+   forward delay 15s, max age 20s), has PortFast/edge ports, and elects on
+   BPDUs. Also missing: RSTP/PVST+, which is what Cisco actually runs.
+8. **MAC tables never age.** Real default aging is 300 s.
+9. **No routing protocols and no routing table.** Static routes, connected
+   routes, OSPF/EIGRP, administrative distance, longest-prefix match.
+10. **Hosts assume a single NIC on port 1** (`hostVlan`, `hostPort`).
+11. **No VLAN database.** VLANs exist implicitly via port config; there is no
+    `vlan 20 / name SALES`, no trunk native VLAN, no allowed-list pruning,
+    no VTP.
+12. **Link speed/duplex is never negotiated** — a 1G port cabled to a 100M port
+    should train to 100M and both ends should report it.
+13. **Cable length affects nothing but a warning.** Real copper past 100 m
+    fails; the sim should mark the link down, not just flag it.
+
+Rule going forward: when a mechanism is modelled, model the whole mechanism. If
+it cannot be finished now, it does not ship as a partial — it stays out and
+stays on this list. A half-modelled mechanism silently teaches the user
+something false, which is worse than an absent feature.
+
 ## Traps already hit once (don't repeat)
 
 - `THREE.Object3D.traverse()` visits everything and the LAST matching mesh
