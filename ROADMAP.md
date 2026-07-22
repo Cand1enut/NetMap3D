@@ -501,6 +501,59 @@ requests. Once a server exists it can proxy that, so live pricing and
 server-side config push become possible. Do not design item 6 in a way that
 makes that impossible later, and do not depend on it before the backend is real.
 
+## Packet Tracer parity is PRIORITY 2 and is not yet close. Read this first.
+
+Owner, repeatedly and emphatically: the Packet Tracer functionality must be 1:1.
+Everything in the UX/pricing/export/cloud sections above SERVES this; none of it
+outranks it. If a session has to choose, protocol fidelity wins.
+
+**The honest gap, stated plainly: NetMap3D has a verdict engine, not a packet
+engine.** `pingHosts()` answers "can A reach B, and if not, why" by walking the
+topology and returning a conclusion. That is genuinely useful and the reasons it
+gives are accurate. But it is not what Packet Tracer is. Packet Tracer's
+defining feature is a **PDU you can watch traverse the network hop by hop, pause,
+step, and open** — seeing the Ethernet header, the IP header, the TCP/UDP
+header, what each device did with the frame at each layer, and why it forwarded,
+flooded, or dropped it. We have none of that. The animated packets on the cables
+are cosmetic; they carry nothing.
+
+Closing this is the largest remaining piece of work in the project and it must
+be specced in full before a line is written.
+
+**The PDU engine — what 1:1 requires:**
+- A real PDU object with layered headers (L2 frame, L3 packet, L4 segment),
+  each field populated from actual device state, not decorative.
+- Simulation mode vs realtime mode, as distinct modes.
+- Step / play / pause / back, with an event queue — one event per device
+  processing one PDU.
+- Click any in-flight PDU and read every layer, inbound and outbound, plus the
+  device's decision and the table entry that drove it ("flooded: no MAC entry
+  for target in VLAN 20", "routed via 10.0.0.0/8 next-hop 10.0.0.2, AD 1").
+- Protocol filter, so you can watch only ARP, or only DHCP.
+- ARP resolution as observable exchanges, not an assumption.
+- Deterministic ordering — see the collaboration section; no random timers.
+
+**Protocols still missing for parity**, beyond the five open audit items (NAT,
+STP port states/timers/RSTP/PVST+, routing tables and protocols, speed/duplex
+negotiation, multi-NIC hosts): DNS, HTTP, the TCP three-way handshake and
+teardown, EtherChannel/LACP, IPv6, and VTP. Each gets a full spec before it is
+started, same rule as everything else.
+
+**Challenges / practice mode — priority 3.** Packet Tracer's Activity Wizard is
+the model: an authored scenario ships with an initial topology, an instructions
+pane, a locked answer state, and automatic grading that reports a completion
+percentage and which specific checks passed. Requirements:
+- Scenario file = initial state + task list + grading rules, authorable in-app.
+- Grading runs against the live model — "VLAN 20 exists on SW1", "PC1 has a
+  DHCP lease from the correct scope", "PC1 can reach SRV1 on tcp/80 but not
+  ICMP" — evaluated by the same engine that runs the simulation, never by
+  string-matching a config.
+- Per-check feedback, so a failed activity teaches rather than just scoring.
+- Progressive hints, and a reset-to-initial.
+- Must survive the physical layer being wrong too: a challenge can legitimately
+  require finding an over-length run or a cable in the wrong patch port, which
+  is something Packet Tracer cannot even express and we can.
+
 ## Definition of done — the data centre build
 
 Owner-set acceptance test for the whole simulation: **build an entire data
