@@ -209,11 +209,35 @@ Object.assign(DEVICE_TYPES, BRAND_PACK);
 // The public Internet, as a placeable node. A gateway's WAN port cables to it;
 // everything behind that gateway is then NATed out. Modelled as a field device
 // so it drops anywhere in the scene.
+// The service-provider side of a building. A circuit is not "internet because a
+// cable reaches a cloud" — it is a provisioned service that lands on a demarc,
+// gets terminated by provider equipment (ONT for fibre, modem for cable/DSL),
+// and only then hands Ethernet to the customer router's WAN port. Each link in
+// that chain can be missing on a real job, so each is modelled separately.
 const WAN_PACK = {
   internet: {
     label: 'Internet', short: 'WAN', uh: 0, ports: 1, rows: 1, depth: 0,
     color: 0x2f6fdb, field: true, mounts: ['desk'], shape: 'cloud',
     isInternet: true, cat: 'WAN'
+  },
+  // Where the provider's responsibility ends and the customer's begins. The
+  // service drop from the street lands here.
+  demarc: {
+    label: 'Demarc / NID', short: 'Demarc', uh: 0, ports: 2, rows: 1, depth: 0,
+    color: 0x8a9099, field: true, mounts: ['wall'], shape: 'box',
+    isDemarc: true, cat: 'WAN'
+  },
+  // Fibre: the ONT terminates the optical service and outputs Ethernet.
+  ont: {
+    label: 'Fiber ONT', short: 'ONT', uh: 0, ports: 2, rows: 1, depth: 0,
+    color: 0xe8ebef, field: true, mounts: ['wall', 'desk'], shape: 'box',
+    isCpeTerm: true, service: 'fiber', cat: 'WAN'
+  },
+  // Coax: DOCSIS modem. Same job, different medium.
+  modem: {
+    label: 'Cable modem (DOCSIS)', short: 'Modem', uh: 0, ports: 2, rows: 1, depth: 0,
+    color: 0x22262c, field: true, mounts: ['desk', 'wall'], shape: 'deskbox',
+    isCpeTerm: true, service: 'cable', cat: 'WAN'
   }
 };
 Object.assign(DEVICE_TYPES, WAN_PACK);
@@ -3421,50 +3445,113 @@ function isPrivateIp(ipInt) {
 function isInternetNode(dev) { return !!(dev && DEVICE_TYPES[dev.type] && DEVICE_TYPES[dev.type].isInternet); }
 function internetNodes() { return state.devices.filter(d => isPlaced(d) && isInternetNode(d)); }
 
-// A gateway performs NAT for the inside network when one of its WAN ports is
-// cabled toward the Internet. Returns the internet node it reaches, or null.
-function natUplink(router) {
-  const def = DEVICE_TYPES[router.type];
+function isDemarc(d) { return !!(d && DEVICE_TYPES[d.type] && DEVICE_TYPES[d.type].isDemarc); }
+function isCpeTerm(d) { return !!(d && DEVICE_TYPES[d.type] && DEVICE_TYPES[d.type].isCpeTerm); }
+
+// Everything cabled to a given device, excluding power.
+function dataNeighbours(dev) {
+  const out = [];
   for (const c of state.cables) {
-    const mine = c.a.deviceId === router.id ? c.a : (c.b.deviceId === router.id ? c.b : null);
-    if (!mine) continue;
-    if (mine.port === 'PWR') continue;
+    const mine = c.a.deviceId === dev.id ? c.a : (c.b.deviceId === dev.id ? c.b : null);
+    if (!mine || mine.port === 'PWR') continue;
     const far = mine === c.a ? c.b : c.a;
     const fd = deviceById(far.deviceId);
-    if (isInternetNode(fd)) return { net: fd, port: mine.port, role: portRole(def, mine.port) };
+    if (fd) out.push({ dev: fd, myPort: mine.port, farPort: far.port });
   }
-  return null;
+  return out;
+}
+
+// A provisioned circuit is what makes a WAN port live. On a real job the chain
+// is: ISP service -> demarc/NID -> provider terminating equipment (ONT for
+// fibre, DOCSIS modem for coax) -> Ethernet handoff -> customer router WAN.
+// Every one of those can be missing or unprovisioned, so each is checked and
+// named separately rather than collapsed into "a cable reaches the cloud".
+//
+// The circuit itself lives on the terminating device: `dev.circuit = { active,
+// provider, wanIp }`. No circuit means the modem/ONT is installed but the
+// service was never turned up — an extremely common real-world state, and the
+// one that makes a tech drive back out to site.
+function circuitOf(dev) {
+  const c = dev && dev.circuit;
+  if (!c) return null;
+  return { active: c.active !== false, provider: c.provider || 'ISP', wanIp: c.wanIp || null };
+}
+
+// Walk outward from a router's WAN port toward the Internet, reporting the
+// first thing that's missing. Returns { ok, net, port, role, term, circuit } or
+// { ok:false, reason }.
+function wanUplink(router) {
+  const def = DEVICE_TYPES[router.type];
+  const wanPorts = dataNeighbours(router).filter(n => portRole(def, n.myPort) === 'WAN');
+  const anyPorts = wanPorts.length ? wanPorts : dataNeighbours(router);
+  if (!anyPorts.length) return { ok: false, reason: `${router.name} has nothing cabled to a WAN port` };
+
+  for (const first of anyPorts) {
+    // walk the provider chain, at most a few hops: demarc -> term -> internet
+    let cur = first.dev, term = null, hops = [], guard = 0;
+    while (cur && guard++ < 6) {
+      hops.push(cur);
+      if (isInternetNode(cur)) {
+        if (!term) {
+          // reached the Internet without passing through provider terminating
+          // equipment — name whichever of the two situations it actually is
+          const viaDemarc = hops.some(isDemarc);
+          return { ok: false, reason: viaDemarc
+            ? `Service reaches the demarc but nothing terminates it — add an ONT or modem between the demarc and ${router.name}`
+            : `${router.name} port ${first.myPort} is cabled straight to the Internet with no demarc or terminating equipment — a WAN port needs a provider handoff, not a direct link` };
+        }
+        const circ = circuitOf(term);
+        if (!circ) return { ok: false, reason: `${term.name} is installed but has no provisioned circuit — the service was never turned up` };
+        if (!circ.active) return { ok: false, reason: `${term.name}: circuit from ${circ.provider} is down` };
+        return {
+          ok: true, net: cur, port: first.myPort, role: portRole(def, first.myPort),
+          term, circuit: circ, hops
+        };
+      }
+      if (isCpeTerm(cur)) term = cur;
+      // step to the next device away from the router
+      const nxt = dataNeighbours(cur).find(n => n.dev.id !== router.id && !hops.some(h => h.id === n.dev.id));
+      cur = nxt ? nxt.dev : null;
+    }
+    // chain ended without reaching the Internet — say where it stopped
+    const last = hops[hops.length - 1];
+    if (last && isCpeTerm(last)) {
+      const circ = circuitOf(last);
+      if (!circ) return { ok: false, reason: `${last.name} has no provisioned circuit — no signal from the ISP` };
+      return { ok: false, reason: `${last.name} is provisioned but nothing links it onward to the Internet` };
+    }
+    if (last && isDemarc(last)) return { ok: false, reason: `Service reaches ${last.name} but there's no ONT or modem to terminate it` };
+  }
+  return { ok: false, reason: `${router.name}'s WAN port leads nowhere — no provider equipment on the far end` };
 }
 
 // Can this host reach the public Internet, and by what path?
-// Mirrors the real requirement chain: a gateway on my segment, that gateway
-// having a WAN uplink, and translation if my address is RFC 1918.
 function pingInternet(host) {
   const ip = hostIp(host);
   if (!ip) return { ok: false, reason: `${host.name} has no valid IP` };
-  const nets = internetNodes();
-  if (!nets.length) return { ok: false, reason: 'No Internet node placed — add one from the WAN category and cable a gateway WAN port to it' };
+  if (!internetNodes().length) return { ok: false, reason: 'No Internet node placed — add one from the WAN category, plus an ONT or modem and a demarc' };
   const walk = l2Walk(host, { vlan: hostVlan(host) });
   if (!walk.routers.size) return { ok: false, reason: `${host.name}'s subnet ${subnetLabel(ip)} has no router / default gateway reachable` };
+
+  let lastReason = null;
   for (const rid of walk.routers.keys()) {
     const r = deviceById(rid);
-    const up = natUplink(r);
-    if (!up) continue;
-    // ACLs still apply on the way out
+    const up = wanUplink(r);
+    if (!up.ok) { lastReason = up.reason; continue; }
     const acl = aclCheck(r, { in: walk.routers.get(rid).port, out: up.port }, ip.int, 0);
     if (acl.blocked) return { ok: false, reason: acl.reason, acl };
     const priv = isPrivateIp(ip.int);
+    const wanIp = up.circuit.wanIp;
     return {
-      ok: true, mode: 'nat', hops: [host.id, rid, up.net.id],
+      ok: true, mode: 'nat',
+      hops: [host.id, rid, ...up.hops.map(h => h.id)],
       translated: priv,
       detail: priv
-        ? `${host.name} ${ipStr(ip.int)} (RFC 1918) NATed by ${r.name} out ${up.role || 'WAN'} port ${up.port}`
-        : `${host.name} ${ipStr(ip.int)} is publicly routable — forwarded by ${r.name}, no translation needed`
+        ? `${host.name} ${ipStr(ip.int)} (RFC 1918) NATed by ${r.name} to ${wanIp || 'the WAN address'} — ${up.circuit.provider} circuit via ${up.term.name}`
+        : `${host.name} ${ipStr(ip.int)} is publicly routable — forwarded by ${r.name} over the ${up.circuit.provider} circuit, no translation`
     };
   }
-  // a gateway exists but nothing links it to the Internet
-  const names = [...walk.routers.keys()].map(id => deviceById(id).name).join(', ');
-  return { ok: false, reason: `${names} has no WAN uplink to the Internet — cable a WAN port to the Internet node` };
+  return { ok: false, reason: lastReason || 'no gateway has a working WAN circuit' };
 }
 
 //////////////////// Access control lists ////////////////////
@@ -5019,6 +5106,40 @@ function hideProps() { propsEl.classList.add('hidden'); selected = null; clearCa
 
 function row(k, v) { return `<div class="row"><span class="k">${k}</span><span>${v}</span></div>`; }
 
+// The ISP circuit terminating on this ONT / modem. Installed hardware with no
+// provisioned service is a real and common state, so it's the default: you have
+// to turn the circuit up, exactly like waiting on the carrier.
+function circuitPropsHtml(dev) {
+  if (!isCpeTerm(dev)) return '';
+  const c = dev.circuit || {};
+  const on = c.active !== false && !!dev.circuit;
+  return `
+    <div class="row" style="margin-top:10px"><span class="k">ISP circuit</span>
+      <input type="checkbox" id="dev-circ-on" ${on ? 'checked' : ''}></div>
+    <div id="dev-circ-cfg" style="${on ? '' : 'display:none'}">
+      <div class="row"><span class="k">Provider</span>
+        <input type="text" id="dev-circ-isp" style="width:118px" value="${c.provider || ''}" placeholder="Comcast"></div>
+      <div class="row"><span class="k">WAN address</span>
+        <input type="text" id="dev-circ-ip" style="width:118px" value="${c.wanIp || ''}" placeholder="203.0.113.10"></div>
+    </div>
+    ${on ? '' : '<p class="cbl-edit-hint">Hardware installed, service not turned up — the WAN port stays dark.</p>'}`;
+}
+
+function wireCircuitProps(dev) {
+  const cb = document.getElementById('dev-circ-on');
+  if (!cb) return;
+  const cfg = document.getElementById('dev-circ-cfg');
+  const isp = document.getElementById('dev-circ-isp');
+  const ip = document.getElementById('dev-circ-ip');
+  const save = () => {
+    dev.circuit = cb.checked
+      ? { active: true, provider: (isp.value || '').trim() || 'ISP', wanIp: (ip.value || '').trim() || null }
+      : null;
+    cfg.style.display = cb.checked ? '' : 'none';
+  };
+  cb.onchange = save; isp.onchange = save; ip.onchange = save;
+}
+
 // ACLs, written in the device's own syntax. Applying one to a port + direction
 // mirrors "ip access-group <n> in|out" on a real interface.
 function aclPropsHtml(dev) {
@@ -5169,6 +5290,7 @@ function showDeviceProps(id) {
     <div class="row" style="margin-top:6px"><span class="k">Notes</span></div>
     <input type="text" id="dev-notes" placeholder="VLAN, location, model…" value="${dev.notes || ''}">
     ${dhcpPropsHtml(dev)}
+    ${circuitPropsHtml(dev)}
     ${aclPropsHtml(dev)}
     ${l2TablesHtml(dev)}
     ${!isPlaced(dev) ? '<button id="dev-place">Place in 3D map</button>' : ''}
@@ -5182,6 +5304,7 @@ function showDeviceProps(id) {
   document.getElementById('dev-ip').onchange = e => { dev.ip = e.target.value.trim(); };
   document.getElementById('dev-notes').onchange = e => { dev.notes = e.target.value.trim(); };
   wireDhcpProps(dev);
+  wireCircuitProps(dev);
   wireAclProps(dev);
   const placeBtn = document.getElementById('dev-place');
   if (placeBtn) placeBtn.onclick = () => {
