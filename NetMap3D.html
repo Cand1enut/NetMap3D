@@ -8458,11 +8458,39 @@ function orthLegs(p0, p1) {
   return out;
 }
 
-// Real rack dressing: leave the port, run horizontally to a vertical manager (or
-// the nearest side channel), run vertically in that column, then break out
-// horizontally into the destination port. Out–across–down–across–in, all 90s.
-// This is the pattern every tidy rack photo shows, and it's why runs shouldn't
-// cut diagonally across the faceplates.
+// How far a run travels vertically before it belongs in a vertical manager.
+// Below this it is dressed on the face, because that is what installers do: a
+// 48-port switch sandwiched between two 24-port panels is the standard layout
+// precisely because every jumper is a short straight drop. Sending a 1U hop out
+// to a side channel and back turns a 4" jumper into a 4' one.
+const RACK_FACE_MAX_DY = 6 * U;          // 6U
+
+// The horizontal cable manager sitting between two heights in a rack, if any.
+// A run passing one is dressed into it — that is the whole reason it is there.
+function hcmBetweenY(rackId, yA, yB) {
+  const lo = Math.min(yA, yB), hi = Math.max(yA, yB), mid = (lo + hi) / 2;
+  let best = null;
+  for (const d of state.devices) {
+    if (d.rackId !== rackId) continue;
+    const def = DEVICE_TYPES[d.type];
+    if (!def.manager || def.vertical) continue;
+    const cy = RACK_BASE + (d.u - 1) * U + def.uh * U / 2;
+    if (cy <= lo || cy >= hi) continue;
+    if (best === null || Math.abs(cy - mid) < Math.abs(best - mid)) best = cy;
+  }
+  return best;
+}
+
+// Real rack dressing, in two regimes because real racks have two.
+//
+// Short hop (within RACK_FACE_MAX_DY): stay on the face. Drop off the port, run
+// across in the gap between the two devices — through a horizontal manager if
+// one is there — then drop into the destination port. Out–down–across–down–in.
+//
+// Long hop: out to a vertical manager (or the nearest side channel), down that
+// column, then break out horizontally into the destination port.
+//
+// Either way every move is a 90, and nothing cuts diagonally across a faceplate.
 function rackDressRoute(cable, a, b) {
   const da = deviceById(cable.a.deviceId), db = deviceById(cable.b.deviceId);
   if (!da || !db || !da.rackId || da.rackId !== db.rackId) return null;
@@ -8472,10 +8500,24 @@ function rackDressRoute(cable, a, b) {
   const toLocal = v => rg.worldToLocal(v.clone());
   const toWorld = v => rg.localToWorld(v.clone());
   const la = toLocal(a.pos), lb = toLocal(b.pos);
-  if (Math.abs(la.y - lb.y) < 1.2) return null;   // same U — a straight pull is right
+  const dy = Math.abs(la.y - lb.y);
+  if (dy < 1.2) return null;                      // same U — a straight pull is right
   const lead = CONN_LEN + 0.7;
   const lan = toLocal(a.pos.clone().addScaledVector(a.normal, lead));
   const lbn = toLocal(b.pos.clone().addScaledVector(b.normal, lead));
+  const z = Math.max(lan.z, lbn.z);               // dress just clear of the faceplates
+
+  if (dy <= RACK_FACE_MAX_DY) {
+    // Run across at the manager if there is one, otherwise midway between the
+    // two ports so the horizontal leg sits in the gap rather than across either
+    // faceplate. An empty list would mean "no dressing at all", so this always
+    // returns its two points.
+    const runY = hcmBetweenY(da.rackId, lan.y, lbn.y) ?? (lan.y + lbn.y) / 2;
+    return [
+      toWorld(new THREE.Vector3(lan.x, runY, z)),
+      toWorld(new THREE.Vector3(lbn.x, runY, z))
+    ];
+  }
   // dress column: a real vertical manager if the rack has one, else nearest side
   let dressX = null;
   for (const d of state.devices) {
@@ -8484,7 +8526,6 @@ function rackDressRoute(cable, a, b) {
     if (dressX === null || Math.abs(x - la.x) < Math.abs(dressX - la.x)) dressX = x;
   }
   if (dressX === null) dressX = (la.x + lb.x) / 2 >= 0 ? RACK_W / 2 + 1.6 : -(RACK_W / 2 + 1.6);
-  const z = Math.max(lan.z, lbn.z);               // dress just clear of the faceplates
   return [
     toWorld(new THREE.Vector3(dressX, lan.y, z)),
     toWorld(new THREE.Vector3(dressX, lbn.y, z))
