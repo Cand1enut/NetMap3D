@@ -24,9 +24,16 @@ GitHub).
 3. Everything must keep working as a double-click file. No dependency that
    adds an install step for end users. (Engine question was asked and
    answered: stay on three.js; upgrade its version, don't migrate engines.)
-4. Accuracy over decoration. Counts/speeds/PoE/fill limits come from published
-   specs with sources recorded (`SPEC_SOURCES`); never invent hardware detail.
-   If a spec can't be verified, say so in a comment instead of guessing.
+4. **Never guess. Research first.** (Owner, verbatim: "don't guess on ANYTHING.")
+   Every dimension, port count, speed, PoE class, fill limit, code depth, bend
+   radius, spacing and command syntax must come from a published source, and the
+   source goes in the code — `SPEC_SOURCES` for hardware, an inline comment with
+   the standard cited (NEC 300.5, TIA-568, IRC R311.7, NEC Ch.9 Table 4) for
+   everything else. This has already caught real errors: EMT vs RMC inside
+   diameters, and the Catalyst 9200L-24P-**4G** uplink count.
+   If something genuinely can't be verified: leave it out, or implement it and
+   mark it `// UNVERIFIED:` with what would confirm it — never quietly guess and
+   never present an assumption as fact to the owner.
 5. Write like a person. Short sentences. No marketing voice, no AI filler —
    the owner has called this out once already.
 6. When the owner reports a bug, find the root cause. The report "can't
