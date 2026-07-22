@@ -580,6 +580,61 @@ If any part of that build reveals something the simulation gets wrong, that is a
 defect to fix, not a limitation to document. The build is not "done" until it
 runs clean end to end.
 
+### What a REAL data centre contains that we do not model at all
+
+Owner: "build a data center or any network setup and configure and manage it
+EXACTLY how you would in real life down to the most minute detail — it needs to
+look the same, function the same, everything."
+
+Making that measurable instead of a slogan. Honest assessment of where the app
+is: it is a strong **structured-cabling and LAN** simulator attached to a real
+building. A data centre is that plus several mechanisms we have not started.
+Each is a separate spec-then-build, same rule as everything else.
+
+**Power chain — entirely absent, and it is half of a data centre.**
+Real: utility → ATS → generator → UPS → PDU → rack PDU → device, with A and B
+sides that are genuinely independent. Dual-corded gear takes one feed from each.
+Needed: per-circuit load in amps, breaker sizing with the NEC 80% continuous
+rule, single vs three-phase, real connector types (C13/C14, C19/C20, L6-30,
+NEMA 5-15), rack PDU outlet maps, UPS runtime at a given load, and the failure
+test that matters — kill the A feed and see exactly what stays up. Today `PWR`
+is a cable to a UPS and nothing computes.
+
+**Cooling and thermal.** BTU/heat load per rack derived from device draw,
+hot/cold aisle orientation, containment, CRAC/CRAH units, inlet temperature,
+and a rack that exceeds its cooling budget being flagged. Rack orientation
+currently has no thermal meaning.
+
+**Fiber and optics.** SFP/SFP+/QSFP form factors, transceiver compatibility per
+switch, DAC vs AOC vs structured fiber, OM3/OM4/OS2, LC/SC/MPO connectors, MPO
+cassettes and trunks, and per-optic distance limits — a 10GBASE-SR link is
+400 m on OM4, not 100 m of copper. We model copper distance correctly and fiber
+not at all.
+
+**Redundancy beyond STP.** Switch stacking (StackWise), chassis line cards,
+redundant supervisors, MLAG/vPC/StackWise Virtual, dual-homed servers with
+bonded NICs. Modern DC fabric: spine-leaf, ECMP, VXLAN/EVPN.
+
+**Out-of-band management.** A separate management network, console servers,
+iDRAC/iLO, and the fact that OOB is how you reach a box when the production
+path is down — which is exactly the scenario a simulator should teach.
+
+**Labeling and documentation standards.** TIA-606 labeling for every cable,
+port, panel and rack; TIA-942 for the facility; TIA-607 grounding and bonding
+with rack busbars. For an install plan a technician follows, the label scheme is
+not cosmetic — it is the deliverable.
+
+**Floor loading and space.** Rack weight vs floor PSF, raised floor tiles,
+clearances, aisle widths, door swings.
+
+**Operations.** Config backup and versioning, change management, SNMP/NetFlow/
+syslog monitoring, capacity planning against port and power headroom.
+
+Nothing here is a reason to slow the Packet Tracer work — that stays priority 2.
+This exists so "1:1 data centre" is a checklist we can measure against rather
+than a feeling, and so no one later mistakes a finished LAN simulator for a
+finished data centre.
+
 ## Method: specify the whole mechanism BEFORE writing it
 
 The recurring failure in this project has not been any single shortcut — it is
