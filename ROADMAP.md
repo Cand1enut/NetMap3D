@@ -554,6 +554,25 @@ percentage and which specific checks passed. Requirements:
   require finding an over-length run or a cable in the wrong patch port, which
   is something Packet Tracer cannot even express and we can.
 
+**9. Graphics: it should look like a game about building networks.**
+Owner: as realistic as it can be made, no shortcuts to save space, up to 10 GB.
+That budget changes what is allowed — real geometry and real texture data
+instead of procedural stand-ins. Wanted: actual product models rather than
+boxes, high-resolution PBR texture sets (albedo/normal/roughness/metalness/AO),
+baked or screen-space GI, proper LODs so a 500-device room still runs, real
+label/silkscreen artwork on faceplates, and lighting that reads photographic.
+The current build is procedural-everything because it had to fit in one HTML
+file; a 10 GB budget removes that constraint, so the portable single file and
+the full-fat build become two distribution targets, not one compromise.
+
+**10. Materials: build out of real materials, 1:1.**
+Surfaces must be selectable and correct — painted drywall, exposed CMU, poured
+concrete, ceiling tile, carpet tile, VCT, raised floor, brushed aluminium,
+powder-coated steel, wood. Each carries a real PBR definition, not a colour
+swatch, so a modelled room looks like the room. Same for gear: a Cisco chassis
+and a UniFi switch have visibly different finishes. This is what lets a build
+look like its real-life counterpart rather than like a diagram.
+
 ## Definition of done — the data centre build
 
 Owner-set acceptance test for the whole simulation: **build an entire data
@@ -746,8 +765,15 @@ this order — the first one is foundational and several others depend on it.
    BPDUs. Also missing: RSTP/PVST+, which is what Cisco actually runs.
 8. ~~**MAC tables never age**~~ — FIXED v0.22.0. Entries timestamped, 300 s
    Cisco default, expired on read.
-9. **No routing protocols and no routing table.** Static routes, connected
-   routes, OSPF/EIGRP, administrative distance, longest-prefix match.
+9. ~~**No routing protocols and no routing table**~~ — PARTIALLY FIXED v0.26.0.
+   Real per-device table: connected + local (/32) routes derived from addressed
+   interfaces, configurable static routes, longest-prefix match with AD then
+   metric as tie-breakers, Cisco's AD values, `show ip route` in IOS format, and
+   an `ip route` editor. Forwarding is now a hop-by-hop table lookup instead of
+   a graph search, so a missing or wrong route fails where it really would.
+   Return-path and per-hop transit ACLs are evaluated too. STILL MISSING and
+   still on this list: OSPF, EIGRP, RIP, BGP, VRFs — dynamic routing has not
+   been started.
 10. **Hosts assume a single NIC on port 1** (`hostVlan`, `hostPort`).
 11. ~~**No VLAN database**~~ — FIXED v0.23.0. Named VLANs, VLAN 1 builtin,
     access vs trunk modes, explicit native VLAN, allowed-list pruning, and

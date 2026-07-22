@@ -3358,6 +3358,11 @@ function sameSubnet(a, b) {
   return ((a.int & m) >>> 0) === ((b.int & m) >>> 0) && a.cidr === b.cidr;
 }
 function subnetLabel(ip) { return ip ? `${ipStr(ip.network)}/${ip.cidr}` : '—'; }
+// Does a bare address fall inside an interface's subnet? Distinct from
+// sameSubnet(), which compares two prefixes and requires equal mask lengths.
+function ipInSubnet(addrInt, net) {
+  return !!net && ((addrInt & net.mask) >>> 0) === (net.network >>> 0);
+}
 
 // ---- device role in the network graph ----
 // A device's network role is DECLARED by its catalog entry, never inferred.
@@ -4400,11 +4405,12 @@ function aclCheck(router, ports, pkt) {
     const res = aclEvaluate(acl, pkt);
     if (!res.permit) {
       const what = `${pkt.proto}${pkt.dstPort ? ' port ' + pkt.dstPort : ''}${pkt.proto === 'icmp' && pkt.icmpType ? ' ' + pkt.icmpType : ''}`;
+      const where = typeof port === 'number' ? `port ${port}` : port;
       return {
         blocked: true, router, aclId: acl.id, dir, port, packet: pkt,
         reason: res.implicit
-          ? `${what} blocked by ACL ${acl.id} on ${router.name} ${dir} port ${port} — implicit deny any at the end of the list`
-          : `${what} blocked by ACL ${acl.id} on ${router.name} ${dir} port ${port} — "${aclRuleText(acl, res.rule)}"`
+          ? `${what} blocked by ACL ${acl.id} on ${router.name} ${dir} ${where} — implicit deny any at the end of the list`
+          : `${what} blocked by ACL ${acl.id} on ${router.name} ${dir} ${where} — "${aclRuleText(acl, res.rule)}"`
       };
     }
   }
@@ -4775,25 +4781,40 @@ function pingHosts(aId, bId, pkt) {
   if (gwB.error) return { ok: false, mode: 'l3', reason: gwB.error };
 
   const ifOf = (walk, rid) => { const j = walk.routers.get(rid); return j ? j.port : null; };
-  if (gwA.id === gwB.id) {
-    const g = deviceById(gwA.id);
-    const acl = aclCheck(g, { in: ifOf(l2A, gwA.id), out: ifOf(l2B, gwB.id) }, mkPkt(ipA.int, ipB.int));
+  // Forwarding is a table lookup at every hop, not a graph search for a router
+  // that happens to touch both subnets. If a transit router has no route, the
+  // packet stops there and says so — which is the real failure and the one the
+  // old graph search silently routed around.
+  const fwd = forwardPath(gwA.id, ipB.int, ifKey(gwA.iface));
+  for (const leg of fwd.legs) {
+    const r = deviceById(leg.id);
+    const acl = aclCheck(r, { in: leg.inIf, out: leg.outIf }, mkPkt(ipA.int, ipB.int));
     if (acl.blocked) return { ok: false, mode: 'l3', reason: acl.reason, acl };
-    return { ok: true, mode: 'l3', hops: [a.id, gwA.id, b.id],
-      detail: `routed by ${g.name}: ${ipStr(gwA.iface.ip.int)} (${gwA.iface.kind === 'svi' ? 'Vlan' + gwA.iface.vlan : 'port ' + gwA.iface.port})` +
-              ` → ${ipStr(gwB.iface.ip.int)} (${gwB.iface.kind === 'svi' ? 'Vlan' + gwB.iface.vlan : 'port ' + gwB.iface.port})` };
   }
-  // distinct gateways: is there a router path between them? (transit link)
-  const path = routerPath([gwA.id], [gwB.id]);
-  if (path) {
-    for (const rid of path) {
-      const r = deviceById(rid);
-      const acl = aclCheck(r, { in: ifOf(l2A, rid), out: ifOf(l2B, rid) }, mkPkt(ipA.int, ipB.int));
-      if (acl.blocked) return { ok: false, mode: 'l3', reason: acl.reason, acl };
+  if (fwd.error) return { ok: false, mode: 'l3', reason: fwd.error, hops: [a.id, ...fwd.hops] };
+  // The echo reply has to get home. Checking only the forward direction passes
+  // asymmetric routing — a route out with no route back — which is one of the
+  // most common real faults there is and exactly what a ping is used to find.
+  const rev = forwardPath(gwB.id, ipA.int, ifKey(gwB.iface));
+  if (rev.error) {
+    return { ok: false, mode: 'l3', hops: [a.id, ...fwd.hops],
+      reason: `${a.name} reaches ${b.name}, but the reply cannot get back — ${rev.error}` };
+  }
+  for (const leg of rev.legs) {                   // ACLs apply to the return path too
+    const r = deviceById(leg.id);
+    const acl = aclCheck(r, { in: leg.inIf, out: leg.outIf }, mkPkt(ipB.int, ipA.int));
+    if (acl.blocked) {
+      return { ok: false, mode: 'l3', hops: [a.id, ...fwd.hops],
+        reason: `request reached ${b.name}, but the reply was ${acl.reason}` };
     }
-    return { ok: true, mode: 'l3', hops: [a.id, ...path, b.id], detail: `routed via ${path.map(id => deviceById(id).name).join(' → ')}` };
   }
-  return { ok: false, mode: 'l3', reason: `${a.name} and ${b.name} are on different subnets and their gateways aren't connected — no route between them` };
+  const names = fwd.hops.map(id => deviceById(id).name);
+  const g0 = deviceById(fwd.hops[0]);
+  const detail = fwd.hops.length === 1
+    ? `routed by ${g0.name}: ${ipStr(gwA.iface.ip.int)} (${gwA.iface.kind === 'svi' ? 'Vlan' + gwA.iface.vlan : 'port ' + gwA.iface.port})` +
+      ` → ${ipStr(gwB.iface.ip.int)} (${gwB.iface.kind === 'svi' ? 'Vlan' + gwB.iface.vlan : 'port ' + gwB.iface.port})`
+    : `routed via ${names.join(' → ')}`;
+  return { ok: true, mode: 'l3', hops: [a.id, ...fwd.hops, b.id], detail };
 }
 
 // Shortest path between any router in set A and any in set B, over a graph where
@@ -4813,6 +4834,143 @@ function routerAdjacency() {
   }
   return adj;
 }
+//////////////////// Routing table ////////////////////
+// A router does not "find a path"; it looks up a destination in a table and
+// forwards to a next hop. Building this as a real table is what makes traceroute
+// truthful, what a PDU walk will consult hop by hop, and what makes a missing
+// static route fail the way it does on real gear instead of being routed around
+// by a graph search.
+//
+// Administrative distance is how a router picks between sources claiming the
+// same prefix — lower wins. Values are Cisco's defaults, cross-checked against
+// Cisco's own "Describe Administrative Distance" doc and two independent
+// references; they are the numbers `show ip route` prints in [AD/metric].
+const AD = { connected: 0, static: 1, eigrpSummary: 5, ebgp: 20, eigrp: 90,
+  igrp: 100, ospf: 110, isis: 115, rip: 120, eigrpExternal: 170, ibgp: 200,
+  unusable: 255 };
+const AD_CODE = { connected: 'C', local: 'L', static: 'S', ospf: 'O',
+  eigrp: 'D', rip: 'R', isis: 'i', bgp: 'B' };
+
+// Every route a device knows, newest-correct-first. Connected routes are derived
+// from addressed interfaces and cannot be configured away, exactly as on a real
+// box. Static routes come from dev.routes.
+function routingTable(dev) {
+  const out = [];
+  for (const i of deviceInterfaces(dev)) {
+    const ifName = i.kind === 'svi' ? `Vlan${i.vlan}` : `Port ${i.port}`;
+    out.push({ prefix: i.ip.network >>> 0, cidr: i.ip.cidr, mask: i.ip.mask >>> 0,
+      via: null, iface: ifName, ad: AD.connected, metric: 0, src: 'connected',
+      code: AD_CODE.connected, ifRef: i });
+    // The /32 for the router's own address — this is the "L" line on IOS 15+.
+    out.push({ prefix: i.ip.int >>> 0, cidr: 32, mask: 0xffffffff >>> 0,
+      via: null, iface: ifName, ad: AD.connected, metric: 0, src: 'local',
+      code: AD_CODE.local, ifRef: i, local: true });
+  }
+  for (const r of dev.routes || []) {
+    const dst = parseIp(r.prefix);
+    if (!dst) continue;
+    const nh = r.via ? parseIp(r.via) : null;
+    if (r.via && !nh) continue;
+    // A static route's outgoing interface is the one whose subnet holds the
+    // next hop — if none does, the next hop is unreachable and IOS will not
+    // install the route at all.
+    let iface = null, ifRef = null;
+    if (nh) {
+      for (const i of deviceInterfaces(dev)) {
+        // A next hop is a bare address, not a prefix — it has no mask of its
+        // own, so this is a containment test against the interface's subnet.
+        // Comparing it as a subnet fails on any link that is not a /24: a
+        // next hop of 192.168.0.2 on a /30 point-to-point parses as /24 and
+        // never matches, so the route silently never installs.
+        if (ipInSubnet(nh.int, i.ip)) { iface = i.kind === 'svi' ? `Vlan${i.vlan}` : `Port ${i.port}`; ifRef = i; break; }
+      }
+      if (!iface) continue;                       // unresolvable next hop, not installed
+    }
+    out.push({ prefix: dst.network >>> 0, cidr: dst.cidr, mask: dst.mask >>> 0,
+      via: nh ? nh.int >>> 0 : null, iface: iface || r.iface || null,
+      ad: r.ad !== undefined ? +r.ad : AD.static, metric: 0, src: 'static',
+      code: AD_CODE.static, ifRef });
+  }
+  return out;
+}
+
+// Longest prefix wins; AD breaks a tie between sources; metric breaks that.
+// Returns the winning route, or null for "no route to host".
+function lookupRoute(dev, dstInt) {
+  let best = null;
+  for (const r of routingTable(dev)) {
+    if (r.local) continue;                        // /32 local is not a forwarding entry
+    if (((dstInt & r.mask) >>> 0) !== r.prefix) continue;
+    if (!best) { best = r; continue; }
+    if (r.cidr !== best.cidr) { if (r.cidr > best.cidr) best = r; continue; }
+    if (r.ad !== best.ad) { if (r.ad < best.ad) best = r; continue; }
+    if (r.metric < best.metric) best = r;
+  }
+  return best;
+}
+
+// Forward hop by hop through real table lookups, the way a packet actually
+// crosses a network. Returns the router chain, or why it stopped.
+// An ACL can be applied to an SVI as readily as to a physical port
+// (`interface Vlan20` / `ip access-group X in`), so an interface is keyed by
+// port number when it is a routed port and `VlanN` when it is an SVI. Two
+// separate bugs came from getting this wrong: SVIs keyed as null made every ACL
+// on a routed VLAN unenforceable, and keying L3 ingress by the physical port
+// the frame arrived on missed that a routed VLAN ingresses on its SVI.
+function ifKey(ref) { return !ref ? null : (ref.kind === 'svi' ? `Vlan${ref.vlan}` : ref.port); }
+const ROUTE_MAX_HOPS = 32;                        // IP TTL sanity bound
+// `legs` carries the ingress and egress interface at every hop. ACLs are applied
+// per interface per direction, so a transit router's interfaces have to come
+// from the forwarding path itself — deriving them from the two endpoints' L2
+// segments leaves every mid-path interface invisible, and an ACL there is then
+// silently never evaluated.
+function forwardPath(startRouterId, dstInt, ingressIf) {
+  const hops = [], legs = [];
+  let cur = deviceById(startRouterId);
+  let inIf = ingressIf || null;
+  const seen = new Set();
+  const portOf = ifKey;
+  for (let i = 0; i < ROUTE_MAX_HOPS && cur; i++) {
+    hops.push(cur.id);
+    if (seen.has(cur.id)) return { hops, legs, error: `routing loop at ${cur.name}` };
+    seen.add(cur.id);
+    // Destination directly attached to this router? then it is delivered here.
+    const conn = routingTable(cur).find(r => !r.local && r.src === 'connected' &&
+      ((dstInt & r.mask) >>> 0) === r.prefix);
+    if (conn) {
+      legs.push({ id: cur.id, inIf, outIf: portOf(conn.ifRef) });
+      return { hops, legs, egress: conn };
+    }
+    const route = lookupRoute(cur, dstInt);
+    if (!route) return { hops, legs, error: `${cur.name} has no route to ${ipStr(dstInt)}` };
+    legs.push({ id: cur.id, inIf, outIf: portOf(route.ifRef) });
+    if (route.via === null) return { hops, legs, egress: route };
+    // Walk the wire to whoever owns the next-hop address.
+    const nh = deviceHolding({ int: route.via, cidr: 32, mask: 0xffffffff, network: route.via });
+    if (!nh) return { hops, legs, error: `${cur.name}: next hop ${ipStr(route.via)} for ${ipStr(route.prefix)}/${route.cidr} is not reachable` };
+    if (nh.id === cur.id) return { hops, legs, egress: route };
+    // The next router receives on whichever of its interfaces holds that link.
+    inIf = null;
+    for (const j of deviceInterfaces(nh)) if (ipInSubnet(route.via, j.ip)) { inIf = portOf(j); break; }
+    cur = nh;
+  }
+  return { hops, legs, error: 'TTL exceeded — more than 32 hops' };
+}
+
+// `show ip route`
+function showIpRoute(dev) {
+  const rows = routingTable(dev).sort((a, b) => (a.prefix >>> 0) - (b.prefix >>> 0) || a.cidr - b.cidr);
+  if (!rows.length) return `${dev.name} has no addressed interfaces — no routing table`;
+  const out = ['Codes: C - connected, L - local, S - static, O - OSPF, D - EIGRP, R - RIP', ''];
+  for (const r of rows) {
+    const dest = `${ipStr(r.prefix)}/${r.cidr}`;
+    const admin = r.src === 'connected' || r.src === 'local' ? '' : ` [${r.ad}/${r.metric}]`;
+    const via = r.via !== null ? ` via ${ipStr(r.via)},` : (r.src === 'connected' || r.src === 'local' ? ' is directly connected,' : '');
+    out.push(`${r.code.padEnd(2)}   ${dest}${admin}${via} ${r.iface || ''}`.trimEnd());
+  }
+  return out.join('\n');
+}
+
 function routerPath(fromSet, toSet) {
   const adj = routerAdjacency();
   const q = fromSet.map(id => [id]);
@@ -6091,13 +6249,53 @@ function aclPropsHtml(dev) {
       placeholder="access-list 110 deny tcp any host 10.0.10.5 eq www&#10;access-list 110 permit ip any any&#10;&#10;ip access-list extended BLOCK-CCTV&#10; 10 remark cameras must not reach servers&#10; 20 deny ip 10.0.30.0 0.0.0.255 10.0.10.0 0.0.0.255&#10; 30 permit ip any any">${esc(aclToText(dev.acls))}</textarea>
     <div id="dev-acl-err" class="ai-bad" style="font-size:11px"></div>
     <div class="row"><span class="k">Apply</span>
-      <select id="dev-acl-port" style="width:62px">${Array.from({ length: Math.min(def.ports || 0, 24) }, (_, i) =>
-        `<option value="${i + 1}">${i + 1}</option>`).join('')}</select>
+      <select id="dev-acl-port" style="width:74px">${[
+        ...deviceInterfaces(dev).filter(i => i.kind === 'svi').map(i => `<option value="Vlan${i.vlan}">Vlan${i.vlan}</option>`),
+        ...Array.from({ length: Math.min(def.ports || 0, 24) }, (_, i) => `<option value="${i + 1}">${i + 1}</option>`)
+      ].join('')}</select>
       <select id="dev-acl-dir" style="width:56px"><option value="in">in</option><option value="out">out</option></select>
       <select id="dev-acl-id" style="width:70px"><option value="">none</option>${(dev.acls || []).map(a =>
         `<option value="${a.id}">${a.id}</option>`).join('')}</select>
     </div>
     ${rows ? `<table class="sim-table"><tr><th>Interface</th><th>Dir</th><th>ACL</th></tr>${rows}</table>` : ''}`;
+}
+
+// Static routes + the resulting table. A routing table you cannot edit from the
+// app is not a feature, so this is the `ip route` half of the mechanism.
+function routePropsHtml(dev) {
+  if (!deviceInterfaces(dev).length) return '';
+  const rows = (dev.routes || []).map((r, i) =>
+    `<div class="row" data-route="${i}">
+       <input type="text" class="rt-prefix" style="width:104px" value="${esc(r.prefix || '')}" placeholder="0.0.0.0/0">
+       <input type="text" class="rt-via" style="width:96px" value="${esc(r.via || '')}" placeholder="next hop">
+       <input type="number" class="rt-ad" style="width:44px" value="${r.ad !== undefined ? r.ad : ''}" placeholder="AD">
+       <button class="rt-del" title="Remove route">×</button></div>`).join('');
+  return `
+    <div class="row" style="margin-top:10px"><span class="k">ip route</span></div>${rows}
+    <button id="rt-add" style="font-size:11px">+ static route</button>
+    <div class="row" style="margin-top:8px"><span class="k">show ip route</span></div>
+    <pre style="font-size:10.5px;white-space:pre-wrap;margin:2px 0">${esc(showIpRoute(dev))}</pre>`;
+}
+function wireRouteProps(dev) {
+  const root = propsBody;
+  const save = () => {
+    dev.routes = [...root.querySelectorAll('[data-route]')].map(el => {
+      const g = c => (el.querySelector('.' + c) || {}).value;
+      const o = { prefix: (g('rt-prefix') || '').trim(), via: (g('rt-via') || '').trim() };
+      const ad = g('rt-ad');
+      if (ad !== '' && ad !== undefined) o.ad = +ad;
+      return o;
+    }).filter(r => r.prefix);
+    flushL2Tables();
+    showDeviceProps(dev.id);
+  };
+  for (const el of root.querySelectorAll('.rt-prefix,.rt-via,.rt-ad')) el.onchange = save;
+  const add = document.getElementById('rt-add');
+  if (add) add.onclick = () => { (dev.routes ||= []).push({ prefix: '', via: '' }); showDeviceProps(dev.id); };
+  for (const b of root.querySelectorAll('.rt-del')) b.onclick = e => {
+    const i = +e.target.closest('[data-route]').dataset.route;
+    dev.routes.splice(i, 1); flushL2Tables(); showDeviceProps(dev.id);
+  };
 }
 
 function wireAclProps(dev) {
@@ -6344,6 +6542,7 @@ function showDeviceProps(id) {
     <input type="text" id="dev-notes" placeholder="VLAN, location, model…" value="${dev.notes || ''}">
     ${dhcpPropsHtml(dev)}
     ${circuitPropsHtml(dev)}
+    ${routePropsHtml(dev)}
     ${aclPropsHtml(dev)}
     ${l2TablesHtml(dev)}
     ${!isPlaced(dev) ? '<button id="dev-place">Place in 3D map</button>' : ''}
@@ -6358,6 +6557,7 @@ function showDeviceProps(id) {
   document.getElementById('dev-notes').onchange = e => { dev.notes = e.target.value.trim(); };
   wireDhcpProps(dev);
   wireCircuitProps(dev);
+  wireRouteProps(dev);
   wireAclProps(dev);
   const placeBtn = document.getElementById('dev-place');
   if (placeBtn) placeBtn.onclick = () => {
