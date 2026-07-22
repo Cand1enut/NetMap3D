@@ -410,6 +410,47 @@ Guardrails, because a generated config can black-hole a switch:
   the device's current running config when one has been imported
 - round-trip test: export a config, re-import it, and the model must be identical
 
+**8. Where no file can be loaded, emit a runbook instead.**
+For every device that cannot be preloaded (item 7), export the ordered
+instructions to configure the real thing by hand so it ends up matching
+NetMap3D. Same config model as the terminal and the file export — that is now
+three consumers of one model, and any of them rendering independently will drift.
+
+The instructions are vendor-shaped, not generic:
+- **CLI without a loadable file** — exact commands including mode transitions
+  (`configure terminal`, `interface GigabitEthernet1/0/12`, `exit`), in the
+  order they must actually be typed.
+- **GUI/controller devices (UniFi, Meraki, Omada, Instant On)** — the real
+  navigation path and field values, e.g. Settings → Networks → Create New
+  Network, VLAN ID 20. These are the devices that need this most, because they
+  are precisely the ones with no file to load.
+
+**Order is the substance of this feature, not a presentation detail.** A list of
+settings is not a runbook. The generator has to respect real dependencies:
+1. VLANs must exist before any port can be assigned to one.
+2. Uplinks/trunks before access ports — configure the edge first and you cut
+   the path you are working over.
+3. Core before edge, for the same reason, so the site-level order matters as
+   much as the per-device order.
+4. Addressing and management access before anything that depends on reaching it.
+5. DHCP scopes after the SVIs they serve exist.
+6. ACLs last. They are the most likely step to strand the operator.
+
+Lockout handling is mandatory, not a nicety: any step that changes the port,
+VLAN or address the operator is likely connected through gets called out before
+it appears, with the recovery path stated (console cable, second uplink, or
+`reload in 5` before applying and `reload cancel` after it is confirmed good).
+
+Each phase ends with a verification step and its expected output — `show vlan
+brief` listing 10, 20, 30; a link light; a successful ping — so the technician
+knows the phase took before moving on. A runbook without checkpoints just moves
+the failure further down the page.
+
+This is the feature nothing else can produce, because it can fold in the
+physical plan the app already has: "punch panel port 12 rear, patch front 12 to
+Gi1/0/12" and then "configure Gi1/0/12 as access VLAN 20" belong in the same
+numbered sequence. Output must be printable and readable on a phone in a closet.
+
 ## Definition of done — the data centre build
 
 Owner-set acceptance test for the whole simulation: **build an entire data
