@@ -292,6 +292,57 @@ If any part of that build reveals something the simulation gets wrong, that is a
 defect to fix, not a limitation to document. The build is not "done" until it
 runs clean end to end.
 
+## Method: specify the whole mechanism BEFORE writing it
+
+The recurring failure in this project has not been any single shortcut — it is
+building each mechanism to the minimum that makes the immediate feature work,
+then correcting it when the owner notices. VLANs shipped as "parse an integer
+out of port config" and only later became a VLAN database with access/trunk
+modes, native VLAN and allowed lists. That should have been the starting point,
+because that is what a VLAN *is*.
+
+Before writing any network mechanism, write its complete real model here first,
+then build to that spec. If the spec is too large for the session, the mechanism
+does not get started — a partial is what causes this.
+
+Specs for what remains, written up front:
+
+**Routing table / protocols.** Per-device table of routes, each with
+destination prefix, next-hop, outgoing interface, administrative distance and
+metric. Connected routes appear automatically for every addressed interface.
+Static routes configurable. Longest-prefix match wins; AD breaks ties between
+sources (connected 0, static 1, EIGRP 90, OSPF 110, RIP 120). A default route
+is 0.0.0.0/0. Forwarding is a table lookup, not "find a router that touches both
+subnets".
+
+**NAT.** A translation table with the four Cisco address perspectives (inside
+local, inside global, outside local, outside global) per flow. PAT overloads
+many inside hosts onto one outside address by port. Static NAT maps one to one.
+Port forwarding maps an outside port to an inside socket. Translations are
+created on the first packet and time out.
+
+**ACLs (completing).** Protocol and port matching (`permit tcp any host x eq
+80`), named lists with their own syntax and sequence numbers, `established`,
+ICMP types, remarks. Per-entry hit counters, since that is how ACLs are actually
+debugged.
+
+**STP (completing).** Port states blocking → listening → learning → forwarding
+on real timers (hello 2 s, forward delay 15 s, max age 20 s). BPDU exchange
+rather than a computed answer. PortFast/edge ports. RSTP and PVST+, since PVST+
+is what Cisco actually runs and means one tree per VLAN.
+
+**DHCP (completing).** A scope per subnet, not one pool per device. Lease time
+with renewal at T1/T2 and expiry. Reservations by MAC. Options: default gateway,
+DNS servers, domain name, TFTP. Exclusions. DHCP relay (ip helper-address) for
+subnets with no local server.
+
+**Interfaces.** Speed and duplex negotiation — a 1 G port cabled to a 100 M port
+trains to 100 M and both ends report it. Administrative state (`shutdown`)
+separate from operational state. Error counters.
+
+**Hosts.** Multiple NICs rather than an assumed port 1, each with its own
+address, VLAN and gateway.
+
 ## Known shortcuts — FIX THESE, they are simulation errors
 
 Owner standard: "literally zero shortcuts, everything needs to be true to life
