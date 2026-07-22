@@ -146,7 +146,34 @@ a cisco switch, a unifi setup would have a unifiOS simulator."
 **Decided (owner):** build them how they are in real life. If a product is
 GUI-managed, that's fine — but the interface must be *present* for every device.
 Not every vendor is CLI-managed, so a fake CLI for a GUI product would be less
-accurate, not more. Build the surface the product actually has:
+accurate, not more. Build the surface the product actually has.
+
+**These are not mockups or screenshots — they are fully functioning simulated
+environments that both work and look like the real thing.** Owner, verbatim:
+"a cisco switch should operate like the cisco cli, a unifi switch should have a
+fully functional simulated unifiOS... they are fully functioning simulated
+environments that function and look like the real thing."
+
+What that requires, concretely:
+
+- **Bidirectional.** The interface doesn't just display state, it *sets* it.
+  `switchport access vlan 20` in IOS changes the port's VLAN in `state`, which
+  changes what `pingHosts` returns, which changes the 3D view. Same for the
+  UniFi console: change a port profile in the UI and the sim reflects it.
+  Managing the whole network through these interfaces must be possible as a
+  full alternative to the app's own property panels.
+- **Stateful and authentic.** Running-config vs startup-config with unsaved
+  changes; `write memory` / `copy run start` actually persists. Mode
+  restrictions enforced (no `configure terminal` from user EXEC). Real error
+  text — IOS answers a bad command with `% Invalid input detected at '^'
+  marker.`, not a generic error.
+- **Visually faithful.** UniFi OS should look like UniFi OS: its dark console
+  chrome, device list, the port panel with its port grid and per-port profile
+  editor, clients, topology. IOS should look like a terminal with the right
+  banner, prompts and paging (`--More--`).
+- **Good enough to practise on.** Someone studying for a CCNA should be able to
+  configure a switch through the IOS CLI here and have it genuinely work — that
+  is what makes the challenges phase (item 3) worth anything.
 
 CLI-first — build a real command interpreter:
 - **Cisco IOS / IOS-XE** (Catalyst): mode hierarchy `>` user EXEC → `#` priv
