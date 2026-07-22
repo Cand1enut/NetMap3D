@@ -266,6 +266,70 @@ procedural PBR surfaces.
 Next: real product models (GLTF) instead of primitives, better materials, baked
 or screen-space GI, richer furniture/environment, texture detail.
 
+## Owner update, Jul 2026 — the app is accurate but it feels clunky
+
+Cables now route correctly (v0.25.1/.2). The owner's next pass is about how the
+thing FEELS to use. Verbatim: "the current floor system is wack", "there's other
+systems that function similarly and they all feel clunky", "the current system
+to utilize the packet tracer roadmapped system is clunky and unintuitive, it
+needs to look and feel clean and be easy to read and configure".
+
+Take that as a standing verdict on the whole interaction model, not six separate
+bugs. The pattern behind every item below is the same: the app makes you pick a
+mode from a list and then edit numbers in a side panel, when you should be able
+to point at the thing and manipulate it directly.
+
+**1. Levels must go. Replace with real building volume.**
+There is no reason for a "Level 1 / Level 2 / …" dropdown. Wanted: cut a
+basement out of the ground the way you'd cut a room, build inside it, build a
+ceiling over it, and move through the whole structure continuously — on foot or
+flying — with no level picker anywhere. Floors and ceilings become slabs you
+draw and cut openings in; a "storey" is an emergent consequence of where the
+slabs are, never a mode you are in. `LEVELS`, `activeLevel`, `setLevel()`,
+`showAllLevels` and the level `<select>` all get deleted rather than restyled.
+Stairs, drilling, raceways and device placement then work off real Y, not off a
+level index. This is the largest item here and it touches placement, picking,
+camera and save format — spec the whole thing before starting, and expect the
+save migration to be the risky part.
+
+**2. Manual cable editing must be intuitive.**
+Auto-routing will never be right 100% of the time, and when it is wrong the
+override has to feel like pulling cable, not like editing a list of waypoints.
+Draggable handles exist but are not discoverable. Wanted: grab a run anywhere
+along its length and pull it, with the segment staying orthogonal and the
+neighbours re-dressing to follow; add and remove bends by direct manipulation;
+snap to rails, ducts and other runs; visible feedback for what a drag will do
+before releasing it.
+
+**3. The 2D planner should read like a flowchart.**
+Links are drawn as bare straight lines (`moveTo`/`lineTo`, app.js ~7591–7615),
+so the plan is a diagonal cat's cradle. It should use the same orthogonal
+routing idea as the 3D view: clean right-angle runs with rounded corners,
+lanes that avoid overlapping nodes, and arrowheads/junctions that read as a
+diagram. This is the cheapest item on the list and is mostly `drawPlan()`.
+
+**4. ~~Packet flow looked like a strobe~~ — DONE v0.25.3.**
+One sphere per cable at 140 in/s. Now a steady train of evenly spaced packets at
+26 in/s with a fixed 12" world spacing, so a patch lead and a 200 ft run show
+the same density and speed. Instanced per cable, so it is still one draw call.
+
+**5. The simulation UI needs rebuilding, and switches need a real terminal.**
+The DHCP/ACL/VLAN/STP work is accurate but is driven through cramped property
+panels and a print-only output pane. It needs to look and read like a network
+tool: legible tables, obvious state, configuration that is quick to change and
+hard to get wrong.
+
+And the CLI stops being a print-out. A managed switch needs an actual terminal:
+a prompt, real mode transitions (user → enable → config → interface), command
+parsing with IOS abbreviation (`sh ru`, `int gi1/0/1`), `?` completion, error
+text that matches the real box ("% Invalid input detected at '^' marker."),
+and `show` output rendered from live engine state rather than canned strings.
+Config typed at the terminal must mutate the same model the 3D view and the
+simulation read, in both directions — that bidirectionality is the whole point
+and is the part most likely to be faked. Per the standing rule: a Cisco switch
+gets IOS, a UniFi device gets UniFi OS, and each is a working environment, not
+a skin. Do one vendor completely before starting a second.
+
 ## Definition of done — the data centre build
 
 Owner-set acceptance test for the whole simulation: **build an entire data

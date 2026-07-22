@@ -6834,7 +6834,17 @@ document.addEventListener('keyup', e => { walkKeys[e.code] = false; });
 //////////////////// Traffic simulation ////////////////////
 
 let simOn = false;
-const pulses = new Map(); // cableId -> {mesh, frac}
+// Packet flow. The old animation ran one sphere per cable at 140 in/s, which
+// read as a strobe rather than as traffic. These are tuned to look like items
+// on a conveyor belt: slow enough to follow with your eye, close enough
+// together to read as continuous.
+const PULSE_SPEED_IPS = 26;      // ~2 ft/s along the jacket
+const PULSE_SPACING_IN = 12;     // one packet per foot of cable
+const PULSE_MAX = 64;            // cap for very long runs
+const PULSE_GEO = new THREE.SphereGeometry(0.5, 10, 10);
+const _pulseM = new THREE.Matrix4();
+const _pulsePos = new THREE.Vector3();
+const pulses = new Map(); // cableId -> {mesh, frac, n, colHex}
 
 function setSim(on) {
   simOn = on;
@@ -6877,18 +6887,38 @@ function updatePulses(dt) {
       if (stale) { scene.remove(stale.mesh); pulses.delete(c.id); }
       continue;
     }
+    // Traffic reads as a conveyor: a steady train of evenly spaced packets
+    // moving at one calm speed, not a single dot strobing down the wire. Spacing
+    // is a fixed world distance, so a 3 ft patch lead and a 200 ft run show the
+    // same density and the same velocity — which is what makes the whole map
+    // look like one flowing system rather than a set of unrelated blinks.
+    const len = Math.max(c.lengthIn || 60, 12);
+    const n = Math.max(1, Math.min(PULSE_MAX, Math.round(len / PULSE_SPACING_IN)));
+    const colHex = (vlanFocus ? vlanColor(vlanFocus.vlan)
+      : new THREE.Color(c.color).lerp(new THREE.Color(0xffffff), 0.65)).getHex();
     let p = pulses.get(c.id);
+    if (p && (p.n !== n || p.colHex !== colHex)) {          // length or focus changed
+      scene.remove(p.mesh); p.mesh.geometry.dispose(); p.mesh.material.dispose();
+      pulses.delete(c.id); p = null;
+    }
     if (!p) {
-      const col = vlanFocus ? vlanColor(vlanFocus.vlan)
-        : new THREE.Color(c.color).lerp(new THREE.Color(0xffffff), 0.65);
-      const m = new THREE.Mesh(new THREE.SphereGeometry(0.55, 10, 10),
-        new THREE.MeshBasicMaterial({ color: col }));
+      const m = new THREE.InstancedMesh(PULSE_GEO,
+        new THREE.MeshBasicMaterial({ color: colHex }), n);
+      m.frustumCulled = false;
+      m.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
       scene.add(m);
-      p = { mesh: m, frac: Math.random() };
+      p = { mesh: m, frac: Math.random(), n, colHex };
       pulses.set(c.id, p);
     }
-    p.frac = (p.frac + dt * 140 / Math.max(c.lengthIn || 60, 20)) % 1;
-    p.mesh.position.copy(cm.userData.curve.getPointAt(p.frac));
+    p.frac = (p.frac + dt * PULSE_SPEED_IPS / len) % 1;
+    const curve = cm.userData.curve;
+    for (let i = 0; i < n; i++) {
+      const f = (p.frac + i / n) % 1;
+      curve.getPointAt(f, _pulsePos);
+      _pulseM.makeTranslation(_pulsePos.x, _pulsePos.y, _pulsePos.z);
+      p.mesh.setMatrixAt(i, _pulseM);
+    }
+    p.mesh.instanceMatrix.needsUpdate = true;
   }
 }
 
