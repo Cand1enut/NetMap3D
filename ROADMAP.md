@@ -383,9 +383,10 @@ this order — the first one is foundational and several others depend on it.
 9. **No routing protocols and no routing table.** Static routes, connected
    routes, OSPF/EIGRP, administrative distance, longest-prefix match.
 10. **Hosts assume a single NIC on port 1** (`hostVlan`, `hostPort`).
-11. **No VLAN database.** VLANs exist implicitly via port config; there is no
-    `vlan 20 / name SALES`, no trunk native VLAN, no allowed-list pruning,
-    no VTP.
+11. ~~**No VLAN database**~~ — FIXED v0.23.0. Named VLANs, VLAN 1 builtin,
+    access vs trunk modes, explicit native VLAN, allowed-list pruning, and
+    detection of native-VLAN mismatch and ports in undeclared VLANs. VTP still
+    absent (deliberately — it is a distinct mechanism, spec it before building).
 12. **Link speed/duplex is never negotiated** — a 1G port cabled to a 100M port
     should train to 100M and both ends should report it.
 13. ~~**Cable length affects nothing but a warning**~~ — FIXED v0.22.0. Channel

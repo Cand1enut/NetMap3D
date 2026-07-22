@@ -3064,18 +3064,70 @@ function portRole(def, port) {
 // Patch panels are true 1:1 passthroughs: front and rear share a port number.
 // A VLAN crosses a cable only when BOTH endpoint ports carry it.
 
+//////////////////// VLAN database ////////////////////
+// VLANs existed only implicitly, as numbers typed into port config. A real
+// switch holds a VLAN database: each VLAN is an object with an ID and a name,
+// it has to exist before a port can be put in it, and VLAN 1 is the default
+// that always exists and cannot be deleted.
+//
+// A port is then either:
+//   access — belongs to exactly one VLAN, frames leave untagged
+//   trunk  — carries a list of VLANs tagged, plus ONE native VLAN untagged
+// The native VLAN is the part that bites people: if two ends of a trunk
+// disagree on it, traffic silently crosses between VLANs. That mismatch is a
+// real fault and the simulation has to be able to represent it.
+const DEFAULT_VLAN = 1;
+function vlanDb(dev) {
+  const db = new Map();
+  db.set(DEFAULT_VLAN, { id: DEFAULT_VLAN, name: 'default', builtin: true });
+  for (const v of dev.vlans || []) {
+    const id = parseInt(v.id, 10);
+    if (id > 0 && id < 4095) db.set(id, { id, name: v.name || `VLAN${id}` });
+  }
+  return db;
+}
+function vlanExists(dev, id) { return vlanDb(dev).has(parseInt(id, 10)); }
+function vlanName(dev, id) { const e = vlanDb(dev).get(parseInt(id, 10)); return e ? e.name : null; }
+
+// How a port is configured, normalised. `mode` is explicit so a trunk with a
+// single allowed VLAN is still a trunk, not an access port.
+function portMode(dev, port) {
+  const cfg = (dev.portCfg && dev.portCfg[port]) || {};
+  if (cfg.mode) return cfg.mode;
+  return cfg.tagged ? 'trunk' : 'access';
+}
+// The untagged VLAN on a port: the access VLAN, or a trunk's native VLAN.
+function nativeVlanOf(dev, port) {
+  const cfg = (dev.portCfg && dev.portCfg[port]) || {};
+  if (portMode(dev, port) === 'trunk') return parseInt(cfg.native, 10) || DEFAULT_VLAN;
+  return parseInt(cfg.vlan, 10) || DEFAULT_VLAN;
+}
+// VLANs a trunk is allowed to carry tagged.
+function allowedVlans(dev, port) {
+  const cfg = (dev.portCfg && dev.portCfg[port]) || {};
+  const out = new Set();
+  for (const t of String(cfg.tagged || '').split(/[\s,]+/)) {
+    const n = parseInt(t, 10);
+    if (n) out.add(n);
+  }
+  return out;
+}
+// Two ends of a trunk disagreeing on the native VLAN — a genuine misconfig that
+// bridges two VLANs together without anyone intending it.
+function nativeVlanMismatch(cable) {
+  const da = deviceById(cable.a.deviceId), db = deviceById(cable.b.deviceId);
+  if (!da || !db) return null;
+  if (portMode(da, cable.a.port) !== 'trunk' || portMode(db, cable.b.port) !== 'trunk') return null;
+  const na = nativeVlanOf(da, cable.a.port), nb = nativeVlanOf(db, cable.b.port);
+  return na === nb ? null : { a: da, aVlan: na, b: db, bVlan: nb };
+}
+
 function carriedVlans(dev, port) {
   const def = DEVICE_TYPES[dev.type];
   if (port === 'PWR' || def.powerDevice) return new Set(); // power carries no data
-  if (def.passthrough) return 'ALL';
-  const cfg = (dev.portCfg && dev.portCfg[port]) || {};
-  const s = new Set([parseInt(cfg.vlan, 10) || 1]);
-  if (cfg.tagged) {
-    for (const t of String(cfg.tagged).split(/[\s,]+/)) {
-      const n = parseInt(t, 10);
-      if (n) s.add(n);
-    }
-  }
+  if (def.passthrough) return 'ALL';                       // copper is VLAN-blind
+  const s = new Set([nativeVlanOf(dev, port)]);            // untagged VLAN always
+  if (portMode(dev, port) === 'trunk') for (const v of allowedVlans(dev, port)) s.add(v);
   return s;
 }
 function portCarries(dev, port, v) {
@@ -3361,10 +3413,9 @@ function hostPort(dev) {
   }
   return 1;
 }
-function accessVlanOf(dev, port) {
-  const cfg = (dev.portCfg && dev.portCfg[port]) || {};
-  return parseInt(cfg.vlan, 10) || 1;
-}
+// The VLAN an untagged host on this port lands in — its access VLAN, or the
+// trunk's native VLAN if someone plugged a host into a trunk port.
+function accessVlanOf(dev, port) { return nativeVlanOf(dev, port); }
 
 // The neighbour on the far end of a jack, stepping straight through any patch
 // panels (front↔rear is one circuit) so a drop lands on the switch it patches to.
@@ -6836,6 +6887,22 @@ function analyzeMap() {
         issues.push(`VLAN mismatch on <b>${da.name}:${c.a.port} ↔ ${db.name}:${c.b.port}</b> — no shared VLAN, link is blocked.`);
     }
   }
+  // trunk native VLAN mismatch — silently bridges two VLANs together
+  for (const c of state.cables) {
+    const mm = nativeVlanMismatch(c);
+    if (mm) issues.push(`Native VLAN mismatch: <b>${mm.a.name}</b> uses VLAN ${mm.aVlan} untagged, <b>${mm.b.name}</b> uses VLAN ${mm.bVlan}. Traffic will cross between those VLANs.`);
+  }
+  // a port placed in a VLAN the device has never been told about
+  for (const d of state.devices) {
+    if (netClass(d) !== 'switch' || !d.portCfg) continue;
+    for (const [p, cfg] of Object.entries(d.portCfg)) {
+      const v = nativeVlanOf(d, isNaN(+p) ? p : +p);
+      if (!vlanExists(d, v)) issues.push(`<b>${d.name}</b> port ${p} is in VLAN ${v}, which is not in its VLAN database.`);
+      for (const t of allowedVlans(d, isNaN(+p) ? p : +p)) {
+        if (!vlanExists(d, t)) issues.push(`<b>${d.name}</b> port ${p} trunks VLAN ${t}, which is not in its VLAN database.`);
+      }
+    }
+  }
   if (!state.devices.some(d => d.type === 'ups')) notes.push('No UPS in any rack — add battery backup.');
   if (!state.devices.some(d => DEVICE_TYPES[d.type].passthrough)) notes.push('No patch panel — direct switch runs are harder to service.');
   // AP coverage vs floor area
@@ -7724,10 +7791,17 @@ function referenceSite() {
   for (const [vlan, ports] of Object.entries(VLAN_OF)) {
     for (const p of ports) setAccess(sw, p, vlan);
   }
-  // the uplink to the gateway trunks all three
-  sw.portCfg[2] = { vlan: '10', tagged: '20,30' };
+  // The VLAN database. A port cannot be put in a VLAN that does not exist, so
+  // both ends of the trunk have to know all three.
+  const VLANS = [{ id: 10, name: 'SERVERS' }, { id: 20, name: 'WIFI' }, { id: 30, name: 'CCTV' }];
+  sw.vlans = VLANS.map(v => ({ ...v }));
+  udm.vlans = VLANS.map(v => ({ ...v }));
+  // The uplink is an explicit trunk: VLAN 10 native (untagged), 20 and 30
+  // tagged. Both ends must agree on the native VLAN or traffic silently
+  // crosses between VLANs.
+  sw.portCfg[2] = { mode: 'trunk', native: '10', tagged: '20,30' };
   udm.portCfg = udm.portCfg || {};
-  udm.portCfg[1] = { vlan: '10', tagged: '20,30' };
+  udm.portCfg[1] = { mode: 'trunk', native: '10', tagged: '20,30' };
   // power cords: rear inlets → UPS outlets, like a real rack
   mkCable(sw, 'PWR', ups1, 1, '#111827');
   mkCable(udm, 'PWR', ups1, 2, '#111827');
