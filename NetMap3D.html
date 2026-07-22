@@ -404,7 +404,7 @@ select:focus, input:focus { border-color: var(--accent); }
        Row 2 carries options for whichever tool is active, so the palette can
        keep growing without the bar ever running off the screen again. -->
   <div id="toolbar">
-    <span class="logo">NetMap<b>3D</b><span class="ver">v0.15.0</span></span>
+    <span class="logo">NetMap<b>3D</b><span class="ver">v0.16.0</span></span>
     <span id="proj-name"></span>
     <span class="sep"></span>
     <div id="modescroll">
@@ -8887,6 +8887,92 @@ function l2Walk(startDev, opts = {}) {
   return { hosts: reachedHosts, routers: reachedRouters, prev, start };
 }
 
+//////////////////// MAC learning + ARP ////////////////////
+// Switches learn a source MAC on the port a frame arrived from; hosts cache the
+// IP->MAC of whoever they talked to. Both are runtime state, not design state,
+// so they live outside `state` and are never saved — same as a real box losing
+// its tables on reboot.
+//
+// MACs are synthetic and derived from the device id so they're stable across a
+// session. First octet 0x02 marks a locally-administered address, which is the
+// correct way to mint an address you don't own; inventing a real vendor OUI
+// would misattribute hardware we don't have a registry entry for.
+const macTables = new Map();   // switchId -> Map(mac -> { port, vlan })
+const arpCaches = new Map();   // hostId   -> Map(ipString -> mac)
+
+function deviceMac(dev) {
+  const id = dev.id >>> 0;
+  const b = [0x02, 0x00, (id >>> 24) & 0xff, (id >>> 16) & 0xff, (id >>> 8) & 0xff, id & 0xff];
+  return b.map(v => v.toString(16).padStart(2, '0').toUpperCase()).join(':');
+}
+function macLearn(devId, mac, port, vlan) {
+  let t = macTables.get(devId);
+  if (!t) macTables.set(devId, t = new Map());
+  t.set(mac, { port, vlan });
+}
+function arpLearn(hostId, ip, mac) {
+  let c = arpCaches.get(hostId);
+  if (!c) arpCaches.set(hostId, c = new Map());
+  c.set(ip, mac);
+}
+// Topology or addressing changed — a real switch would age these out; we clear
+// them, because a stale table pointing at a deleted cable is worse than empty.
+function flushL2Tables() { macTables.clear(); arpCaches.clear(); }
+
+// The chain of jacks a frame crosses from a to b, or null if it can't get there.
+function l2PathJacks(a, b) {
+  const w = l2Walk(a, { vlan: hostVlan(a) });
+  if (!w.hosts.has(b.id)) return null;
+  let endKey = null;
+  for (const [k] of w.prev) if (k.startsWith(b.id + ':')) { endKey = k; break; }
+  if (!endKey) return null;
+  const chain = [];
+  for (let k = endKey; k; k = w.prev.get(k)) chain.unshift(k);
+  return chain;
+}
+
+// Walk a successful conversation and populate every table it would really touch.
+function learnFromExchange(a, b) {
+  const chain = l2PathJacks(a, b);
+  if (!chain) return false;
+  const macA = deviceMac(a), macB = deviceMac(b);
+  const vlan = hostVlan(a);
+  const parse = k => { const [d, p, sd] = k.split(':'); return { id: +d, port: isNaN(+p) ? p : +p, side: sd }; };
+  for (let i = 0; i < chain.length; i++) {
+    const jack = parse(chain[i]);
+    const dev = deviceById(jack.id);
+    if (!dev || netClass(dev) !== 'switch') continue;   // patches are passive, hosts don't bridge
+    // the frame from A arrived on this port
+    macLearn(dev.id, macA, jack.port, vlan);
+    // B lives out the port cabled to the next hop
+    if (i + 1 < chain.length) {
+      const nx = parse(chain[i + 1]);
+      const c = portConnection(nx.id, nx.port, nx.side);
+      if (c) {
+        const near = (c.a.deviceId === dev.id) ? c.a : (c.b.deviceId === dev.id ? c.b : null);
+        if (near) macLearn(dev.id, macB, near.port, vlan);
+      }
+    }
+  }
+  // ARP: same subnet resolves each other directly, otherwise each side resolves
+  // its own gateway — which is exactly what a host's cache really holds
+  const ipA = hostIp(a), ipB = hostIp(b);
+  if (ipA && ipB) {
+    if (sameSubnet(ipA, ipB)) {
+      arpLearn(a.id, ipStr(ipB.int), macB);
+      arpLearn(b.id, ipStr(ipA.int), macA);
+    } else {
+      for (const [h, other] of [[a, b], [b, a]]) {
+        const w = l2Walk(h, { vlan: hostVlan(h) });
+        const gwId = w.routers.keys().next().value;
+        const gw = gwId !== undefined ? deviceById(gwId) : null;
+        if (gw && gw.ip) arpLearn(h.id, gw.ip, deviceMac(gw));
+      }
+    }
+  }
+  return true;
+}
+
 // Layer-2 reachable? Plus the reason it isn't, discovered by relaxing rules.
 function l2Reachable(a, b) {
   const v = hostVlan(a);
@@ -9144,6 +9230,8 @@ function deleteTie(id) {
 }
 
 function deleteCable(id) {
+  flushL2Tables();
+
   const m = cableMeshes.get(id);
   if (m) { disposeCableObj(m); cableMeshes.delete(id); }
   cableRoutes.delete(id);          // stop steering other cables around a gap
@@ -9158,6 +9246,8 @@ function deleteCable(id) {
 }
 
 function deleteDevice(id) {
+  flushL2Tables();
+
   for (const c of state.cables.filter(c => c.a.deviceId === id || c.b.deviceId === id)) deleteCable(c.id);
   const g = deviceGroups.get(id);
   if (g) {
@@ -10179,6 +10269,33 @@ function hideProps() { propsEl.classList.add('hidden'); selected = null; clearCa
 
 function row(k, v) { return `<div class="row"><span class="k">${k}</span><span>${v}</span></div>`; }
 
+// A switch's MAC address table and a host's ARP cache, as learned by actual
+// traffic. Empty until something pings — same as a freshly booted device.
+function l2TablesHtml(dev) {
+  const cls = netClass(dev);
+  if (cls === 'switch') {
+    const t = macTables.get(dev.id);
+    if (!t || !t.size) return `<p class="cbl-edit-hint">MAC address table empty — run a ping to populate it.</p>`;
+    const rows = [...t].sort((a, b) => a[1].port - b[1].port)
+      .map(([mac, e]) => `<tr><td>${e.vlan}</td><td>${mac}</td><td>Port ${e.port}</td></tr>`).join('');
+    return `<div class="row" style="margin-top:10px"><span class="k">MAC address table</span></div>
+      <table class="sim-table"><tr><th>VLAN</th><th>MAC</th><th>Port</th></tr>${rows}</table>`;
+  }
+  if (cls === 'host') {
+    const c = arpCaches.get(dev.id);
+    let html = `<div class="row" style="margin-top:10px"><span class="k">MAC</span><span>${deviceMac(dev)}</span></div>`;
+    if (c && c.size) {
+      html += `<div class="row"><span class="k">ARP cache</span></div><table class="sim-table">` +
+        `<tr><th>Address</th><th>MAC</th></tr>` +
+        [...c].map(([ip, mac]) => `<tr><td>${ip}</td><td>${mac}</td></tr>`).join('') + `</table>`;
+    } else {
+      html += `<p class="cbl-edit-hint">ARP cache empty — run a ping to populate it.</p>`;
+    }
+    return html;
+  }
+  return '';
+}
+
 // DHCP server config, shown on router-class devices only. A real gateway hands
 // out addresses on the subnets it serves; here one pool per device covers the
 // common case and keeps the config honest rather than pretending to more.
@@ -10255,6 +10372,7 @@ function showDeviceProps(id) {
     <div class="row" style="margin-top:6px"><span class="k">Notes</span></div>
     <input type="text" id="dev-notes" placeholder="VLAN, location, model…" value="${dev.notes || ''}">
     ${dhcpPropsHtml(dev)}
+    ${l2TablesHtml(dev)}
     ${!isPlaced(dev) ? '<button id="dev-place">Place in 3D map</button>' : ''}
     <button id="dev-del" class="danger">Delete device</button>`;
   propsEl.classList.remove('hidden');
@@ -11772,6 +11890,8 @@ function runPing() {
   const b = parseInt(document.getElementById('sim-dst').value, 10);
   const r = pingHosts(a, b);
   const da = deviceById(a), db = deviceById(b);
+  // a reply means frames really crossed the path — switches and hosts learn
+  if (r.ok) learnFromExchange(da, db);
   if (r.ok) {
     showPingPath(r.hops);
     aiPrint(`<h4 class="ai-good">PING ${da.name} → ${db.name}: reply</h4><p>${r.detail}</p>` +
