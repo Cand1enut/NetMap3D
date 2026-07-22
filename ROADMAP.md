@@ -175,6 +175,34 @@ What that requires, concretely:
   configure a switch through the IOS CLI here and have it genuinely work — that
   is what makes the challenges phase (item 3) worth anything.
 
+**Standard: identical. No shortcuts, no half-working demos.** (Owner, verbatim:
+"commands should be identical... everything should be identical... no shortcuts,
+no half working demos, everything.")
+
+How that is actually achieved — this is a method, not a softening:
+
+1. **Every implemented command is verified against vendor documentation or real
+   device output before it ships.** Exact syntax, exact argument forms, exact
+   output formatting (column headers, spacing, order), exact error text. Never
+   approximate from memory; cite the source in a comment. This follows ground
+   rule 4 — the same rule that already caught the EMT/RMC and 9200L-4G errors.
+2. **Depth before breadth.** Finish a command family completely — every form,
+   every flag, correct output, correct errors — before starting the next. A
+   half-done family is exactly the "half working demo" being ruled out. Ten
+   command families that are genuinely identical beat a hundred that are close.
+3. **Never fake a response.** A command that is not implemented yet must not
+   return invented output. Authentic behaviour is already the correct fallback:
+   real IOS answers an unrecognised command with
+   `% Invalid input detected at '^' marker.` — so an unimplemented command is
+   indistinguishable from one the real device rejects, and nothing lies.
+4. **Track coverage honestly.** Keep a per-vendor checklist in the repo of which
+   command families are complete and verified. "Done" means verified, not
+   written. Report coverage to the owner as a fact, never as an impression.
+
+The end state is full parity for the products in the catalog. The path there is
+one verified family at a time — never a broad shallow layer that looks right in
+a screenshot and falls over on the second command.
+
 CLI-first — build a real command interpreter:
 - **Cisco IOS / IOS-XE** (Catalyst): mode hierarchy `>` user EXEC → `#` priv
   EXEC (`enable`) → `(config)#` (`configure terminal`) → `(config-if)#`.
