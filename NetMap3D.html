@@ -404,7 +404,7 @@ select:focus, input:focus { border-color: var(--accent); }
        Row 2 carries options for whichever tool is active, so the palette can
        keep growing without the bar ever running off the screen again. -->
   <div id="toolbar">
-    <span class="logo">NetMap<b>3D</b><span class="ver">v0.18.0</span></span>
+    <span class="logo">NetMap<b>3D</b><span class="ver">v0.19.0</span></span>
     <span id="proj-name"></span>
     <span class="sep"></span>
     <div id="modescroll">
@@ -5823,6 +5823,18 @@ Object.assign(DEVICE_TYPES, BRAND_PACK);
 // access ports in blocks of six and puts uplinks hard right; Meraki runs WAN on
 // the left, then LAN, then LAN fibre. Counts and speeds are from the datasheet;
 // spacing follows house convention.
+// The public Internet, as a placeable node. A gateway's WAN port cables to it;
+// everything behind that gateway is then NATed out. Modelled as a field device
+// so it drops anywhere in the scene.
+const WAN_PACK = {
+  internet: {
+    label: 'Internet', short: 'WAN', uh: 0, ports: 1, rows: 1, depth: 0,
+    color: 0x2f6fdb, field: true, mounts: ['desk'], shape: 'cloud',
+    isInternet: true, cat: 'WAN'
+  }
+};
+Object.assign(DEVICE_TYPES, WAN_PACK);
+
 const CISCO_PACK = {
   // --- Catalyst access switches ---
   c_c9200l48: { ...R('Catalyst 9200L-48P-4G', 'C9200-48', 52, 2, 1, 16, { sfp: 4, verified: true,
@@ -7597,6 +7609,14 @@ function buildDeviceGroup(dev) {
         const screen = new THREE.Mesh(new THREE.PlaneGeometry(3.9, 6.1),
           new THREE.MeshStandardMaterial({ color: 0x0d1b33, emissive: 0x16345e, emissiveIntensity: 0.9, roughness: 0.2 }));
         screen.position.z = 0.92; h.add(screen);
+      } else if (shape === 'cloud') {
+        // overlapping spheres read as a cloud from any angle
+        const cm = mat(0xdfe7f5, { roughness: 0.85, metalness: 0 });
+        for (const [cx, cy, cz, r] of [[0,0,0,7],[-6,-1.5,0,5],[6,-1.5,0,5],[-2.5,3.5,0,4.5],[3,3,0,4]]) {
+          const puff = tag(new THREE.Mesh(new THREE.SphereGeometry(r, 18, 14), cm));
+          puff.position.set(cx, cy, cz);
+          h.add(puff);
+        }
       } else if (shape === 'tower') {
         const body = tag(new THREE.Mesh(new THREE.CylinderGeometry(2.3, 2.3, 7.5, 26), white));
         body.position.set(0, 0, 0); h.add(body);
@@ -8991,6 +9011,77 @@ function learnFromExchange(a, b) {
     }
   }
   return true;
+}
+
+//////////////////// NAT / Internet ////////////////////
+// RFC 1918 §3 reserves exactly three blocks for private internets, verified
+// against the RFC text itself:
+//     10.0.0.0    - 10.255.255.255  (10/8)
+//     172.16.0.0  - 172.31.255.255  (172.16/12)
+//     192.168.0.0 - 192.168.255.255 (192.168/16)
+// The same section states packets with private source or destination addresses
+// "should not be forwarded across" inter-enterprise links — which is precisely
+// why a gateway must translate them, and why a host with a private address and
+// no NAT gateway cannot reach the Internet node.
+const RFC1918 = [
+  { net: '10.0.0.0', cidr: 8 },
+  { net: '172.16.0.0', cidr: 12 },
+  { net: '192.168.0.0', cidr: 16 }
+];
+function isPrivateIp(ipInt) {
+  return RFC1918.some(b => {
+    const base = parseIp(b.net + '/' + b.cidr);
+    const mask = base.mask;
+    return ((ipInt & mask) >>> 0) === base.network;
+  });
+}
+function isInternetNode(dev) { return !!(dev && DEVICE_TYPES[dev.type] && DEVICE_TYPES[dev.type].isInternet); }
+function internetNodes() { return state.devices.filter(d => isPlaced(d) && isInternetNode(d)); }
+
+// A gateway performs NAT for the inside network when one of its WAN ports is
+// cabled toward the Internet. Returns the internet node it reaches, or null.
+function natUplink(router) {
+  const def = DEVICE_TYPES[router.type];
+  for (const c of state.cables) {
+    const mine = c.a.deviceId === router.id ? c.a : (c.b.deviceId === router.id ? c.b : null);
+    if (!mine) continue;
+    if (mine.port === 'PWR') continue;
+    const far = mine === c.a ? c.b : c.a;
+    const fd = deviceById(far.deviceId);
+    if (isInternetNode(fd)) return { net: fd, port: mine.port, role: portRole(def, mine.port) };
+  }
+  return null;
+}
+
+// Can this host reach the public Internet, and by what path?
+// Mirrors the real requirement chain: a gateway on my segment, that gateway
+// having a WAN uplink, and translation if my address is RFC 1918.
+function pingInternet(host) {
+  const ip = hostIp(host);
+  if (!ip) return { ok: false, reason: `${host.name} has no valid IP` };
+  const nets = internetNodes();
+  if (!nets.length) return { ok: false, reason: 'No Internet node placed — add one from the WAN category and cable a gateway WAN port to it' };
+  const walk = l2Walk(host, { vlan: hostVlan(host) });
+  if (!walk.routers.size) return { ok: false, reason: `${host.name}'s subnet ${subnetLabel(ip)} has no router / default gateway reachable` };
+  for (const rid of walk.routers.keys()) {
+    const r = deviceById(rid);
+    const up = natUplink(r);
+    if (!up) continue;
+    // ACLs still apply on the way out
+    const acl = aclCheck(r, { in: walk.routers.get(rid).port, out: up.port }, ip.int, 0);
+    if (acl.blocked) return { ok: false, reason: acl.reason, acl };
+    const priv = isPrivateIp(ip.int);
+    return {
+      ok: true, mode: 'nat', hops: [host.id, rid, up.net.id],
+      translated: priv,
+      detail: priv
+        ? `${host.name} ${ipStr(ip.int)} (RFC 1918) NATed by ${r.name} out ${up.role || 'WAN'} port ${up.port}`
+        : `${host.name} ${ipStr(ip.int)} is publicly routable — forwarded by ${r.name}, no translation needed`
+    };
+  }
+  // a gateway exists but nothing links it to the Internet
+  const names = [...walk.routers.keys()].map(id => deviceById(id).name).join(', ');
+  return { ok: false, reason: `${names} has no WAN uplink to the Internet — cable a WAN port to the Internet node` };
 }
 
 //////////////////// Access control lists ////////////////////
@@ -12171,6 +12262,11 @@ function refreshSimPickers() {
     if (!sel) continue;
     const cur = sel.value;
     sel.innerHTML = hosts.map(h => `<option value="${h.id}">${h.name} (${hostAddr(h)})</option>`).join('');
+    // the Internet is a valid destination when one is placed — this is the
+    // "can my network get out?" test, which is what people actually check first
+    if (sel.id === 'sim-dst' && internetNodes().length) {
+      sel.innerHTML += `<option value="internet">🌐 Internet (8.8.8.8)</option>`;
+    }
     if (hosts.some(h => String(h.id) === cur)) sel.value = cur;
   }
   // default to two different hosts so the first click means something
@@ -12212,7 +12308,9 @@ function showPingPath(hops) {
 function runPing() {
   resolveDhcp();
   const a = parseInt(document.getElementById('sim-src').value, 10);
-  const b = parseInt(document.getElementById('sim-dst').value, 10);
+  const dstRaw = document.getElementById('sim-dst').value;
+  if (dstRaw === 'internet') return runPingInternet(deviceById(a));
+  const b = parseInt(dstRaw, 10);
   const r = pingHosts(a, b);
   const da = deviceById(a), db = deviceById(b);
   // a reply means frames really crossed the path — switches and hosts learn
@@ -12227,10 +12325,24 @@ function runPing() {
   }
 }
 
+function runPingInternet(host) {
+  const r = pingInternet(host);
+  if (r.ok) {
+    showPingPath(r.hops);
+    aiPrint(`<h4 class="ai-good">PING ${host.name} → 8.8.8.8: reply</h4><p>${r.detail}</p>` +
+      `<p class="ai-meta">${r.hops.map(id => deviceById(id).name).join(' → ')}</p>`);
+  } else {
+    setVlanFocus(null);
+    aiPrint(`<h4 class="ai-bad">PING ${host.name} → 8.8.8.8: unreachable</h4><p>${r.reason}</p>`);
+  }
+}
+
 function runTrace() {
   resolveDhcp();
   const a = parseInt(document.getElementById('sim-src').value, 10);
-  const b = parseInt(document.getElementById('sim-dst').value, 10);
+  const dstRaw = document.getElementById('sim-dst').value;
+  if (dstRaw === 'internet') return runPingInternet(deviceById(a));
+  const b = parseInt(dstRaw, 10);
   const r = pingHosts(a, b);
   const da = deviceById(a), db = deviceById(b);
   if (!r.ok) { setVlanFocus(null); aiPrint(`<h4 class="ai-bad">TRACE ${da.name} → ${db.name}</h4><p>* * * — ${r.reason}</p>`); return; }
