@@ -5630,6 +5630,24 @@ const U = 1.75;
 const RACK_UNITS = 42;
 const RACK_W = 19;          // rail-to-rail
 const RACK_OUTER_W = 23;
+
+// Cable-manager geometry. Shared by the mesh builder and the router so a cable
+// is dressed to where the duct actually is — if these two ever disagree, runs
+// float in front of the fingers instead of sitting inside the channel.
+const HCM_FINGER_N = 10, HCM_FINGER_W = 1.1, HCM_FINGER_D = 1.6, HCM_FINGER_Z = 1.4;
+const VCM_W = 3.2, VCM_D = 6, VCM_FINGER_N = 14, VCM_FINGER_D = 1.2;
+// Finger centres across a horizontal duct, in device-local x.
+function hcmFingerX(i) { return -RACK_W / 2 + 1.5 + i * (RACK_W - 3) / (HCM_FINGER_N - 1); }
+// The gap between two fingers nearest a given x — where a run breaks out of the
+// duct. Snapping to a gap is what stops a cable exiting straight through a tooth.
+function hcmGapX(x) {
+  let best = null;
+  for (let i = 0; i < HCM_FINGER_N - 1; i++) {
+    const c = (hcmFingerX(i) + hcmFingerX(i + 1)) / 2;
+    if (best === null || Math.abs(c - x) < Math.abs(best - x)) best = c;
+  }
+  return best === null ? x : best;
+}
 const RACK_D = 30;
 const RACK_BASE = 2;        // floor to bottom of U1
 const RACK_H = RACK_BASE + RACK_UNITS * U + 1;
@@ -7864,16 +7882,29 @@ function buildDeviceGroup(dev) {
   const rackG = rackGroups.get(dev.rackId);
 
   if (def.vertical) {
-    // Vertical cable manager mounted on the side of the rack
+    // Vertical cable manager mounted on the side of the rack. A real one is a
+    // CHANNEL, not a solid block: a back pan, two side walls, and a comb of
+    // fingers across the front. Cable lives inside it, behind the fingers, and
+    // the fingers are what retain it. Modelling it solid meant runs had nowhere
+    // to go but in front of the whole assembly.
     const h = RACK_UNITS * U;
-    const body = new THREE.Mesh(new THREE.BoxGeometry(3.2, h, 6), mat(def.color, { roughness: 0.85 }));
-    body.castShadow = true;
-    body.userData = { isManager: true, deviceId: dev.id, isDeviceBody: true };
-    g.add(body); managerMeshes.push(body);
-    // finger slots
-    for (let i = 0; i < 14; i++) {
-      const fin = new THREE.Mesh(new THREE.BoxGeometry(3.4, 0.5, 6.2), mat(0x0c0e12));
-      fin.position.y = -h / 2 + (i + 0.5) * (h / 14);
+    const pan = new THREE.Mesh(new THREE.BoxGeometry(VCM_W, h, 0.4), mat(def.color, { roughness: 0.85 }));
+    pan.position.z = -VCM_D / 2 + 0.2;
+    pan.castShadow = true;
+    pan.userData = { isManager: true, deviceId: dev.id, isDeviceBody: true };
+    g.add(pan); managerMeshes.push(pan);
+    for (const sx of [-1, 1]) {
+      const wall = new THREE.Mesh(new THREE.BoxGeometry(0.4, h, VCM_D), mat(def.color, { roughness: 0.85 }));
+      wall.position.set(sx * (VCM_W / 2 - 0.2), 0, 0);
+      wall.castShadow = true;
+      wall.userData = { isManager: true, deviceId: dev.id, isDeviceBody: true };
+      g.add(wall); managerMeshes.push(wall);
+    }
+    // The comb. Deliberately NOT flagged isDeviceBody, so it is not a collider:
+    // a comb is precisely the thing cable passes between.
+    for (let i = 0; i < VCM_FINGER_N; i++) {
+      const fin = new THREE.Mesh(new THREE.BoxGeometry(VCM_W + 0.2, 0.5, VCM_FINGER_D), mat(0x0c0e12));
+      fin.position.set(0, -h / 2 + (i + 0.5) * (h / VCM_FINGER_N), VCM_D / 2 - VCM_FINGER_D / 2);
       g.add(fin);
     }
     const sideX = (dev.side === 'L' ? -1 : 1) * (RACK_OUTER_W / 2 + 1.8);
@@ -7921,10 +7952,11 @@ function buildDeviceGroup(dev) {
     }
     if (def.manager) {
       managerMeshes.push(face);
-      // finger ducts on horizontal managers
-      for (let i = 0; i < 10; i++) {
-        const fin = new THREE.Mesh(new THREE.BoxGeometry(1.1, h + 0.7, 1.6), mat(0x0c0e12));
-        fin.position.set(-RACK_W / 2 + 1.5 + i * (RACK_W - 3) / 9, 0, 1.4);
+      // The comb on a horizontal finger duct. Not colliders, for the same
+      // reason as the vertical one — cable is meant to pass between them.
+      for (let i = 0; i < HCM_FINGER_N; i++) {
+        const fin = new THREE.Mesh(new THREE.BoxGeometry(HCM_FINGER_W, h + 0.7, HCM_FINGER_D), mat(0x0c0e12));
+        fin.position.set(hcmFingerX(i), 0, HCM_FINGER_Z);
         g.add(fin);
       }
     }
@@ -8480,6 +8512,11 @@ function hcmBetweenY(rackId, yA, yB) {
   }
   return best;
 }
+// Depth of the channel inside each kind of duct, in rack-local z. A run is
+// dressed to this plane, which is behind the finger tips and in front of the
+// faceplate — i.e. actually inside the comb, held by it.
+const HCM_DUCT_Z = RACK_D / 2 - 1 + HCM_FINGER_Z;
+const VCM_DUCT_Z = RACK_D / 2 - 3;
 
 // Real rack dressing, in two regimes because real racks have two.
 //
@@ -8508,26 +8545,49 @@ function rackDressRoute(cable, a, b) {
   const z = Math.max(lan.z, lbn.z);               // dress just clear of the faceplates
 
   if (dy <= RACK_FACE_MAX_DY) {
-    // Run across at the manager if there is one, otherwise midway between the
-    // two ports so the horizontal leg sits in the gap rather than across either
-    // faceplate. An empty list would mean "no dressing at all", so this always
-    // returns its two points.
-    const runY = hcmBetweenY(da.rackId, lan.y, lbn.y) ?? (lan.y + lbn.y) / 2;
+    const runY = hcmBetweenY(da.rackId, lan.y, lbn.y);
+    if (runY === null) {
+      // No duct between them: run across midway, so the horizontal leg sits in
+      // the gap rather than across either faceplate.
+      const midY = (lan.y + lbn.y) / 2;
+      return [
+        toWorld(new THREE.Vector3(lan.x, midY, z)),
+        toWorld(new THREE.Vector3(lbn.x, midY, z))
+      ];
+    }
+    // Through the duct: slide to the nearest finger gap, push back between the
+    // fingers into the channel, run along inside it, then back out through a
+    // gap at the far end. This is what a finger duct is for — the cable is
+    // retained by the comb rather than lying in front of it.
+    const gA = hcmGapX(lan.x), gB = hcmGapX(lbn.x);
     return [
-      toWorld(new THREE.Vector3(lan.x, runY, z)),
-      toWorld(new THREE.Vector3(lbn.x, runY, z))
+      toWorld(new THREE.Vector3(gA, runY, z)),
+      toWorld(new THREE.Vector3(gA, runY, HCM_DUCT_Z)),
+      toWorld(new THREE.Vector3(gB, runY, HCM_DUCT_Z)),
+      toWorld(new THREE.Vector3(gB, runY, z))
     ];
   }
   // dress column: a real vertical manager if the rack has one, else nearest side
-  let dressX = null;
+  let dressX = null, hasVcm = false;
   for (const d of state.devices) {
     if (d.rackId !== da.rackId || !DEVICE_TYPES[d.type].vertical) continue;
     const x = (d.side === 'L' ? -1 : 1) * (RACK_OUTER_W / 2 + 1.8);
-    if (dressX === null || Math.abs(x - la.x) < Math.abs(dressX - la.x)) dressX = x;
+    if (dressX === null || Math.abs(x - la.x) < Math.abs(dressX - la.x)) { dressX = x; hasVcm = true; }
   }
   if (dressX === null) dressX = (la.x + lb.x) / 2 >= 0 ? RACK_W / 2 + 1.6 : -(RACK_W / 2 + 1.6);
+  if (!hasVcm) {
+    return [
+      toWorld(new THREE.Vector3(dressX, lan.y, z)),
+      toWorld(new THREE.Vector3(dressX, lbn.y, z))
+    ];
+  }
+  // Into the vertical duct: out to the manager in front of the rails, back
+  // through the fingers into the channel, down the channel, then out through
+  // the fingers again at the destination.
   return [
     toWorld(new THREE.Vector3(dressX, lan.y, z)),
+    toWorld(new THREE.Vector3(dressX, lan.y, VCM_DUCT_Z)),
+    toWorld(new THREE.Vector3(dressX, lbn.y, VCM_DUCT_Z)),
     toWorld(new THREE.Vector3(dressX, lbn.y, z))
   ];
 }
@@ -8554,14 +8614,23 @@ function cableCurve(cable) {
   }
   // build the control chain, expanding each leg to 90° moves
   const chain = [a.pos.clone(), aLead];
+  // Duplicate control points make a zero-length leg, and a zero-length leg has
+  // no direction to build a fillet from — it produces NaN and the run vanishes.
+  // Both ends of a duct hop landing in the same finger gap is a normal case, so
+  // this has to be handled here rather than avoided upstream.
+  const add = (p) => {
+    const last = chain[chain.length - 1];
+    if (last && last.distanceToSquared(p) < 1e-6) return;
+    chain.push(p.clone ? p.clone() : new THREE.Vector3(p.x, p.y, p.z));
+  };
   const push = (p) => {
     const last = chain[chain.length - 1];
-    if (orth) for (const q of orthLegs(last, p)) chain.push(q);
-    else chain.push(p.clone());
+    if (orth) for (const q of orthLegs(last, p)) add(q);
+    else add(p);
   };
   for (const m of mid) push(m);
   push(bLead);
-  chain.push(b.pos.clone());
+  add(b.pos);
   return roundedCablePath(chain, cableBendRadius(cable));
 }
 
