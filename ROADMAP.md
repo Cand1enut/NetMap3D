@@ -266,6 +266,32 @@ procedural PBR surfaces.
 Next: real product models (GLTF) instead of primitives, better materials, baked
 or screen-space GI, richer furniture/environment, texture detail.
 
+## Definition of done — the data centre build
+
+Owner-set acceptance test for the whole simulation: **build an entire data
+centre in the app and verify it functions 100% completely.** Not a unit test,
+not a scripted probe — a full site, built the way one would really be built,
+that then has to actually work.
+
+What that has to exercise, all at once and all correct:
+- Multiple racks, real SKUs, structured cabling landing on patch panel rears
+  with short leads to switches, cable management that reads as professionally
+  dressed
+- Pathways: in walls, in ceilings, underground between buildings, in racks
+- Full addressing: VLANs per subnet, gateway SVIs, DHCP scopes, static
+  assignments that do not collide
+- Redundancy: multiple uplinks with spanning tree blocking correctly, and a cut
+  link failing over
+- Security: ACLs enforcing real segmentation between zones
+- Internet: provisioned circuit, demarc, terminating equipment, NAT
+- Every host reaching what it should and nothing reaching what it should not,
+  proven by the reachability matrix
+- Vendor management interfaces reflecting and controlling all of it
+
+If any part of that build reveals something the simulation gets wrong, that is a
+defect to fix, not a limitation to document. The build is not "done" until it
+runs clean end to end.
+
 ## Known shortcuts — FIX THESE, they are simulation errors
 
 Owner standard: "literally zero shortcuts, everything needs to be true to life
