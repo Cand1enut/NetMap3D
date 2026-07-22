@@ -128,12 +128,20 @@ Still to do:
 
 ### 2. Packet Tracer functionality — 100%
 
-Done: L2/L3 reachability, ping/trace/matrix (v0.11), DHCP (v0.15),
-MAC + ARP tables (v0.16). Each shipped with its acceptance test passing.
+Done, each with its acceptance test passing:
+- L2/L3 reachability, ping/trace/matrix (v0.11)
+- DHCP (v0.15) — pools, leases, "no server in broadcast domain" verdict
+- MAC + ARP tables (v0.16) — learned by real traffic, flushed on topology change
+- STP 802.1D (v0.17) — per-component root election, blocked ports honoured by
+  l2Walk and rendered amber
+- IP ACLs (v0.18) — Cisco semantics, real access-list syntax parser that
+  round-trips, per-port in/out application
+
 Remaining, roughly in order:
-- STP with blocked-port rendering
-- ACLs, NAT + an Internet node
-- Management interfaces, per vendor (see below)
+- NAT + an Internet node
+- Device CLI / management interfaces (see the vendor section below). The ACL
+  parser in v0.18 is the first piece of the IOS command layer — extend it
+  rather than starting a second parser.
 - Routing protocols, VLAN trunk depth, LACP/HA/failover
 All of it must derive from catalog data via netClass() so new devices inherit
 simulation for free.
@@ -267,6 +275,14 @@ or screen-space GI, richer furniture/environment, texture detail.
 - RMC and EMT inside diameters differ from 2½" up; NEC fill numbers are per
   conduit type.
 - Cisco suffixes encode counts: 9200L-24P-**4G** = four 1G uplinks.
+- STP has **two** cost tables differing by orders of magnitude: 802.1D-1998
+  short (1G=4, 100M=19, 10G=2) vs 802.1D-2004 long (20,000,000 / speed-in-Mbps,
+  so 1G=20000). Cisco still defaults to short, so `show spanning-tree` must
+  print short costs even though the engine computes long ones. Both are in the
+  code; keep them in sync.
+- STP must elect a root **per connected component**. One global tree leaves
+  every switch on an isolated island rootless and blocks all its ports. Caught
+  by the triangle acceptance test, not by inspection.
 - Grade (y = 0) must stop acting as a floor where a basement excavates, and
   the raycaster does NOT respect `visible = false` — exclude hidden meshes in
   `groundTargets()` yourself.
