@@ -1117,7 +1117,24 @@ const RACEWAY_TYPES = {
   tray24:  { label: '24" cable tray',    kind: 'tray', w: 24, d: 6 },
   ras075:  { label: '¾" surface raceway',kind: 'surface', w: 0.75, d: 0.5 },
   ras150:  { label: '1½" surface raceway',kind: 'surface', w: 1.5, d: 0.75 },
-  jhook:   { label: 'J-hook (bridle ring)', kind: 'hook', w: 2, d: 2 }
+  jhook:   { label: 'J-hook (bridle ring)', kind: 'hook', w: 2, d: 2 },
+
+  // ---- outside plant / underground ----
+  // Buried runs sit at a trench depth instead of the plenum. NEC 300.5 puts
+  // rigid nonmetallic (PVC) conduit at 18" cover and unprotected direct burial
+  // at 24"; warning tape goes ~12" below grade so the next person with a shovel
+  // finds it before the backhoe does.
+  pvc100:  { label: '1" PVC (buried)',   kind: 'conduit', id: 1.049, burial: true, depth: 18 },
+  pvc200:  { label: '2" PVC (buried)',   kind: 'conduit', id: 2.067, burial: true, depth: 18 },
+  pvc300:  { label: '3" PVC (buried)',   kind: 'conduit', id: 3.068, burial: true, depth: 18 },
+  pvc400:  { label: '4" PVC (buried)',   kind: 'conduit', id: 4.026, burial: true, depth: 18 },
+  burial:  { label: 'Direct burial (no conduit)', kind: 'tray', w: 3, d: 2, burial: true, depth: 24 },
+
+  // ---- vertical pathways ----
+  // A riser carries backbone between floors through a sleeved, firestopped core.
+  riser400: { label: '4" riser sleeve', kind: 'conduit', id: 4.026, vertical: true },
+  // A drop inside a stud bay, ceiling down to an outlet box.
+  wallbay:  { label: 'Wall cavity drop', kind: 'tray', w: 3.5, d: 3.5, vertical: true, inWall: true }
 };
 
 // Usable cross-section, in². Conduit is limited by NEC Chapter 9 Table 1: 53%
@@ -1153,6 +1170,17 @@ function racewayFill(rw) {
     if (room > 999) break;
   }
   return { count: n, capacityIn2: cap, usedIn2: used, pct, over: pct > 100, room, label: t.label || rw.type };
+}
+
+// Where a pathway sits, by the space it's installed in. Installers don't put
+// everything at one height: plenum runs ride just under the deck above a drop
+// ceiling, attic/crawlspace runs lie on the joists, buried runs sit at trench
+// depth below grade. Getting this right is most of why a model reads as real.
+function pathwayY(t) {
+  if (t && t.burial) return -(t.depth || 18);              // below grade, NEC cover
+  const L = level();
+  if (L.route) return levelY() + 4;                        // attic / crawlspace: on the joists
+  return levelY() + L.h - 6;                               // plenum above the drop ceiling
 }
 
 function racewayPath(rw) {
@@ -2682,6 +2710,14 @@ function plenumRoute(a, b) {
 // stay tidy. CABLE_BEND_R is a generous stand-in for cat6's ~1" min bend radius.
 const CABLE_SNAP = 1;
 const CABLE_BEND_R = 1.4;
+// Per-cable override, so a run can be dressed tighter or looser by hand. Cat6's
+// real minimum is ~4× the 0.25" OD, so 1" is the floor — below that you're
+// modelling a damaged cable.
+const CABLE_BEND_MIN = 1.0, CABLE_BEND_MAX = 8;
+function cableBendRadius(c) {
+  const r = c && c.bendR !== undefined ? parseFloat(c.bendR) : CABLE_BEND_R;
+  return Math.max(CABLE_BEND_MIN, Math.min(CABLE_BEND_MAX, isFinite(r) ? r : CABLE_BEND_R));
+}
 function snapCable(v) {
   return new THREE.Vector3(
     Math.round(v.x / CABLE_SNAP) * CABLE_SNAP,
@@ -2721,25 +2757,88 @@ function roundedCablePath(raw, radius) {
   return path;
 }
 
+// Expand one leg into axis-aligned moves so runs turn 90° instead of cutting a
+// diagonal. Horizontal first, then vertical — cable is dressed across to its
+// column, then up or down it. Legs shorter than MIN_ORTH stay straight, because
+// a 2" jumper broken into a staircase looks worse than a short direct pull.
+const MIN_ORTH = 4;
+function orthLegs(p0, p1) {
+  const out = [];
+  if (p0.distanceTo(p1) < MIN_ORTH) { out.push(p1.clone()); return out; }
+  const cur = p0.clone();
+  // take the larger horizontal axis first, then the other, then vertical
+  const order = Math.abs(p1.z - p0.z) > Math.abs(p1.x - p0.x) ? ['z', 'x', 'y'] : ['x', 'z', 'y'];
+  for (const ax of order) {
+    if (Math.abs(p1[ax] - cur[ax]) > 0.05) { cur[ax] = p1[ax]; out.push(cur.clone()); }
+  }
+  if (!out.length || out[out.length - 1].distanceToSquared(p1) > 1e-6) out.push(p1.clone());
+  return out;
+}
+
+// Real rack dressing: leave the port, run horizontally to a vertical manager (or
+// the nearest side channel), run vertically in that column, then break out
+// horizontally into the destination port. Out–across–down–across–in, all 90s.
+// This is the pattern every tidy rack photo shows, and it's why runs shouldn't
+// cut diagonally across the faceplates.
+function rackDressRoute(cable, a, b) {
+  const da = deviceById(cable.a.deviceId), db = deviceById(cable.b.deviceId);
+  if (!da || !db || !da.rackId || da.rackId !== db.rackId) return null;
+  const rg = rackGroups.get(da.rackId);
+  if (!rg) return null;
+  rg.updateMatrixWorld(true);
+  const toLocal = v => rg.worldToLocal(v.clone());
+  const toWorld = v => rg.localToWorld(v.clone());
+  const la = toLocal(a.pos), lb = toLocal(b.pos);
+  if (Math.abs(la.y - lb.y) < 1.2) return null;   // same U — a straight pull is right
+  const lead = CONN_LEN + 0.7;
+  const lan = toLocal(a.pos.clone().addScaledVector(a.normal, lead));
+  const lbn = toLocal(b.pos.clone().addScaledVector(b.normal, lead));
+  // dress column: a real vertical manager if the rack has one, else nearest side
+  let dressX = null;
+  for (const d of state.devices) {
+    if (d.rackId !== da.rackId || !DEVICE_TYPES[d.type].vertical) continue;
+    const x = (d.side === 'L' ? -1 : 1) * (RACK_OUTER_W / 2 + 1.8);
+    if (dressX === null || Math.abs(x - la.x) < Math.abs(dressX - la.x)) dressX = x;
+  }
+  if (dressX === null) dressX = (la.x + lb.x) / 2 >= 0 ? RACK_W / 2 + 1.6 : -(RACK_W / 2 + 1.6);
+  const z = Math.max(lan.z, lbn.z);               // dress just clear of the faceplates
+  return [
+    toWorld(new THREE.Vector3(dressX, lan.y, z)),
+    toWorld(new THREE.Vector3(dressX, lbn.y, z))
+  ];
+}
+
 function cableCurve(cable) {
   const ep = cablePorts(cable);
   if (!ep) return null;
   const { a, b } = ep;
   // a short straight lead-out so the jacket leaves the jack square, then the run
   const lead = CONN_LEN + 0.7;
-  const pts = [a.pos.clone(), a.pos.clone().addScaledVector(a.normal, lead)];
+  const aLead = a.pos.clone().addScaledVector(a.normal, lead);
+  const bLead = b.pos.clone().addScaledVector(b.normal, lead);
   // Precedence: a raceway physically carries the cable (overrides everything);
-  // then the user's own waypoints; then a default plenum route for long hauls.
+  // then the user's own waypoints; then automatic dressing.
   const rwGuide = racewayGuide(cable);
+  let mid = [], orth = true;
   if (rwGuide.length) {
-    for (const w of rwGuide) pts.push(w.clone ? w.clone() : new THREE.Vector3(w.x, w.y, w.z));
+    mid = rwGuide.map(w => (w.clone ? w.clone() : new THREE.Vector3(w.x, w.y, w.z)));
+    orth = false;                                  // inside a pipe the path is the pipe
   } else if (cable.waypoints && cable.waypoints.length) {
-    for (const w of cable.waypoints) pts.push(new THREE.Vector3(w.x, w.y, w.z));
+    mid = cable.waypoints.map(w => new THREE.Vector3(w.x, w.y, w.z));
   } else if (cable.autoRoute !== false) {
-    for (const w of plenumRoute(a, b)) pts.push(w);
+    mid = rackDressRoute(cable, a, b) || plenumRoute(a, b);
   }
-  pts.push(b.pos.clone().addScaledVector(b.normal, lead), b.pos.clone());
-  return roundedCablePath(pts, CABLE_BEND_R);
+  // build the control chain, expanding each leg to 90° moves
+  const chain = [a.pos.clone(), aLead];
+  const push = (p) => {
+    const last = chain[chain.length - 1];
+    if (orth) for (const q of orthLegs(last, p)) chain.push(q);
+    else chain.push(p.clone());
+  };
+  for (const m of mid) push(m);
+  push(bLead);
+  chain.push(b.pos.clone());
+  return roundedCablePath(chain, cableBendRadius(cable));
 }
 
 // Molded RJ45 plug (frosty polycarbonate) + colored strain-relief boot, aimed
@@ -3027,7 +3126,59 @@ function netClass(dev) {
   return 'host';                                // servers, APs, cameras, workstations, phones
 }
 function isHostDev(dev) { return isPlaced(dev) && dev.ip && netClass(dev) === 'host'; }
-function hostIp(dev) { return parseIp(dev.ip); }
+
+// ---- DHCP ----
+// A router with dhcp.enabled hands out addresses from its pool to any host on
+// its L2 segment that asks (ip = "dhcp"). Leases are recomputed from scratch
+// before each sim run — deterministic, host-id order, so the same map always
+// leases the same address.
+let _dhcpLeases = new Map();   // hostId -> { ip, serverId, subnet }
+function dhcpPool(server) {
+  const d = server.dhcp;
+  if (!d || !d.enabled) return null;
+  const s = parseIp(d.poolStart), e = parseIp(d.poolEnd);
+  if (!s || !e) return null;
+  return { start: s.int, end: Math.max(s.int, e.int), network: s.network, mask: s.mask, cidr: s.cidr, ip: s };
+}
+function resolveDhcp() {
+  _dhcpLeases = new Map();
+  const usedByServer = new Map();
+  const askers = state.devices.filter(d => isPlaced(d) && netClass(d) === 'host' && d.ip === 'dhcp')
+    .sort((a, b) => a.id - b.id);
+  for (const h of askers) {
+    const walk = l2Walk(h, { vlan: hostVlan(h) });
+    let server = null;
+    for (const sid of walk.routers.keys()) {
+      const sv = deviceById(sid);
+      if (sv && sv.dhcp && sv.dhcp.enabled && dhcpPool(sv)) { server = sv; break; }
+    }
+    if (!server) continue;                       // no lease → host stays unaddressed
+    const pool = dhcpPool(server);
+    let used = usedByServer.get(server.id);
+    if (!used) {
+      used = new Set();
+      for (const o of state.devices) {           // static IPs in the pool's subnet are taken
+        if (!o.ip || o.ip === 'dhcp') continue;
+        const oip = parseIp(o.ip);
+        if (oip && ((oip.int & pool.mask) >>> 0) === pool.network) used.add(oip.int);
+      }
+      usedByServer.set(server.id, used);
+    }
+    for (let a = pool.start; a <= pool.end; a++) {
+      if (!used.has(a)) { used.add(a); _dhcpLeases.set(h.id, { ip: ipStr(a), serverId: server.id, subnet: subnetLabel(pool.ip) }); break; }
+    }
+  }
+  return _dhcpLeases;
+}
+function hostIp(dev) {
+  if (dev.ip === 'dhcp') { const l = _dhcpLeases.get(dev.id); return l ? parseIp(l.ip) : null; }
+  return parseIp(dev.ip);
+}
+// display string for a host's address, resolving a lease
+function hostAddr(dev) {
+  if (dev.ip === 'dhcp') { const l = _dhcpLeases.get(dev.id); return l ? `${l.ip} (DHCP)` : 'dhcp (no lease)'; }
+  return dev.ip || '—';
+}
 
 // data (non-power) port a host actually uses — its first real port
 function hostPort(dev) {
@@ -3132,8 +3283,9 @@ function pingHosts(aId, bId) {
   if (!a || !b) return { ok: false, reason: 'device not found' };
   if (a.id === b.id) return { ok: true, mode: 'self', hops: [a.id], detail: 'loopback' };
   const ipA = hostIp(a), ipB = hostIp(b);
-  if (!ipA) return { ok: false, reason: `${a.name} has no valid IP` };
-  if (!ipB) return { ok: false, reason: `${b.name} has no valid IP` };
+  const dhcpFail = (d) => d.ip === 'dhcp' && !_dhcpLeases.get(d.id);
+  if (!ipA) return { ok: false, reason: dhcpFail(a) ? `${a.name} couldn't get a DHCP lease — no DHCP server in its broadcast domain` : `${a.name} has no valid IP` };
+  if (!ipB) return { ok: false, reason: dhcpFail(b) ? `${b.name} couldn't get a DHCP lease — no DHCP server in its broadcast domain` : `${b.name} has no valid IP` };
 
   if (sameSubnet(ipA, ipB)) {
     const l2 = l2Reachable(a, b);
@@ -3710,10 +3862,9 @@ function updateHover(cx, cy) {
     const hit = firstHit(groundTargets());
     if (hit) {
       const x = Math.round(hit.point.x / 6) * 6, z = Math.round(hit.point.z / 6) * 6;
-      // pathways run at the plenum by default — that's where they actually go
-      const y = levelY() + level().h - 6;
       const type = document.getElementById('raceway-type').value;
       const t = RACEWAY_TYPES[type];
+      const y = pathwayY(t);
       hoverInfo = { x, z, y, type };
       if (racewayStart) {
         const len = Math.hypot(x - racewayStart.x, z - racewayStart.z);
@@ -4532,6 +4683,9 @@ function showCableProps(id) {
     ${row('Route points', c.waypoints.length)}
     ${row('Est. length', (c.lengthIn / 12).toFixed(1) + ' ft')}
     <div class="row"><span class="k">Color</span><select id="cbl-color">${opts}</select></div>
+    <div class="row"><span class="k">Bend radius</span><input type="number" id="cbl-bend"
+      min="${CABLE_BEND_MIN}" max="${CABLE_BEND_MAX}" step="0.2" style="width:64px"
+      value="${cableBendRadius(c)}"><span class="unit">in</span></div>
     <p class="cbl-edit-hint">Drag a <b>yellow</b> handle to move a bend · drag a <b>blue</b>
       handle to add one · Shift-drag raises/lowers · right-click a yellow handle to remove it.</p>
     <button id="cbl-clear">Clear route points</button>
@@ -4543,6 +4697,11 @@ function showCableProps(id) {
     c.color = e.target.value;
     rebuildCable(c);
     refreshPortTints();
+  };
+  document.getElementById('cbl-bend').onchange = e => {
+    c.bendR = Math.max(CABLE_BEND_MIN, Math.min(CABLE_BEND_MAX, parseFloat(e.target.value) || CABLE_BEND_R));
+    e.target.value = c.bendR;
+    rebuildCable(c); showCableHandles(c);
   };
   document.getElementById('cbl-clear').onclick = () => {
     undoPush(); c.waypoints = []; rebuildCable(c); showCableProps(id);
@@ -5886,12 +6045,13 @@ document.getElementById('ai-analyze').onclick = analyzeMap;
 // The pickers hold every placed device with an IP. Rebuilt each time the panel
 // opens so they never go stale against the map.
 function refreshSimPickers() {
+  resolveDhcp();
   const hosts = allHosts();
   for (const id of ['sim-src', 'sim-dst']) {
     const sel = document.getElementById(id);
     if (!sel) continue;
     const cur = sel.value;
-    sel.innerHTML = hosts.map(h => `<option value="${h.id}">${h.name} (${h.ip})</option>`).join('');
+    sel.innerHTML = hosts.map(h => `<option value="${h.id}">${h.name} (${hostAddr(h)})</option>`).join('');
     if (hosts.some(h => String(h.id) === cur)) sel.value = cur;
   }
   // default to two different hosts so the first click means something
@@ -5931,6 +6091,7 @@ function showPingPath(hops) {
 }
 
 function runPing() {
+  resolveDhcp();
   const a = parseInt(document.getElementById('sim-src').value, 10);
   const b = parseInt(document.getElementById('sim-dst').value, 10);
   const r = pingHosts(a, b);
@@ -5946,6 +6107,7 @@ function runPing() {
 }
 
 function runTrace() {
+  resolveDhcp();
   const a = parseInt(document.getElementById('sim-src').value, 10);
   const b = parseInt(document.getElementById('sim-dst').value, 10);
   const r = pingHosts(a, b);
@@ -5960,6 +6122,7 @@ function runTrace() {
 }
 
 function runMatrix() {
+  resolveDhcp();
   const { hosts, rows } = reachabilityMatrix();
   if (hosts.length < 2) { aiPrint('<p>Fewer than two hosts with IPs — assign IPs in device properties first.</p>'); return; }
   const head = `<tr><th></th>${hosts.map(h => `<th title="${h.name}">${h.name.slice(0, 6)}</th>`).join('')}</tr>`;
@@ -5975,6 +6138,28 @@ function runMatrix() {
 document.getElementById('sim-ping').onclick = runPing;
 document.getElementById('sim-trace').onclick = runTrace;
 document.getElementById('sim-matrix').onclick = runMatrix;
+
+function runDhcp() {
+  resolveDhcp();
+  const servers = state.devices.filter(d => isPlaced(d) && netClass(d) === 'router' && d.dhcp && d.dhcp.enabled && dhcpPool(d));
+  if (!servers.length) { aiPrint('<p>No DHCP servers. Enable DHCP on a router/gateway in its properties.</p>'); return; }
+  let html = '';
+  for (const sv of servers) {
+    const pool = dhcpPool(sv);
+    const leases = [...(_dhcpLeases)].filter(([, l]) => l.serverId === sv.id);
+    html += `<h4>${sv.name} · DHCP</h4><p class="ai-meta">pool ${sv.dhcp.poolStart}–${sv.dhcp.poolEnd} · ${leases.length} leased</p>`;
+    if (leases.length) {
+      html += `<table class="sim-table">${leases.map(([hid, l]) => {
+        const h = deviceById(hid);
+        return `<tr><td>${h ? h.name : '?'}</td><td>${l.ip}</td></tr>`;
+      }).join('')}</table>`;
+    }
+  }
+  const noLease = state.devices.filter(d => isPlaced(d) && d.ip === 'dhcp' && !_dhcpLeases.get(d.id));
+  if (noLease.length) html += `<p class="ai-bad">${noLease.map(d => d.name).join(', ')} — no lease (no server in broadcast domain).</p>`;
+  aiPrint(html);
+}
+document.getElementById('sim-dhcp').onclick = runDhcp;
 
 function autoDesign() {
   if (!state.walls.length) { aiPrint('<p>Draw the building outline first (Wall tool) — the designer works from your layout.</p>'); return; }
