@@ -34,6 +34,11 @@ GitHub).
    If something genuinely can't be verified: leave it out, or implement it and
    mark it `// UNVERIFIED:` with what would confirm it — never quietly guess and
    never present an assumption as fact to the owner.
+   **Cross-reference every fact against 3-5 independent sources**, and prefer the
+   primary one (the RFC, the IEEE standard, the NEC/TIA text, the vendor's own
+   datasheet) over blogs that quote it. A single search repeats one site's
+   mistake; agreement across several, anchored to the primary, is what makes it
+   safe to encode. Cite the primary source in the comment.
 5. Write like a person. Short sentences. No marketing voice, no AI filler —
    the owner has called this out once already.
 6. When the owner reports a bug, find the root cause. The report "can't
