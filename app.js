@@ -4148,6 +4148,154 @@ function isPrivateIp(ipInt) {
     return ((ipInt & mask) >>> 0) === base.network;
   });
 }
+// ---- NAT translation table ----
+// Cisco's four address perspectives, which are the whole vocabulary of NAT and
+// the reason `show ip nat translations` has four columns:
+//   inside local    the private address as the inside host sees itself
+//   inside global   what the outside world sees that host as
+//   outside local   the outside host as the inside sees it
+//   outside global  the outside host's real address
+// A translation is created by the first packet of a flow and expires on a timer.
+//
+// Timeouts are IOS defaults, cross-checked against Cisco's ip nat command
+// reference and two independent references: everything except overload 86400 s,
+// TCP 86400 s, UDP 300 s, DNS 60 s, ICMP 60 s, and a TCP flow that has seen
+// FIN or RST drops to 60 s.
+const NAT_TIMEOUT = { tcp: 86400, udp: 300, dns: 60, icmp: 60, finrst: 60, any: 86400 };
+const PAT_PORT_MIN = 1024, PAT_PORT_MAX = 65535;
+const _natTable = new Map();     // routerId -> Map(key -> entry)
+
+function natCfg(dev) { return dev.nat || null; }
+function natTimeoutFor(proto, finrst) {
+  if (finrst) return NAT_TIMEOUT.finrst;
+  return NAT_TIMEOUT[proto] !== undefined ? NAT_TIMEOUT[proto] : NAT_TIMEOUT.any;
+}
+function natEntries(routerId) {
+  const t = _natTable.get(routerId);
+  if (!t) return [];
+  const now = simNow();
+  for (const [k, e] of [...t]) if (now >= e.expiresAt) t.delete(k);   // aged out
+  return [...t.values()];
+}
+function natClear(routerId) {
+  if (routerId === undefined) _natTable.clear(); else _natTable.delete(routerId);
+}
+// Ports already handed out on a given inside-global address, so PAT never
+// double-assigns one.
+function patPortsInUse(routerId, globalInt) {
+  const s = new Set();
+  for (const e of natEntries(routerId)) if (e.insideGlobal === globalInt) s.add(e.insideGlobalPort);
+  return s;
+}
+
+// Translate a packet leaving the inside. Returns the rewritten packet plus the
+// table entry, or null when this router does not NAT this source.
+function natTranslateOutbound(router, pkt, outsideInt) {
+  const cfg = natCfg(router);
+  if (!cfg || !cfg.enabled) return null;
+  const globalIp = parseIp(cfg.insideGlobal || '');
+  if (!globalIp) return null;
+  // Static one-to-one mappings win over the pool — they are matched first on a
+  // real box and they are what makes an inside host reachable from outside.
+  const stat = (cfg.statics || []).find(s => {
+    const l = parseIp(s.local);
+    if (!l || l.int !== pkt.srcInt) return false;
+    return !s.proto || (s.proto === pkt.proto && (!s.localPort || +s.localPort === pkt.srcPort));
+  });
+  let key, insideGlobal, insideGlobalPort;
+  if (stat) {
+    const g = parseIp(stat.global);
+    if (!g) return null;
+    insideGlobal = g.int;
+    insideGlobalPort = stat.globalPort ? +stat.globalPort : pkt.srcPort;
+    key = `static|${pkt.proto}|${pkt.srcInt}|${pkt.srcPort}`;
+  } else {
+    // Only addresses permitted by the NAT ACL are translated; everything else
+    // is forwarded untranslated, which is how a real router behaves and how a
+    // missing `ip nat inside source list` shows up as "no internet".
+    if (cfg.aclId) {
+      const acl = deviceAcl(router, cfg.aclId);
+      if (!acl) return null;
+      if (!aclEvaluate(acl, { ...pkt, dstInt: outsideInt }, { count: false }).permit) return null;
+    } else if (!isPrivateIp(pkt.srcInt)) return null;
+    insideGlobal = globalIp.int;
+    if (cfg.overload) {
+      // PAT: many inside hosts on one address, told apart by source port.
+      const existing = natEntries(router.id).find(e =>
+        e.proto === pkt.proto && e.insideLocal === pkt.srcInt && e.insideLocalPort === pkt.srcPort);
+      if (existing) insideGlobalPort = existing.insideGlobalPort;
+      else {
+        const used = patPortsInUse(router.id, insideGlobal);
+        let p = pkt.srcPort && pkt.srcPort >= PAT_PORT_MIN ? pkt.srcPort : PAT_PORT_MIN;
+        while (used.has(p) && p < PAT_PORT_MAX) p++;
+        if (used.has(p)) return { error: `${router.name}: PAT port pool exhausted on ${ipStr(insideGlobal)}` };
+        insideGlobalPort = p;
+      }
+    } else {
+      // Without overload one global address serves one inside host at a time.
+      const holder = natEntries(router.id).find(e =>
+        e.insideGlobal === insideGlobal && e.insideLocal !== pkt.srcInt);
+      if (holder) return { error: `${router.name}: ${ipStr(insideGlobal)} is already translating ${ipStr(holder.insideLocal)} — no overload configured, so there is no second address to hand out` };
+      insideGlobalPort = pkt.srcPort;
+    }
+    key = `${pkt.proto}|${pkt.srcInt}:${pkt.srcPort}|${insideGlobalPort}`;
+  }
+  let t = _natTable.get(router.id);
+  if (!t) _natTable.set(router.id, t = new Map());
+  const proto = pkt.proto === 'udp' && pkt.dstPort === 53 ? 'dns' : pkt.proto;
+  const entry = t.get(key) || {
+    proto: pkt.proto, insideLocal: pkt.srcInt, insideLocalPort: pkt.srcPort,
+    insideGlobal, insideGlobalPort, static: !!stat, createdAt: simNow()
+  };
+  entry.outsideLocal = outsideInt;      // no outside-NAT, so local == global here
+  entry.outsideGlobal = outsideInt;
+  entry.outsidePort = pkt.dstPort;
+  entry.expiresAt = simNow() + natTimeoutFor(proto, pkt.finrst) * 1000;
+  t.set(key, entry);
+  return { entry, pkt: { ...pkt, srcInt: insideGlobal, srcPort: insideGlobalPort } };
+}
+
+// A packet arriving from outside is delivered only if a translation already
+// exists for it, or a static/port-forward mapping says where it goes. This is
+// the property that makes NAT a de-facto inbound filter.
+function natTranslateInbound(router, pkt) {
+  const cfg = natCfg(router);
+  if (!cfg || !cfg.enabled) return null;
+  for (const e of natEntries(router.id)) {
+    if (e.proto !== pkt.proto) continue;
+    if (e.insideGlobal !== pkt.dstInt) continue;
+    if (e.insideGlobalPort !== undefined && pkt.dstPort !== undefined &&
+        e.insideGlobalPort !== pkt.dstPort) continue;
+    return { entry: e, pkt: { ...pkt, dstInt: e.insideLocal, dstPort: e.insideLocalPort } };
+  }
+  const fwd = (cfg.statics || []).find(s => {
+    const g = parseIp(s.global);
+    if (!g || g.int !== pkt.dstInt) return false;
+    if (s.proto && s.proto !== pkt.proto) return false;
+    if (s.globalPort && +s.globalPort !== pkt.dstPort) return false;
+    return true;
+  });
+  if (fwd) {
+    const l = parseIp(fwd.local);
+    if (l) return { pkt: { ...pkt, dstInt: l.int, dstPort: fwd.localPort ? +fwd.localPort : pkt.dstPort }, forwarded: fwd };
+  }
+  return { blocked: true, reason: `${router.name} has no NAT translation for ${ipStr(pkt.dstInt)}${pkt.dstPort ? ':' + pkt.dstPort : ''} — unsolicited inbound traffic is dropped` };
+}
+
+// `show ip nat translations`
+function showIpNat(dev) {
+  const rows = natEntries(dev.id);
+  if (!rows.length) return `${dev.name}: no active translations`;
+  const port = (a, p) => p === undefined || p === null ? ipStr(a) : `${ipStr(a)}:${p}`;
+  const out = ['Pro   Inside global        Inside local         Outside local        Outside global'];
+  for (const e of rows) {
+    out.push(`${(e.proto || '---').padEnd(5)} ${port(e.insideGlobal, e.insideGlobalPort).padEnd(20)} ` +
+      `${port(e.insideLocal, e.insideLocalPort).padEnd(20)} ` +
+      `${port(e.outsideLocal, e.outsidePort).padEnd(20)} ${port(e.outsideGlobal, e.outsidePort)}`);
+  }
+  return out.join('\n');
+}
+
 function isInternetNode(dev) { return !!(dev && DEVICE_TYPES[dev.type] && DEVICE_TYPES[dev.type].isInternet); }
 function internetNodes() { return state.devices.filter(d => isPlaced(d) && isInternetNode(d)); }
 
@@ -4246,16 +4394,31 @@ function pingInternet(host) {
     const r = deviceById(rid);
     const up = wanUplink(r);
     if (!up.ok) { lastReason = up.reason; continue; }
-    const acl = aclCheck(r, { in: walk.routers.get(rid).port, out: up.port }, icmpEchoPacket(ip.int, 0));
+    const acl = aclCheck(r, { in: ifKey(gw.iface), out: up.port }, icmpEchoPacket(ip.int, 0));
     if (acl.blocked) return { ok: false, reason: acl.reason, acl };
     const priv = isPrivateIp(ip.int);
     const wanIp = up.circuit.wanIp;
+    // A private source needs a real translation, not just the observation that
+    // it is private. Build the entry the way the first packet of a flow would,
+    // so `show ip nat translations` reflects traffic that actually happened and
+    // a gateway with NAT switched off correctly fails to reach the Internet.
+    let natted = null;
+    if (priv) {
+      const outside = parseIp('8.8.8.8').int;         // the Internet node stands in for any public host
+      const pkt = { proto: 'icmp', srcInt: ip.int, dstInt: outside, srcPort: null, dstPort: null, icmpType: 'echo' };
+      const res = natTranslateOutbound(r, pkt, outside);
+      if (!res) {
+        return { ok: false, reason: `${host.name} has an RFC 1918 address and ${r.name} is not translating it — enable NAT on the gateway, or the packet leaves with a private source and is dropped upstream` };
+      }
+      if (res.error) return { ok: false, reason: res.error };
+      natted = res.entry;
+    }
     return {
       ok: true, mode: 'nat',
       hops: [host.id, rid, ...up.hops.map(h => h.id)],
-      translated: priv,
+      translated: priv, nat: natted,
       detail: priv
-        ? `${host.name} ${ipStr(ip.int)} (RFC 1918) NATed by ${r.name} to ${wanIp || 'the WAN address'} — ${up.circuit.provider} circuit via ${up.term.name}`
+        ? `${host.name} ${ipStr(ip.int)} (RFC 1918) translated by ${r.name} to ${ipStr(natted.insideGlobal)}${natted.insideGlobalPort ? ':' + natted.insideGlobalPort : ''} — ${up.circuit.provider} circuit via ${up.term.name}`
         : `${host.name} ${ipStr(ip.int)} is publicly routable — forwarded by ${r.name} over the ${up.circuit.provider} circuit, no translation`
     };
   }
@@ -6298,6 +6461,74 @@ function wireRouteProps(dev) {
   };
 }
 
+// NAT config. `ip nat inside source list <acl> interface <if> overload`, static
+// one-to-one, and port forwarding — the three forms that cover real edge NAT.
+function natPropsHtml(dev) {
+  if (netClass(dev) !== 'router') return '';
+  const n = dev.nat || {};
+  const on = !!n.enabled;
+  const st = (n.statics || []).map((s, i) =>
+    `<div class="row" data-nat="${i}">
+       <select class="nt-proto" style="width:56px">${['', 'tcp', 'udp'].map(p =>
+         `<option value="${p}" ${s.proto === p ? 'selected' : ''}>${p || 'any'}</option>`).join('')}</select>
+       <input type="text" class="nt-local" style="width:92px" value="${esc(s.local || '')}" placeholder="inside">
+       <input type="number" class="nt-lport" style="width:52px" value="${s.localPort || ''}" placeholder="port">
+       <input type="text" class="nt-global" style="width:92px" value="${esc(s.global || '')}" placeholder="outside">
+       <input type="number" class="nt-gport" style="width:52px" value="${s.globalPort || ''}" placeholder="port">
+       <button class="nt-del" title="Remove">\u00d7</button></div>`).join('');
+  return `
+    <div class="row" style="margin-top:10px"><span class="k">NAT</span>
+      <input type="checkbox" id="dev-nat-on" ${on ? 'checked' : ''}></div>
+    <div id="dev-nat-cfg" style="${on ? '' : 'display:none'}">
+      <div class="row"><span class="k">inside global</span>
+        <input type="text" id="nt-ig" style="width:118px" value="${esc(n.insideGlobal || '')}" placeholder="203.0.113.10"></div>
+      <div class="row"><span class="k">overload (PAT)</span>
+        <input type="checkbox" id="nt-ovl" ${n.overload ? 'checked' : ''}></div>
+      <div class="row"><span class="k">source list</span>
+        <select id="nt-acl" style="width:96px"><option value="">RFC 1918</option>${(dev.acls || []).map(a =>
+          `<option value="${a.id}" ${String(n.aclId) === String(a.id) ? 'selected' : ''}>${a.id}</option>`).join('')}</select></div>
+      <div class="row"><span class="k">static / forward</span></div>${st}
+      <button id="nt-add" style="font-size:11px">+ mapping</button>
+      <div class="row" style="margin-top:8px"><span class="k">show ip nat translations</span></div>
+      <pre style="font-size:10px;white-space:pre-wrap;margin:2px 0">${esc(showIpNat(dev))}</pre>
+      <button id="nt-clear" style="font-size:11px">clear ip nat translation *</button>
+    </div>`;
+}
+function wireNatProps(dev) {
+  const cb = document.getElementById('dev-nat-on');
+  if (!cb) return;
+  const root = propsBody;
+  const save = () => {
+    const g = id => (document.getElementById(id) || {}).value;
+    dev.nat = {
+      enabled: cb.checked,
+      insideGlobal: (g('nt-ig') || '').trim(),
+      overload: !!(document.getElementById('nt-ovl') || {}).checked,
+      aclId: (g('nt-acl') || '') || undefined,
+      statics: [...root.querySelectorAll('[data-nat]')].map(el => {
+        const v = c => (el.querySelector('.' + c) || {}).value;
+        const o = { local: (v('nt-local') || '').trim(), global: (v('nt-global') || '').trim() };
+        if (v('nt-proto')) o.proto = v('nt-proto');
+        if (v('nt-lport')) o.localPort = +v('nt-lport');
+        if (v('nt-gport')) o.globalPort = +v('nt-gport');
+        return o;
+      }).filter(x => x.local && x.global)
+    };
+    natClear(dev.id);
+    showDeviceProps(dev.id);
+  };
+  cb.onchange = save;
+  for (const el of root.querySelectorAll('#dev-nat-cfg input, #dev-nat-cfg select')) el.onchange = save;
+  const add = document.getElementById('nt-add');
+  if (add) add.onclick = () => { dev.nat = dev.nat || { enabled: true }; (dev.nat.statics ||= []).push({ local: '', global: '' }); showDeviceProps(dev.id); };
+  const clr = document.getElementById('nt-clear');
+  if (clr) clr.onclick = () => { natClear(dev.id); showDeviceProps(dev.id); };
+  for (const b of root.querySelectorAll('.nt-del')) b.onclick = e => {
+    const i = +e.target.closest('[data-nat]').dataset.nat;
+    dev.nat.statics.splice(i, 1); natClear(dev.id); showDeviceProps(dev.id);
+  };
+}
+
 function wireAclProps(dev) {
   const ta = document.getElementById('dev-acl');
   if (!ta) return;
@@ -6543,6 +6774,7 @@ function showDeviceProps(id) {
     ${dhcpPropsHtml(dev)}
     ${circuitPropsHtml(dev)}
     ${routePropsHtml(dev)}
+    ${natPropsHtml(dev)}
     ${aclPropsHtml(dev)}
     ${l2TablesHtml(dev)}
     ${!isPlaced(dev) ? '<button id="dev-place">Place in 3D map</button>' : ''}
@@ -6558,6 +6790,7 @@ function showDeviceProps(id) {
   wireDhcpProps(dev);
   wireCircuitProps(dev);
   wireRouteProps(dev);
+  wireNatProps(dev);
   wireAclProps(dev);
   const placeBtn = document.getElementById('dev-place');
   if (placeBtn) placeBtn.onclick = () => {

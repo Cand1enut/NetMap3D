@@ -755,10 +755,13 @@ this order — the first one is foundational and several others depend on it.
    while leaving TCP alone — which the old address-only model could not express.
    The sim panel gained a traffic tester, because a ping only ever exercises
    ICMP echo and most of an ACL could otherwise never be verified.
-6. **NAT has no translation table and no PAT.** Real NAT tracks
-   inside-local/inside-global/outside-local/outside-global per flow and
-   overloads many inside hosts onto one public address by port. Also missing:
-   static NAT, port forwarding.
+6. ~~**NAT has no translation table and no PAT**~~ — FIXED v0.27.0. Real
+   translation table with Cisco's four address perspectives, PAT overload with
+   per-flow source-port allocation, static one-to-one, port forwarding, and
+   IOS default timeouts (TCP 86400 s, UDP 300 s, DNS 60 s, ICMP 60 s, FIN/RST
+   60 s). Entries are created by the first packet and age out. Unsolicited
+   inbound with no matching translation is dropped, which is what makes NAT a
+   de-facto inbound filter. `show ip nat translations` and a config UI.
 7. **STP converges instantly with no port states.** Real 802.1D moves
    blocking -> listening -> learning -> forwarding on timers (hello 2s,
    forward delay 15s, max age 20s), has PortFast/edge ports, and elects on
