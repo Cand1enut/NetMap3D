@@ -303,11 +303,11 @@ means internet access" (fixed in v0.19.1). These are the remaining known
 divergences from reality. Each is a defect, not a backlog nicety. Fix in roughly
 this order — the first one is foundational and several others depend on it.
 
-1. **Routers have one `ip` field, not per-interface addresses.** Real routers
-   address every interface separately, and that is what makes a default gateway,
-   inter-VLAN routing (SVIs), and NAT inside/outside meaningful. Everything below
-   is compromised until this is fixed. Needs `portCfg[port].ip` on routers, SVIs
-   per VLAN, and hostIp/gateway logic reading them.
+1. ~~**Routers have one `ip` field**~~ — FIXED v0.21.0. Routed ports
+   (`portCfg[port].ip`) and SVIs (`svi[vlan]`); a device with neither on a
+   segment is not a gateway there. Host default gateways are verified against
+   addresses actually present. Caught a real VLAN/subnet mismatch in the sample
+   site the moment it went in.
 2. ~~**`netClass()` guesses device role from port count**~~ — FIXED v0.20.0.
    Role is declared on every one of the 100 catalog entries; an undeclared SKU
    warns in console rather than being guessed. Caught three real
@@ -327,7 +327,8 @@ this order — the first one is foundational and several others depend on it.
    blocking -> listening -> learning -> forwarding on timers (hello 2s,
    forward delay 15s, max age 20s), has PortFast/edge ports, and elects on
    BPDUs. Also missing: RSTP/PVST+, which is what Cisco actually runs.
-8. **MAC tables never age.** Real default aging is 300 s.
+8. ~~**MAC tables never age**~~ — FIXED v0.22.0. Entries timestamped, 300 s
+   Cisco default, expired on read.
 9. **No routing protocols and no routing table.** Static routes, connected
    routes, OSPF/EIGRP, administrative distance, longest-prefix match.
 10. **Hosts assume a single NIC on port 1** (`hostVlan`, `hostPort`).
@@ -336,8 +337,10 @@ this order — the first one is foundational and several others depend on it.
     no VTP.
 12. **Link speed/duplex is never negotiated** — a 1G port cabled to a 100M port
     should train to 100M and both ends should report it.
-13. **Cable length affects nothing but a warning.** Real copper past 100 m
-    fails; the sim should mark the link down, not just flag it.
+13. ~~**Cable length affects nothing but a warning**~~ — FIXED v0.22.0. Channel
+    limit (100 m) fails the link; permanent link (90 m) warns with the remaining
+    patch-cord allowance. Fixing it exposed that the first hop was never
+    length-checked at all.
 
 Rule going forward: when a mechanism is modelled, model the whole mechanism. If
 it cannot be finished now, it does not ship as a partial — it stays out and
