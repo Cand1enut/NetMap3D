@@ -330,6 +330,42 @@ and is the part most likely to be faked. Per the standing rule: a Cisco switch
 gets IOS, a UniFi device gets UniFi OS, and each is a working environment, not
 a skin. Do one vendor completely before starting a second.
 
+**6. Cost of the build — a real bill of materials, with order links.**
+Track what the design costs, priced at the cheapest reputable seller, with a
+per-item custom price override and links to actually order the gear.
+
+The app already computes every cable's true routed length, so this is a genuine
+installer's BOM, not just a list of boxes. It rolls up:
+- devices by SKU and quantity
+- cable by type and total footage, plus the waste factor a real estimate carries
+- connectors and keystones, counted from actual endpoints
+- patch panels, racks, managers, and raceway/conduit by the foot from `state.raceways`
+- optionally a labour line, since drops are usually quoted per-drop
+
+Data model: a bundled price book keyed by SKU carrying MSRP, street price,
+currency, the source it came from, and the date it was captured. A per-SKU or
+per-device custom price always wins and is visibly marked as owner-set. Every
+price displayed shows its "as of" date — a stale price presented as current is
+the same class of error as a fake `show` command.
+
+**Constraint that shapes this: the app cannot silently fetch live prices.** It
+is a single portable HTML file with no backend; browsers block cross-origin
+retailer requests and retailers block scrapers regardless. So live pricing is
+NOT an invisible auto-feature. Honest options, in order of preference:
+- ship the price book with the build, refreshed when a version is cut
+- import a CSV/JSON price list the owner supplies or exports from a distributor
+- opt-in fetch, only if a backend or proxy ever exists
+Never render an old number as if it were today's.
+
+"Reputable" needs modelling, not a guess. For network gear the distinction that
+actually matters is **authorized distributor vs grey market** — grey-market
+Cisco and UniFi voids warranty, invalidates licensing and is where counterfeit
+optics come from. So a seller entry carries whether it is authorized for that
+brand, and the UI says so. Cheapest-that-is-reputable means cheapest authorized
+seller by default, with grey-market listings shown only if the owner opts in and
+clearly labelled. Order links are per-SKU and should prefer a stable product URL,
+falling back to a search URL keyed on the exact manufacturer part number.
+
 ## Definition of done — the data centre build
 
 Owner-set acceptance test for the whole simulation: **build an entire data
