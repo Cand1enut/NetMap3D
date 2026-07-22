@@ -128,9 +128,9 @@ Still to do:
 
 ### 2. Packet Tracer functionality — 100%
 
-Existing: L2/L3 reachability, ping/trace/matrix, DHCP (v0.14 partial).
+Done: L2/L3 reachability, ping/trace/matrix (v0.11), DHCP (v0.15),
+MAC + ARP tables (v0.16). Each shipped with its acceptance test passing.
 Remaining, roughly in order:
-- MAC + ARP tables, inspectable per device
 - STP with blocked-port rendering
 - ACLs, NAT + an Internet node
 - Management interfaces, per vendor (see below)
@@ -275,6 +275,10 @@ or screen-space GI, richer furniture/environment, texture detail.
 - Pushes get rejected because the owner edits on GitHub directly (has
   happened twice). Always fetch + inspect + rebase; never force-push over
   their commits; preserve their README edits.
+- Backticks inside a `git commit -m "..."` heredoc/double-quoted string are
+  shell command substitution — `` `state` `` silently vanished from a commit
+  body once. Use single quotes around code words in commit messages, or write
+  the message to a file and use `-F`.
 
 ## Per-version cadence
 
