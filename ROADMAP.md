@@ -126,10 +126,48 @@ Remaining, roughly in order:
 - MAC + ARP tables, inspectable per device
 - STP with blocked-port rendering
 - ACLs, NAT + an Internet node
-- Device CLI (IOS-flavoured show commands first, then config)
+- Management interfaces, per vendor (see below)
 - Routing protocols, VLAN trunk depth, LACP/HA/failover
 All of it must derive from catalog data via netClass() so new devices inherit
 simulation for free.
+
+#### Management interfaces must match the real vendor
+
+Owner requirement: "a cisco switch needs to use cisco commands and operate like
+a cisco switch, a unifi setup would have a unifiOS simulator."
+
+Critical design point: **not every vendor is CLI-managed.** Half this catalog is
+GUI-first in real life, so a fake CLI for those would be *less* accurate, not
+more. Build the surface the product actually has:
+
+CLI-first — build a real command interpreter:
+- **Cisco IOS / IOS-XE** (Catalyst): mode hierarchy `>` user EXEC → `#` priv
+  EXEC (`enable`) → `(config)#` (`configure terminal`) → `(config-if)#`.
+  Commands `show running-config`, `show ip interface brief`, `show vlan brief`,
+  `show mac address-table`, `show interfaces status`, `show spanning-tree`,
+  `show cdp neighbors`; config `interface GigabitEthernet1/0/1`,
+  `switchport mode access|trunk`, `switchport access vlan N`,
+  `switchport trunk allowed vlan a,b`, `no shutdown`, `write memory`.
+  Interface naming matters (`GigabitEthernet1/0/1`, `TenGigabitEthernet1/1/1`,
+  `Vlan10`). Support `?` help, tab completion and abbreviation (`sh ip int br`)
+  — that's most of what makes it feel like IOS.
+- **Aruba/HPE AOS-CX**: similar shape, different syntax — `interface 1/1/1`,
+  `vlan access 20`, `vlan trunk allowed 10,20`. Do NOT reuse IOS syntax.
+- **MikroTik RouterOS**: completely different — hierarchical menus,
+  `/interface print`, `/ip address print`, `/interface bridge vlan print`,
+  prompt `[admin@MikroTik] >`.
+
+GUI-first — build a simulated console panel, not a CLI:
+- **UniFi (UniFi OS / Network application)**: the real management surface is the
+  web console — Devices, Ports, Networks/VLANs, Clients, Topology. A "UniFi OS
+  simulator" means those panels, styled like UniFi OS, reading live sim state.
+  (Switches do have SSH, but nobody configures UniFi that way.)
+- **Meraki**: cloud dashboard, no meaningful CLI.
+- **TP-Link Omada / Aruba Instant On / Netgear**: controller web UI.
+
+Shared engine, per-vendor front end: every interface reads and writes the same
+sim state (VLANs, port config, MAC/ARP, routes). The vendor layer is only
+syntax/presentation, so a new SKU inherits management from its vendor pack.
 
 ### 3. Challenges / practice mode
 
