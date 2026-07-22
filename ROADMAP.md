@@ -143,9 +143,10 @@ simulation for free.
 Owner requirement: "a cisco switch needs to use cisco commands and operate like
 a cisco switch, a unifi setup would have a unifiOS simulator."
 
-Critical design point: **not every vendor is CLI-managed.** Half this catalog is
-GUI-first in real life, so a fake CLI for those would be *less* accurate, not
-more. Build the surface the product actually has:
+**Decided (owner):** build them how they are in real life. If a product is
+GUI-managed, that's fine — but the interface must be *present* for every device.
+Not every vendor is CLI-managed, so a fake CLI for a GUI product would be less
+accurate, not more. Build the surface the product actually has:
 
 CLI-first — build a real command interpreter:
 - **Cisco IOS / IOS-XE** (Catalyst): mode hierarchy `>` user EXEC → `#` priv

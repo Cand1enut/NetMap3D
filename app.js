@@ -340,7 +340,15 @@ function fmtLen(inches) {
   const ft = Math.floor(inches / 12), rem = Math.round(inches % 12);
   return rem === 0 ? `${ft}'` : `${ft}' ${rem}"`;
 }
-const WALL_H = 114, WALL_T = 4;  // 9'6" walls — tops meet the next level's slab (120" spacing, 6" slab)
+// 9'6" walls — tops meet the next level's slab (120" spacing, 6" slab).
+// WALL_T is a real 2x4 partition: 3.5" stud (nominal 2x4 actual is 1.5"x3.5")
+// plus 1/2" drywall each face = 4.5". The cavity a cable drops through is the
+// 3.5" stud depth, which is what STUD_BAY_D below is for.
+const WALL_H = 114, WALL_T = 4.5;
+const STUD_D = 3.5;              // stud depth = usable wall cavity
+const STUD_OC = 16;              // studs 16" on centre (24" also common)
+const OUTLET_AFF = 18;           // data outlets 18" above finished floor (NC STS-1000)
+const JHOOK_MAX_SPAN = 60;       // non-continuous supports max 5 ft (ANSI/TIA-569-B, BICSI)
 const LEVEL_H = 120;
 const SLAB_T = 6;
 
