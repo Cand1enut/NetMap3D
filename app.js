@@ -4131,7 +4131,7 @@ function pingInternet(host) {
     const r = deviceById(rid);
     const up = wanUplink(r);
     if (!up.ok) { lastReason = up.reason; continue; }
-    const acl = aclCheck(r, { in: walk.routers.get(rid).port, out: up.port }, ip.int, 0);
+    const acl = aclCheck(r, { in: walk.routers.get(rid).port, out: up.port }, icmpEchoPacket(ip.int, 0));
     if (acl.blocked) return { ok: false, reason: acl.reason, acl };
     const priv = isPrivateIp(ip.int);
     const wanIp = up.circuit.wanIp;
@@ -4160,14 +4160,52 @@ function pingInternet(host) {
 // and egress interfaces are resolved separately below.
 const ACL_STD = [[1, 99], [1300, 1999]];
 const ACL_EXT = [[100, 199], [2000, 2699]];
+const ACL_SEQ_STEP = 10;               // IOS: first entry 10, then +10
+
+// Cisco's port mnemonics. Three of them mean different things on TCP and UDP
+// (512/513/514), which is why these are two tables rather than one.
+const ACL_PORTS_TCP = { 'ftp-data': 20, ftp: 21, ssh: 22, telnet: 23, smtp: 25,
+  time: 37, whois: 43, tacacs: 49, domain: 53, gopher: 70, finger: 79, www: 80,
+  hostname: 101, pop2: 109, pop3: 110, sunrpc: 111, ident: 113, nntp: 119,
+  bgp: 179, irc: 194, exec: 512, login: 513, cmd: 514, lpd: 515, talk: 517,
+  uucp: 540, klogin: 543, kshell: 544, echo: 7, discard: 9, daytime: 13,
+  chargen: 19, drip: 3949 };
+const ACL_PORTS_UDP = { echo: 7, discard: 9, time: 37, nameserver: 42,
+  tacacs: 49, domain: 53, bootps: 67, bootpc: 68, tftp: 69, sunrpc: 111,
+  ntp: 123, 'netbios-ns': 137, 'netbios-dgm': 138, 'netbios-ss': 139,
+  snmp: 161, snmptrap: 162, xdmcp: 177, 'mobile-ip': 434, isakmp: 500,
+  biff: 512, who: 513, syslog: 514, talk: 517, rip: 520, 'pim-auto-rp': 496 };
+// ICMP message types by keyword — a rule may also give a bare numeric type.
+const ACL_ICMP = { 'echo-reply': 0, unreachable: 3, 'net-unreachable': 3,
+  'host-unreachable': 3, 'port-unreachable': 3, 'packet-too-big': 3,
+  'administratively-prohibited': 3, 'source-quench': 4, redirect: 5, echo: 8,
+  'router-advertisement': 9, 'router-solicitation': 10, 'time-exceeded': 11,
+  'ttl-exceeded': 11, traceroute: 30, 'parameter-problem': 12,
+  'timestamp-request': 13, 'timestamp-reply': 14 };
+
+function aclPortNum(tok, proto) {
+  if (tok === undefined) return null;
+  if (/^\d+$/.test(tok)) return parseInt(tok, 10);
+  const t = (proto === 'udp' ? ACL_PORTS_UDP : ACL_PORTS_TCP)[tok];
+  return t === undefined ? null : t;
+}
+function aclPortName(n, proto) {
+  const tbl = proto === 'udp' ? ACL_PORTS_UDP : ACL_PORTS_TCP;
+  for (const [k, v] of Object.entries(tbl)) if (v === n) return k;
+  return String(n);
+}
 function aclKind(id) {
   const n = parseInt(id, 10);
-  if (!isNaN(n)) {
+  if (String(id).match(/^\d+$/)) {
     if (ACL_STD.some(([a, b]) => n >= a && n <= b)) return 'standard';
     if (ACL_EXT.some(([a, b]) => n >= a && n <= b)) return 'extended';
     return null;                       // out of every valid numbered range
   }
-  return 'extended';                   // named lists behave as extended here
+  return null;                         // named lists declare their own kind
+}
+// A list's kind: numbered lists get it from the number, named lists carry it.
+function aclKindOf(acl) {
+  return acl.kind || aclKind(acl.id) || 'extended';
 }
 // "any" | "host x.x.x.x" | "x.x.x.x wild.card"
 function aclMatchAddr(spec, ipInt) {
@@ -4178,24 +4216,70 @@ function aclMatchAddr(spec, ipInt) {
   const mask = wild ? (~wild.int) >>> 0 : 0xFFFFFFFF;   // no wildcard = host match
   return ((ipInt & mask) >>> 0) === ((base.int & mask) >>> 0);
 }
-// Returns { permit, rule, index } — implicit deny when nothing matched.
-function aclEvaluate(acl, srcInt, dstInt) {
-  const kind = aclKind(acl.id);
-  const rules = acl.rules || [];
-  for (let i = 0; i < rules.length; i++) {
-    const r = rules[i];
-    if (!aclMatchAddr(r.src, srcInt)) continue;
-    if (kind === 'extended' && r.dst && !aclMatchAddr(r.dst, dstInt)) continue;
-    return { permit: r.action === 'permit', rule: r, index: i + 1 };
+// eq / neq / lt / gt / range, against the packet's port for that side.
+function aclMatchPort(spec, port) {
+  if (!spec) return true;
+  if (port === null || port === undefined) return false;  // rule wants a port, packet has none
+  const p = spec.ports;
+  switch (spec.op) {
+    case 'eq': return p.includes(port);
+    case 'neq': return !p.includes(port);
+    case 'lt': return port < p[0];
+    case 'gt': return port > p[0];
+    case 'range': return port >= p[0] && port <= p[1];
+    default: return true;
   }
-  return { permit: false, rule: null, index: null, implicit: true };
+}
+// A rule's protocol admits the packet's protocol. "ip" matches everything,
+// which is why a deny ip entry stops ICMP as well as TCP.
+function aclMatchProto(rule, pkt) {
+  const rp = rule.proto || 'ip';
+  if (rp === 'ip') return true;
+  return rp === pkt.proto;
+}
+function aclMatchIcmp(rule, pkt) {
+  if (rule.icmpType === undefined || rule.icmpType === null) return true;
+  if (pkt.proto !== 'icmp') return false;
+  const want = typeof rule.icmpType === 'number' ? rule.icmpType : ACL_ICMP[rule.icmpType];
+  const got = typeof pkt.icmpType === 'number' ? pkt.icmpType : ACL_ICMP[pkt.icmpType];
+  return want === got;
+}
+
+// Evaluate a packet against one list. A packet is
+// { proto, srcInt, dstInt, srcPort, dstPort, established, icmpType }.
+// Returns { permit, rule, seq, implicit } — implicit deny when nothing matched.
+function aclEvaluate(acl, pkt, opts = {}) {
+  const kind = aclKindOf(acl);
+  const rules = acl.rules || [];
+  for (const r of rules) {
+    if (r.remark !== undefined) continue;              // remarks never match
+    if (!aclMatchAddr(r.src, pkt.srcInt)) continue;
+    if (kind === 'extended') {
+      if (!aclMatchProto(r, pkt)) continue;
+      if (r.dst && !aclMatchAddr(r.dst, pkt.dstInt)) continue;
+      if (!aclMatchPort(r.srcPort, pkt.srcPort)) continue;
+      if (!aclMatchPort(r.dstPort, pkt.dstPort)) continue;
+      if (!aclMatchIcmp(r, pkt)) continue;
+      // "established" admits only TCP that is part of an existing conversation
+      // — the ACK or RST bit set. A fresh SYN never matches it, which is the
+      // whole reason the keyword exists.
+      if (r.established && !(pkt.proto === 'tcp' && pkt.established)) continue;
+    }
+    if (opts.count !== false) r.hits = (r.hits || 0) + 1;
+    return { permit: r.action === 'permit', rule: r, seq: r.seq };
+  }
+  return { permit: false, rule: null, seq: null, implicit: true };
 }
 function deviceAcl(dev, id) {
   return (dev.acls || []).find(a => String(a.id) === String(id)) || null;
 }
+// Human-readable "why", naming the entry that did it.
+function aclRuleText(acl, r) {
+  return aclLineText(acl, r).trim();
+}
 // Check every ACL a packet meets crossing this router. `ports` is
 // { in: <port|null>, out: <port|null> } resolved from the L2 walk on each side.
-function aclCheck(router, ports, srcInt, dstInt) {
+function aclCheck(router, ports, pkt) {
   const applied = router.aclApply || {};
   for (const [port, dir] of [[ports.in, 'in'], [ports.out, 'out']]) {
     if (port === null || port === undefined) continue;
@@ -4203,41 +4287,94 @@ function aclCheck(router, ports, srcInt, dstInt) {
     if (!id) continue;
     const acl = deviceAcl(router, id);
     if (!acl) continue;
-    const res = aclEvaluate(acl, srcInt, dstInt);
+    const res = aclEvaluate(acl, pkt);
     if (!res.permit) {
+      const what = `${pkt.proto}${pkt.dstPort ? ' port ' + pkt.dstPort : ''}${pkt.proto === 'icmp' && pkt.icmpType ? ' ' + pkt.icmpType : ''}`;
       return {
-        blocked: true, router, aclId: acl.id, dir, port,
+        blocked: true, router, aclId: acl.id, dir, port, packet: pkt,
         reason: res.implicit
-          ? `blocked by ACL ${acl.id} on ${router.name} ${dir} port ${port} — implicit deny any`
-          : `blocked by ACL ${acl.id} rule ${res.index} on ${router.name} ${dir} port ${port}`
+          ? `${what} blocked by ACL ${acl.id} on ${router.name} ${dir} port ${port} — implicit deny any at the end of the list`
+          : `${what} blocked by ACL ${acl.id} on ${router.name} ${dir} port ${port} — "${aclRuleText(acl, res.rule)}"`
       };
     }
   }
   return { blocked: false };
 }
+// A ping is ICMP echo, not an abstract "packet". Modelling it as such is what
+// makes "deny icmp" and "permit tcp any any eq 80" behave differently, which
+// they must.
+function icmpEchoPacket(srcInt, dstInt) {
+  return { proto: 'icmp', srcInt, dstInt, srcPort: null, dstPort: null, icmpType: 'echo', established: false };
+}
 
 // Parse real IOS access-list syntax so what you type here is what you'd type on
-// the device:
+// the device. Both forms are accepted, because both are real:
+//
 //   access-list 10 permit 10.0.10.0 0.0.0.255
-//   access-list 110 deny ip 10.0.10.0 0.0.0.255 10.0.30.0 0.0.0.255
-//   access-list 110 permit ip any any
+//   access-list 110 deny tcp any host 10.0.10.5 eq www
+//   access-list 110 permit tcp any any established
+//   ip access-list extended BLOCK-CCTV
+//    10 deny ip 10.0.30.0 0.0.0.255 10.0.10.0 0.0.0.255
+//    20 permit ip any any
+//
 // Returns { acls, errors } — errors carry the line so bad input is reported,
 // never silently dropped.
 function parseAclText(text) {
   const acls = new Map(), errors = [];
   const lines = String(text || '').split('\n');
+  let ctx = null;                        // the named list we're inside, if any
+  const get = (id, kind) => {
+    if (!acls.has(id)) acls.set(id, { id, kind, rules: [], named: kind !== undefined && !/^\d+$/.test(String(id)) });
+    return acls.get(id);
+  };
+  const nextSeq = (acl) => (acl.rules.reduce((m, r) => Math.max(m, r.seq || 0), 0) || 0) + ACL_SEQ_STEP;
+
   lines.forEach((raw, i) => {
     const line = raw.trim();
+    const err = msg => errors.push({ line: i + 1, text: line, msg });
     if (!line || line.startsWith('!')) return;
-    const t = line.split(/\s+/);
-    if (t[0] !== 'access-list') { errors.push({ line: i + 1, text: line, msg: 'expected "access-list"' }); return; }
-    const id = t[1];
-    if (!aclKind(id)) { errors.push({ line: i + 1, text: line, msg: `${id} is not a valid access-list number` }); return; }
-    const action = t[2];
-    if (action !== 'permit' && action !== 'deny') { errors.push({ line: i + 1, text: line, msg: 'expected permit or deny' }); return; }
-    let k = 3;
-    const ext = aclKind(id) === 'extended';
-    if (ext) { if (t[k] === 'ip') k++; else { errors.push({ line: i + 1, text: line, msg: 'extended list needs a protocol (ip)' }); return; } }
+    let t = line.split(/\s+/);
+
+    // enter a named list
+    if (t[0] === 'ip' && t[1] === 'access-list') {
+      const kind = t[2];
+      if (kind !== 'standard' && kind !== 'extended') { err('expected "standard" or "extended"'); return; }
+      if (!t[3]) { err('named access-list needs a name'); return; }
+      ctx = get(t[3], kind);
+      ctx.kind = kind; ctx.named = true;
+      return;
+    }
+
+    let acl, seq = null;
+    if (t[0] === 'access-list') {        // numbered, one line per entry
+      ctx = null;
+      const id = t[1];
+      const kind = aclKind(id);
+      if (!kind) { err(`${id} is not a valid access-list number`); return; }
+      acl = get(id, kind); acl.kind = kind;
+      t = t.slice(2);
+    } else if (ctx) {                    // a line inside a named list
+      acl = ctx;
+      if (/^\d+$/.test(t[0])) { seq = parseInt(t[0], 10); t = t.slice(1); }
+    } else {
+      err('expected "access-list" or "ip access-list"');
+      return;
+    }
+
+    if (t[0] === 'remark') {
+      acl.rules.push({ seq: seq === null ? nextSeq(acl) : seq, remark: t.slice(1).join(' ') });
+      return;
+    }
+    const action = t[0];
+    if (action !== 'permit' && action !== 'deny') { err('expected permit, deny or remark'); return; }
+    let k = 1;
+    const ext = aclKindOf(acl) === 'extended';
+    let proto = 'ip';
+    if (ext) {
+      const p = t[k];
+      if (['ip', 'tcp', 'udp', 'icmp'].includes(p)) { proto = p; k++; }
+      else { err(`extended list needs a protocol (ip, tcp, udp, icmp), got "${p || 'nothing'}"`); return; }
+    }
     const readAddr = () => {
       if (t[k] === 'any') { k++; return { any: true }; }
       if (t[k] === 'host') { k++; return { addr: t[k++] }; }
@@ -4245,24 +4382,100 @@ function parseAclText(text) {
       const wild = (t[k] && /^\d+\.\d+\.\d+\.\d+$/.test(t[k])) ? t[k++] : undefined;
       return wild ? { addr, wild } : { addr };
     };
+    const readPort = () => {
+      const op = t[k];
+      if (!['eq', 'neq', 'lt', 'gt', 'range'].includes(op)) return null;
+      if (proto !== 'tcp' && proto !== 'udp') { err(`port operators only apply to tcp and udp, not ${proto}`); return null; }
+      k++;
+      const want = op === 'range' ? 2 : 1;
+      const ports = [];
+      // eq accepts a list of ports on real IOS; range takes exactly two.
+      while (t[k] !== undefined && ports.length < (op === 'eq' ? 10 : want)) {
+        const n = aclPortNum(t[k], proto);
+        if (n === null) break;
+        ports.push(n); k++;
+        if (op !== 'eq' && ports.length === want) break;
+      }
+      if (!ports.length) { err(`${op} needs a port`); return null; }
+      return { op, ports };
+    };
     const src = readAddr();
+    const srcPort = ext ? readPort() : null;
     const dst = ext ? readAddr() : undefined;
-    if (!acls.has(id)) acls.set(id, { id, rules: [] });
-    acls.get(id).rules.push(dst ? { action, src, dst } : { action, src });
+    const dstPort = ext ? readPort() : null;
+    let established = false, icmpType = null, log = false;
+    while (t[k] !== undefined) {
+      const tok = t[k];
+      if (tok === 'established') { established = true; k++; continue; }
+      if (tok === 'log' || tok === 'log-input') { log = true; k++; continue; }
+      if (proto === 'icmp' && (ACL_ICMP[tok] !== undefined || /^\d+$/.test(tok))) {
+        icmpType = /^\d+$/.test(tok) ? parseInt(tok, 10) : tok; k++; continue;
+      }
+      err(`unrecognised keyword "${tok}"`); return;
+    }
+    if (established && proto !== 'tcp') { err('"established" is only valid on tcp'); return; }
+    const rule = { seq: seq === null ? nextSeq(acl) : seq, action, proto, src, hits: 0 };
+    if (srcPort) rule.srcPort = srcPort;
+    if (dst) rule.dst = dst;
+    if (dstPort) rule.dstPort = dstPort;
+    if (established) rule.established = true;
+    if (icmpType !== null) rule.icmpType = icmpType;
+    if (log) rule.log = true;
+    acl.rules.push(rule);
   });
+  // IOS keeps entries in sequence order, not entry order.
+  for (const a of acls.values()) a.rules.sort((x, y) => (x.seq || 0) - (y.seq || 0));
   return { acls: [...acls.values()], errors };
 }
-// Render ACLs back to IOS syntax for the editor.
+
+// One entry, rendered the way IOS prints it.
+function aclLineText(acl, r) {
+  if (r.remark !== undefined) return ` remark ${r.remark}`;
+  const ext = aclKindOf(acl) === 'extended';
+  const addr = sp => sp.any ? 'any' : (sp.wild ? `${sp.addr} ${sp.wild}` : `host ${sp.addr}`);
+  const port = sp => !sp ? '' : ` ${sp.op} ${sp.ports.map(p => aclPortName(p, r.proto)).join(' ')}`;
+  let s = ` ${r.action}`;
+  if (ext) s += ` ${r.proto || 'ip'}`;
+  s += ` ${addr(r.src)}${port(r.srcPort)}`;
+  if (ext && r.dst) s += ` ${addr(r.dst)}${port(r.dstPort)}`;
+  if (r.icmpType !== undefined && r.icmpType !== null) s += ` ${r.icmpType}`;
+  if (r.established) s += ' established';
+  if (r.log) s += ' log';
+  return s;
+}
+// Render ACLs back to IOS syntax for the editor. Named lists print in their own
+// block form; numbered ones print one access-list line per entry.
 function aclToText(acls) {
   const out = [];
   for (const a of acls || []) {
-    const ext = aclKind(a.id) === 'extended';
-    for (const r of a.rules) {
-      const addr = (sp) => sp.any ? 'any' : (sp.wild ? `${sp.addr} ${sp.wild}` : `host ${sp.addr}`);
-      out.push(`access-list ${a.id} ${r.action}${ext ? ' ip' : ''} ${addr(r.src)}${ext && r.dst ? ' ' + addr(r.dst) : ''}`);
+    if (a.named) {
+      out.push(`ip access-list ${aclKindOf(a)} ${a.id}`);
+      for (const r of a.rules) out.push(` ${r.seq}${aclLineText(a, r)}`);
+    } else {
+      for (const r of a.rules) {
+        out.push(r.remark !== undefined
+          ? `access-list ${a.id} remark ${r.remark}`
+          : `access-list ${a.id}${aclLineText(a, r)}`);
+      }
     }
   }
   return out.join('\n');
+}
+// `show access-lists`, including the per-entry match counts that are how ACLs
+// are actually debugged on a live device.
+function aclShow(dev) {
+  const out = [];
+  for (const a of dev.acls || []) {
+    out.push(`${aclKindOf(a) === 'standard' ? 'Standard' : 'Extended'} IP access list ${a.id}`);
+    for (const r of a.rules) {
+      const hits = r.remark === undefined && r.hits ? ` (${r.hits} match${r.hits === 1 ? '' : 'es'})` : '';
+      out.push(`    ${r.seq}${aclLineText(a, r)}${hits}`);
+    }
+  }
+  return out.join('\n');
+}
+function aclResetHits(dev) {
+  for (const a of dev.acls || []) for (const r of a.rules) r.hits = 0;
 }
 
 //////////////////// Spanning Tree (802.1D) ////////////////////
@@ -4421,7 +4634,11 @@ function noAddressReason(d) {
   return r.ok ? `${d.name} has no valid IP` : `${d.name} has no DHCP lease — ${r.reason}`;
 }
 
-function pingHosts(aId, bId) {
+// `pkt` lets the caller send something other than a ping. Everything about the
+// path is identical — only the packet the ACLs see changes, which is exactly
+// the difference between "can these two reach each other" and "can this host
+// reach that server on 443".
+function pingHosts(aId, bId, pkt) {
   const a = deviceById(aId), b = deviceById(bId);
   if (!a || !b) return { ok: false, reason: 'device not found' };
   if (a.id === b.id) return { ok: true, mode: 'self', hops: [a.id], detail: 'loopback' };
@@ -4439,6 +4656,7 @@ function pingHosts(aId, bId) {
   // Different subnets → routing. Each host needs a gateway that genuinely holds
   // an address in that host's subnet, and the two gateways must be able to
   // reach each other. A router merely sitting on the segment is not a gateway.
+  const mkPkt = (s, d) => pkt ? { ...icmpEchoPacket(s, d), ...pkt, srcInt: s, dstInt: d } : icmpEchoPacket(s, d);
   const l2A = l2Walk(a, { vlan: hostVlan(a) });
   const l2B = l2Walk(b, { vlan: hostVlan(b) });
   const gwA = gatewayForHost(a, l2A, ipA);
@@ -4449,7 +4667,7 @@ function pingHosts(aId, bId) {
   const ifOf = (walk, rid) => { const j = walk.routers.get(rid); return j ? j.port : null; };
   if (gwA.id === gwB.id) {
     const g = deviceById(gwA.id);
-    const acl = aclCheck(g, { in: ifOf(l2A, gwA.id), out: ifOf(l2B, gwB.id) }, ipA.int, ipB.int);
+    const acl = aclCheck(g, { in: ifOf(l2A, gwA.id), out: ifOf(l2B, gwB.id) }, mkPkt(ipA.int, ipB.int));
     if (acl.blocked) return { ok: false, mode: 'l3', reason: acl.reason, acl };
     return { ok: true, mode: 'l3', hops: [a.id, gwA.id, b.id],
       detail: `routed by ${g.name}: ${ipStr(gwA.iface.ip.int)} (${gwA.iface.kind === 'svi' ? 'Vlan' + gwA.iface.vlan : 'port ' + gwA.iface.port})` +
@@ -4460,7 +4678,7 @@ function pingHosts(aId, bId) {
   if (path) {
     for (const rid of path) {
       const r = deviceById(rid);
-      const acl = aclCheck(r, { in: ifOf(l2A, rid), out: ifOf(l2B, rid) }, ipA.int, ipB.int);
+      const acl = aclCheck(r, { in: ifOf(l2A, rid), out: ifOf(l2B, rid) }, mkPkt(ipA.int, ipB.int));
       if (acl.blocked) return { ok: false, mode: 'l3', reason: acl.reason, acl };
     }
     return { ok: true, mode: 'l3', hops: [a.id, ...path, b.id], detail: `routed via ${path.map(id => deviceById(id).name).join(' → ')}` };
@@ -5759,8 +5977,8 @@ function aclPropsHtml(dev) {
     .flatMap(([p, d]) => Object.entries(d).map(([dir, id]) => `<tr><td>Port ${p}</td><td>${dir}</td><td>${id}</td></tr>`)).join('');
   return `
     <div class="row" style="margin-top:10px"><span class="k">Access lists</span></div>
-    <textarea id="dev-acl" rows="3" style="width:100%;font-size:11px"
-      placeholder="access-list 110 deny ip 10.0.10.0 0.0.0.255 10.0.30.0 0.0.0.255">${aclToText(dev.acls)}</textarea>
+    <textarea id="dev-acl" rows="6" style="width:100%;font-size:11px"
+      placeholder="access-list 110 deny tcp any host 10.0.10.5 eq www&#10;access-list 110 permit ip any any&#10;&#10;ip access-list extended BLOCK-CCTV&#10; 10 remark cameras must not reach servers&#10; 20 deny ip 10.0.30.0 0.0.0.255 10.0.10.0 0.0.0.255&#10; 30 permit ip any any">${esc(aclToText(dev.acls))}</textarea>
     <div id="dev-acl-err" class="ai-bad" style="font-size:11px"></div>
     <div class="row"><span class="k">Apply</span>
       <select id="dev-acl-port" style="width:62px">${Array.from({ length: Math.min(def.ports || 0, 24) }, (_, i) =>
@@ -7729,6 +7947,73 @@ function runDhcp() {
   bind('dh-clear', () => dhcpClearBindings());
 }
 document.getElementById('sim-dhcp').onclick = runDhcp;
+
+// `show access-lists` plus a traffic tester. A ping only ever exercises ICMP
+// echo, so without a way to send TCP on a chosen port most of an ACL can never
+// be verified — and an ACL you cannot test is an ACL you are guessing about.
+function runAcl() {
+  const withAcls = state.devices.filter(d => isPlaced(d) && (d.acls || []).length);
+  let html = '';
+  if (!withAcls.length) {
+    html += `<p>No access lists. Add them in a router's properties, in IOS syntax:</p>
+      <p><code>access-list 110 deny tcp any host 10.0.10.5 eq www</code></p>
+      <p><code>ip access-list extended BLOCK-CCTV</code></p>`;
+  }
+  for (const d of withAcls) {
+    const applied = d.aclApply || {};
+    const rows = Object.entries(applied).flatMap(([p, dd]) =>
+      Object.entries(dd).map(([dir, id]) => `<tr><td>Port ${p}</td><td>${dir}</td><td>${id}</td></tr>`)).join('');
+    html += `<h4>${d.name} · show access-lists</h4><pre style="font-size:11px;white-space:pre-wrap">${esc(aclShow(d))}</pre>`;
+    html += rows
+      ? `<table class="sim-table"><tr><th>Interface</th><th>Dir</th><th>ACL</th></tr>${rows}</table>`
+      : `<p class="ai-warn">None of ${d.name}'s lists are applied to an interface — an ACL that isn't applied filters nothing.</p>`;
+  }
+  const hosts = state.devices.filter(d => isPlaced(d) && netClass(d) === 'host' && d.ip);
+  const opts = hosts.map(h => `<option value="${h.id}">${h.name}</option>`).join('');
+  html += `<h4>Test traffic</h4>
+    <div class="row" style="gap:4px;flex-wrap:wrap">
+      <select id="acl-a" style="width:96px">${opts}</select>
+      <span class="sim-arrow">→</span>
+      <select id="acl-b" style="width:96px">${opts}</select>
+      <select id="acl-proto" style="width:64px">
+        <option value="icmp">icmp</option><option value="tcp">tcp</option>
+        <option value="udp">udp</option></select>
+      <input type="text" id="acl-port" style="width:72px" placeholder="port / www">
+      <label style="font-size:11px"><input type="checkbox" id="acl-est"> established</label>
+      <button id="acl-run">Send</button>
+    </div>
+    <div id="acl-result" style="margin-top:6px"></div>`;
+  aiPrint(html);
+  const sel = id => document.getElementById(id);
+  if (hosts.length > 1) { sel('acl-a').value = hosts[0].id; sel('acl-b').value = hosts[1].id; }
+  const btn = sel('acl-run');
+  if (btn) btn.onclick = () => {
+    const a = +sel('acl-a').value, b = +sel('acl-b').value;
+    const proto = sel('acl-proto').value;
+    const raw = (sel('acl-port').value || '').trim();
+    const est = sel('acl-est').checked;
+    let pkt;
+    if (proto === 'icmp') pkt = { proto: 'icmp', icmpType: 'echo', srcPort: null, dstPort: null };
+    else {
+      const dstPort = raw ? aclPortNum(raw, proto) : null;
+      if (raw && dstPort === null) {
+        sel('acl-result').innerHTML = `<p class="ai-bad">"${esc(raw)}" isn't a port number or a ${proto} mnemonic.</p>`;
+        return;
+      }
+      // Real clients source from an ephemeral port; rules matching a source
+      // port must see something plausible rather than nothing.
+      pkt = { proto, srcPort: 49152, dstPort, established: est, icmpType: null };
+    }
+    for (const d of state.devices) aclResetHits(d);
+    const r = pingHosts(a, b, pkt);
+    const desc = proto === 'icmp' ? 'icmp echo'
+      : `${proto}${pkt.dstPort ? ' → port ' + aclPortName(pkt.dstPort, proto) : ''}${est ? ' established' : ''}`;
+    sel('acl-result').innerHTML = r.ok
+      ? `<p class="ai-good">${desc}: permitted — ${esc(r.detail || 'delivered')}</p>`
+      : `<p class="ai-bad">${desc}: ${esc(r.reason)}</p>`;
+  };
+}
+document.getElementById('sim-acl').onclick = runAcl;
 
 function runStp() {
   flushL2Tables();

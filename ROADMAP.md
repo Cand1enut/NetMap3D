@@ -324,7 +324,9 @@ created on the first packet and time out.
 **ACLs (completing).** Protocol and port matching (`permit tcp any host x eq
 80`), named lists with their own syntax and sequence numbers, `established`,
 ICMP types, remarks. Per-entry hit counters, since that is how ACLs are actually
-debugged.
+debugged. — BUILT in v0.25.0. Still absent, and each needs its own spec before
+being started: reflexive ACLs, time-based ACLs, object groups, and the
+`ip access-list resequence` command.
 
 **STP (completing).** Port states blocking → listening → learning → forwarding
 on real timers (hello 2 s, forward delay 15 s, max age 20 s). BPDU exchange
@@ -380,9 +382,17 @@ this order — the first one is foundational and several others depend on it.
    EXPIRED, and on expiry the client stops using the address. RENEWING unicasts
    to the leasing server; REBINDING broadcasts. A client that cannot keep its
    address gets a NAK and restarts.
-5. **ACLs match addresses only.** Real ACLs match protocol and ports
-   (`permit tcp any host x eq 80`), established, ICMP types. Named ACLs are
-   currently treated as extended rather than having their own syntax.
+5. ~~**ACLs match addresses only**~~ — FIXED v0.25.0. Protocol (ip/tcp/udp/
+   icmp), port operators (eq/neq/lt/gt/range) with Cisco's mnemonics — kept as
+   separate TCP and UDP tables because 512/513/514 mean different things on
+   each — `established` (ACK or RST, TCP only), ICMP types, `log`, and remarks.
+   Named lists have their own `ip access-list extended NAME` block syntax with
+   sequence numbers starting at 10 and stepping by 10, and entries evaluate in
+   sequence order. Per-entry hit counters, shown by `show access-lists`.
+   A ping is now genuinely ICMP echo, so `deny icmp any any echo` stops a ping
+   while leaving TCP alone — which the old address-only model could not express.
+   The sim panel gained a traffic tester, because a ping only ever exercises
+   ICMP echo and most of an ACL could otherwise never be verified.
 6. **NAT has no translation table and no PAT.** Real NAT tracks
    inside-local/inside-global/outside-local/outside-global per flow and
    overloads many inside hosts onto one public address by port. Also missing:
