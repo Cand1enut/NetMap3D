@@ -3158,7 +3158,15 @@ function setVlanFocus(f) {
 // layer and gateway-based routing on top. This is the Packet-Tracer core: the
 // value is the honest failure reason, not just red/green.
 
-const COPPER_LIMIT_FT = 328;   // 100 m TIA/EIA channel limit for twisted pair
+// TIA-568 distinguishes two lengths and they mean different things:
+//   permanent link — the fixed cable, outlet to patch panel:      90 m (295 ft)
+//   channel        — permanent link plus patch cords at both ends: 100 m (328 ft)
+// A run over the channel limit does not pass traffic, so l2Walk refuses it.
+// A run between 90 and 100 m is legal only if the patch cords fit inside the
+// remaining allowance, which is why exceeding the permanent link is a warning
+// rather than a failure.
+const COPPER_LIMIT_FT = 328;        // 100 m channel — hard failure
+const PERMANENT_LINK_FT = 295;      // 90 m permanent link — warn past this
 
 // ---- IP / subnet math (v4) ----
 function parseIp(str) {
@@ -3394,6 +3402,12 @@ function l2Walk(startDev, opts = {}) {
   const seen = new Set();
   const start = hopThroughPatches(startDev, fromPort, FRONT);
   if (!start) return { hosts: reachedHosts, routers: reachedRouters, prev, start: null };
+  // The first hop is a cable too. Checking length only when spreading from a
+  // switch missed the most common case of all — an over-length drop cable on
+  // the host itself, which passed as if it were fine.
+  if (!opts.ignoreLength && start.cable && (start.cable.lengthIn || 0) / 12 > COPPER_LIMIT_FT) {
+    return { hosts: reachedHosts, routers: reachedRouters, prev, start: null, overLength: true };
+  }
   const startKey = `${start.dev.id}:${start.port}:${start.side}`;
   const q = [{ dev: start.dev, port: start.port, side: start.side, key: startKey }];
   prev.set(startKey, `${startDev.id}:${fromPort}:${FRONT}`);
@@ -3442,7 +3456,12 @@ function l2Walk(startDev, opts = {}) {
 // session. First octet 0x02 marks a locally-administered address, which is the
 // correct way to mint an address you don't own; inventing a real vendor OUI
 // would misattribute hardware we don't have a registry entry for.
-const macTables = new Map();   // switchId -> Map(mac -> { port, vlan })
+// Cisco Catalyst default aging is 300 s: an entry for a station that stops
+// talking is discarded, which is why a MAC table is a picture of recent traffic
+// rather than a permanent inventory. Timestamps are real wall-clock, so leaving
+// the app idle and coming back genuinely shows an aged-out table.
+const MAC_AGE_MS = 300 * 1000;
+const macTables = new Map();   // switchId -> Map(mac -> { port, vlan, at })
 const arpCaches = new Map();   // hostId   -> Map(ipString -> mac)
 
 function deviceMac(dev) {
@@ -3453,7 +3472,17 @@ function deviceMac(dev) {
 function macLearn(devId, mac, port, vlan) {
   let t = macTables.get(devId);
   if (!t) macTables.set(devId, t = new Map());
-  t.set(mac, { port, vlan });
+  t.set(mac, { port, vlan, at: Date.now() });
+}
+// Live entries only — anything past the aging time is gone, and is removed on
+// read the way a real table expires it.
+function macEntries(devId, ageMs) {
+  const t = macTables.get(devId);
+  if (!t) return [];
+  const limit = ageMs === undefined ? MAC_AGE_MS : ageMs;
+  const now = Date.now();
+  for (const [mac, e] of [...t]) if (now - (e.at || 0) > limit) t.delete(mac);
+  return [...t];
 }
 function arpLearn(hostId, ip, mac) {
   let c = arpCaches.get(hostId);
@@ -5293,9 +5322,9 @@ function wireAclProps(dev) {
 function l2TablesHtml(dev) {
   const cls = netClass(dev);
   if (cls === 'switch') {
-    const t = macTables.get(dev.id);
-    if (!t || !t.size) return `<p class="cbl-edit-hint">MAC address table empty — run a ping to populate it.</p>`;
-    const rows = [...t].sort((a, b) => a[1].port - b[1].port)
+    const t = macEntries(dev.id);
+    if (!t.length) return `<p class="cbl-edit-hint">MAC address table empty — run a ping to populate it. Entries age out after ${MAC_AGE_MS / 1000}s.</p>`;
+    const rows = t.sort((a, b) => a[1].port - b[1].port)
       .map(([mac, e]) => `<tr><td>${e.vlan}</td><td>${mac}</td><td>Port ${e.port}</td></tr>`).join('');
     return `<div class="row" style="margin-top:10px"><span class="k">MAC address table</span></div>
       <table class="sim-table"><tr><th>VLAN</th><th>MAC</th><th>Port</th></tr>${rows}</table>`;
@@ -6795,7 +6824,12 @@ function analyzeMap() {
   for (const c of state.cables) {
     const ft = (c.lengthIn || 0) / 12;
     const da = deviceById(c.a.deviceId), db = deviceById(c.b.deviceId);
-    if (ft > 328) issues.push(`Cable <b>${da ? da.name : '?'}:${c.a.port} → ${db ? db.name : '?'}:${c.b.port}</b> is ${ft.toFixed(0)} ft — over the 328 ft Ethernet limit.`);
+    const runName = `${da ? da.name : '?'}:${c.a.port} → ${db ? db.name : '?'}:${c.b.port}`;
+    if (ft > COPPER_LIMIT_FT) {
+      issues.push(`Cable <b>${runName}</b> is ${ft.toFixed(0)} ft — past the ${COPPER_LIMIT_FT} ft (100 m) channel limit. This link will not pass traffic.`);
+    } else if (ft > PERMANENT_LINK_FT) {
+      notes.push(`Cable <b>${runName}</b> is ${ft.toFixed(0)} ft — past the ${PERMANENT_LINK_FT} ft (90 m) permanent link. Legal only if patch cords at both ends stay inside the remaining ${(COPPER_LIMIT_FT - ft).toFixed(0)} ft.`);
+    }
     if (da && db) {
       const sh = sharedVlans(da, c.a.port, db, c.b.port);
       if (sh !== 'ALL' && sh.size === 0)
