@@ -282,9 +282,11 @@ this order — the first one is foundational and several others depend on it.
    inter-VLAN routing (SVIs), and NAT inside/outside meaningful. Everything below
    is compromised until this is fixed. Needs `portCfg[port].ip` on routers, SVIs
    per VLAN, and hostIp/gateway logic reading them.
-2. **`netClass()` guesses device role from port count** (>=8 ports = switch).
-   Role must come from the catalog entry, not a heuristic. A 5-port switch or a
-   multi-NIC server is currently misclassified.
+2. ~~**`netClass()` guesses device role from port count**~~ — FIXED v0.20.0.
+   Role is declared on every one of the 100 catalog entries; an undeclared SKU
+   warns in console rather than being guessed. Caught three real
+   misclassifications (Flex Mini, Switch Ultra, Flex 2.5G were simulated as
+   endpoints instead of switches).
 3. **DHCP serves one pool per device.** Real gateways serve a scope per
    subnet/VLAN, with lease time, reservations, and options (gateway, DNS).
 4. **No DHCP lease lifecycle** — no lease time, renewal, or expiry.
@@ -315,6 +317,15 @@ Rule going forward: when a mechanism is modelled, model the whole mechanism. If
 it cannot be finished now, it does not ship as a partial — it stays out and
 stays on this list. A half-modelled mechanism silently teaches the user
 something false, which is worse than an absent feature.
+
+**Do not reason "I would normally simplify this, but I was told not to."** The
+simplification should not be a candidate in the first place. Owner, verbatim:
+"reverse that thinking and don't even consider corner cutting a possibility."
+Two tells that a shortcut is being taken, both caught in this project:
+- A heuristic standing in for data (port count guessing device role).
+- Bulk regex-patching a data file instead of reading each entry and setting it
+  deliberately. If the edit is too tedious to do properly, that is a signal the
+  data model is wrong, not a licence to batch-guess.
 
 ## Traps already hit once (don't repeat)
 
