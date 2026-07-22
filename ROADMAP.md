@@ -451,6 +451,56 @@ physical plan the app already has: "punch panel port 12 rear, patch front 12 to
 Gi1/0/12" and then "configure Gi1/0/12 as access VLAN 20" belong in the same
 numbered sequence. Output must be printable and readable on a phone in a closet.
 
+## Cloud + real-time collaboration is an ARCHITECTURAL CONSTRAINT, not item 9
+
+This becomes a cloud app where several people edit one site simultaneously,
+Google-Docs style. That is owner priority 4, but it must not be treated as
+something bolted on after the rest — it constrains the data model now, and every
+item above is affected by it. Retrofitting sync onto ad-hoc mutation is a
+rewrite, not a feature.
+
+**Concrete debt already in the code, cheap now and expensive later:**
+- `uid()` is `nextId++` (app.js:471). Two clients will both mint id 1001 and
+  silently collide. Needs client-prefixed or UUID ids before any sync work.
+- ~15 direct `state.devices.push(...)`-style mutations. Every edit needs to
+  become an operation that can be applied, inverted for undo, merged, and
+  broadcast. The op log is also a better undo system than the current snapshot
+  one, so this pays for itself even single-player.
+- `simNow()` is `Date.now() + skew`. In a shared session the simulation clock
+  has to be session state, or two clients disagree about whether a lease has
+  expired.
+
+**What is already right, and should be preserved deliberately:** design state
+lives in `state` and is saved; runtime state (MAC tables, ARP caches, DHCP
+bindings, STP, sim clock) lives outside it and is never saved, because a real
+box loses its tables on reboot. That boundary is exactly the one collaboration
+needs — design state syncs as the shared document, runtime state does not.
+Nothing random touches design or protocol state (`Math.random()` appears only in
+procedural textures and the cosmetic packet phase), so the simulation is
+deterministic and can be replayed identically on every client from synced design
+state. Keep it that way: no random fuzz in protocol timers, ever.
+
+**Conflict semantics must be per object type, not one global rule.** Two people
+dragging the same cable waypoint is last-write-wins and harmless. Two people
+assigning the same switch port is a real conflict that must be *rejected*, not
+merged — the physical world cannot have two cables in one jack, and silently
+merging would produce a design that cannot be built. Same for rack U slots and
+conduit fill.
+
+Also needed: presence (cursors, selection, collaborator cameras), read-only
+share links, and version history.
+
+**Local-first, sync optional.** The portable double-click file is an owner
+requirement and does not go away. Local-first with optional sync is the honest
+architecture and is also the best one — the file keeps working with no account,
+no server, and no connection.
+
+**This relaxes one earlier constraint.** Item 6 says the app cannot fetch live
+prices because there is no backend and browsers block cross-origin retailer
+requests. Once a server exists it can proxy that, so live pricing and
+server-side config push become possible. Do not design item 6 in a way that
+makes that impossible later, and do not depend on it before the backend is real.
+
 ## Definition of done — the data centre build
 
 Owner-set acceptance test for the whole simulation: **build an entire data
