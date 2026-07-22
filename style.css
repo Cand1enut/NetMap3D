@@ -286,6 +286,10 @@ select:focus, input:focus { border-color: var(--accent); }
 #ai-out code { background: var(--panel-2); padding: 1px 6px; border-radius: 5px; font-size: 11.5px; }
 #ai-out h4.ai-good { color: var(--good); }
 #ai-out .ai-good { color: var(--good); }
+#ai-out h4.ai-warn { color: var(--warn); }
+#ai-out .ai-warn { color: var(--warn); }
+.sim-table .ai-warn { color: var(--warn); }
+.sim-table .ai-bad { color: var(--bad); }
 
 /* ---------- connectivity sim ---------- */
 #sim-row select { flex: 1; min-width: 0; }

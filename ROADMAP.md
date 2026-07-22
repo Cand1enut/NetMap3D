@@ -334,7 +334,12 @@ is what Cisco actually runs and means one tree per VLAN.
 **DHCP (completing).** A scope per subnet, not one pool per device. Lease time
 with renewal at T1/T2 and expiry. Reservations by MAC. Options: default gateway,
 DNS servers, domain name, TFTP. Exclusions. DHCP relay (ip helper-address) for
-subnets with no local server.
+subnets with no local server. — BUILT in v0.24.0.
+
+**VTP.** Still deliberately absent. Spec it before building: a domain name, a
+revision number, server/client/transparent modes, and the fact that a client
+with a higher revision number overwrites the domain — which is the single most
+destructive real-world VTP behaviour and the reason it must not be faked.
 
 **Interfaces.** Speed and duplex negotiation — a 1 G port cabled to a 100 M port
 trains to 100 M and both ends report it. Administrative state (`shutdown`)
@@ -364,9 +369,17 @@ this order — the first one is foundational and several others depend on it.
    warns in console rather than being guessed. Caught three real
    misclassifications (Flex Mini, Switch Ultra, Flex 2.5G were simulated as
    endpoints instead of switches).
-3. **DHCP serves one pool per device.** Real gateways serve a scope per
-   subnet/VLAN, with lease time, reservations, and options (gateway, DNS).
-4. **No DHCP lease lifecycle** — no lease time, renewal, or expiry.
+3. ~~**DHCP serves one pool per device**~~ — FIXED v0.24.0. A scope per subnet
+   with its own range, lease, options (3/6/15/150), reservations by MAC, and
+   device-wide excluded ranges (global on IOS, not a pool subcommand). Conflict
+   detection probes an address before offering it — 2 pings, 500 ms — and lists
+   the squatter. Relay works: the relay stamps giaddr and the server picks the
+   scope matching giaddr rather than the arrival interface.
+4. ~~**No DHCP lease lifecycle**~~ — FIXED v0.24.0. Real durations with T1 at
+   0.5x and T2 at 0.875x (RFC 2131 s4.4.5), BOUND → RENEWING → REBINDING →
+   EXPIRED, and on expiry the client stops using the address. RENEWING unicasts
+   to the leasing server; REBINDING broadcasts. A client that cannot keep its
+   address gets a NAK and restarts.
 5. **ACLs match addresses only.** Real ACLs match protocol and ports
    (`permit tcp any host x eq 80`), established, ICMP types. Named ACLs are
    currently treated as extended rather than having their own syntax.
@@ -394,6 +407,13 @@ this order — the first one is foundational and several others depend on it.
     patch-cord allowance. Fixing it exposed that the first hop was never
     length-checked at all.
 
+14. **Soft shadows are silently disabled.** three.js r185 logs
+    "PCFSoftShadowMap has been deprecated. Using PCFShadowMap instead" on every
+    load — the renderer is quietly downgrading shadow filtering, so shadow edges
+    are harder than intended. `THREE.Clock` is deprecated in favour of
+    `THREE.Timer` on the same load. Both are one-line fixes; noticed while
+    testing DHCP, recorded rather than fixed mid-mechanism.
+
 Rule going forward: when a mechanism is modelled, model the whole mechanism. If
 it cannot be finished now, it does not ship as a partial — it stays out and
 stays on this list. A half-modelled mechanism silently teaches the user
@@ -410,6 +430,29 @@ Two tells that a shortcut is being taken, both caught in this project:
 
 ## Traps already hit once (don't repeat)
 
+- **Advancing a simulated clock must be a discrete-event walk, not one jump.**
+  Skipping straight to the target time steps over every timer that should have
+  fired on the way: a one-day jump on a one-day lease sailed past the T1
+  renewal at the halfway mark and reported the lease as expired, when a real
+  client would have renewed it and still been up. `simAdvance()` now stops at
+  each pending event in order. Any future timer mechanism (STP, ARP, NAT
+  translation timeouts, OSPF hellos) must register its next event the same way.
+- **A client's own lease must not count against itself.** The free-address set
+  included the requesting client's current binding, so every renewal walked it
+  one address up the pool. Renewal keeping the same address is the entire point
+  of a renewal.
+- **A stale index outlives the thing it indexes.** Lease expiry marked the
+  binding EXPIRED but left the host→lease map alone, so an expired client kept
+  answering with its old address. Rebuild derived state wherever the source
+  changes, not only in the one function that happens to be called first.
+- **The browser cached `app.js` across reloads and I tested stale code twice**,
+  including one round where a fix appeared not to work. `node make-dev.js`
+  writes a gitignored `dev.html` with cache-busted asset URLs — test through
+  that, and assert a known-new string is present before trusting any result.
+- `referenceSite()` appends to the scene rather than replacing it. Call
+  `clearScene()` first in any test, or you get several sites layered on top of
+  each other — which briefly looked like a duplicate-address bug when it was
+  really two independent gateways serving the same subnet.
 - `THREE.Object3D.traverse()` visits everything and the LAST matching mesh
   wins an assignment — patch rear jacks silently beat front jacks until
   endpoints became side-aware.

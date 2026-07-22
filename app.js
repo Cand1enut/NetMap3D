@@ -3275,64 +3275,471 @@ function netClass(dev) {
 }
 function isHostDev(dev) { return isPlaced(dev) && dev.ip && netClass(dev) === 'host'; }
 
-// ---- DHCP ----
-// A router with dhcp.enabled hands out addresses from its pool to any host on
-// its L2 segment that asks (ip = "dhcp"). Leases are recomputed from scratch
-// before each sim run — deterministic, host-id order, so the same map always
-// leases the same address.
-let _dhcpLeases = new Map();   // hostId -> { ip, serverId, subnet }
-function dhcpPool(server) {
-  const d = server.dhcp;
-  if (!d || !d.enabled) return null;
-  const s = parseIp(d.poolStart), e = parseIp(d.poolEnd);
-  if (!s || !e) return null;
-  return { start: s.int, end: Math.max(s.int, e.int), network: s.network, mask: s.mask, cidr: s.cidr, ip: s };
+//////////////////// Simulation clock ////////////////////
+// Protocol timers are real: a one-day DHCP lease is 86400 seconds, a MAC entry
+// ages at 300 s. Nobody is going to sit here for a day to watch a lease renew,
+// so the simulator has a clock you can wind forward. This is a time machine,
+// not a shortened timer — the durations stay true to life and the clock moves.
+let _simSkewMs = 0;
+function simNow() { return Date.now() + _simSkewMs; }
+function simResetClock() { _simSkewMs = 0; }
+// Winding the clock forward is a discrete-event advance, not a single jump.
+// Jumping straight to the target silently skips every timer that should have
+// fired on the way — a day-long jump would step over the T1 renewal at the
+// halfway mark and report the lease as expired when a real client would have
+// renewed it. So we stop at each pending event, in order, and run it.
+function simAdvance(secs) {
+  const target = simNow() + secs * 1000;
+  let guard = 0;
+  while (guard++ < 2000) {
+    const next = dhcpNextEventAt();
+    if (!isFinite(next) || next > target) break;
+    _simSkewMs += Math.max(1, next - simNow() + 1);   // land just past the event
+    dhcpTick();
+  }
+  _simSkewMs += Math.max(0, target - simNow());
+  dhcpTick();
+  return simNow();
 }
-function resolveDhcp() {
-  _dhcpLeases = new Map();
-  const usedByServer = new Map();
-  const askers = state.devices.filter(d => isPlaced(d) && netClass(d) === 'host' && d.ip === 'dhcp')
-    .sort((a, b) => a.id - b.id);
-  for (const h of askers) {
-    const walk = l2Walk(h, { vlan: hostVlan(h) });
-    let server = null;
-    for (const sid of walk.routers.keys()) {
-      const sv = deviceById(sid);
-      if (!sv || !sv.dhcp || !sv.dhcp.enabled) continue;
-      const pool = dhcpPool(sv);
-      if (!pool) continue;
-      // A DHCP server hands out addresses on subnets it has an interface in —
-      // otherwise the offer could never be delivered or routed back.
-      const iface = ifaceIp(sv, walk.routers.get(sid).port, hostVlan(h));
-      if (!iface || !sameSubnet(iface.ip, pool.ip)) continue;
-      server = sv; break;
+// The soonest lease timer that has not fired yet.
+function dhcpNextEventAt() {
+  const now = simNow();
+  let next = Infinity;
+  for (const b of _dhcpBindings.values()) {
+    if (b.state === 'EXPIRED') continue;
+    for (const t of [b.t1At, b.t2At, b.expiresAt]) {
+      if (isFinite(t) && t > now && t < next) next = t;
     }
-    if (!server) continue;                       // no lease → host stays unaddressed
-    const pool = dhcpPool(server);
-    let used = usedByServer.get(server.id);
-    if (!used) {
-      used = new Set();
-      for (const o of state.devices) {           // static IPs in the pool's subnet are taken
-        if (!o.ip || o.ip === 'dhcp') continue;
-        const oip = parseIp(o.ip);
-        if (oip && ((oip.int & pool.mask) >>> 0) === pool.network) used.add(oip.int);
+  }
+  return next;
+}
+// "2d 03:14:07" / "00:04:30" — the way IOS prints a lease remaining
+function fmtDur(ms) {
+  if (!isFinite(ms)) return 'Infinite';
+  if (ms <= 0) return 'expired';
+  let s = Math.floor(ms / 1000);
+  const d = Math.floor(s / 86400); s -= d * 86400;
+  const h = Math.floor(s / 3600); s -= h * 3600;
+  const m = Math.floor(s / 60); s -= m * 60;
+  const hms = `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
+  return d ? `${d}d ${hms}` : hms;
+}
+
+//////////////////// DHCP ////////////////////
+// Built to RFC 2131 (protocol + lease state machine), RFC 2132 (options) and
+// Cisco IOS behaviour, rather than to "hand out the next free address":
+//
+//   * a server holds SCOPES — one per subnet — not one pool per device
+//   * DORA is genuinely exchanged (DISCOVER/OFFER/REQUEST/ACK, or NAK), and the
+//     packet log is what the UI prints
+//   * every lease has a duration with T1 at 0.5x and T2 at 0.875x of it
+//     (RFC 2131 s4.4.5), and on expiry the client MUST stop using the address
+//   * addresses can be excluded, reserved by MAC, and are probed for conflicts
+//     before being offered — IOS pings twice with a 500 ms timeout
+//   * a subnet with no local server is served by a RELAY: the relay stamps
+//     giaddr with its own interface address and the server chooses the scope
+//     matching giaddr, not the interface the packet arrived on
+//
+// Defaults are the IOS ones so the CLI will agree with the engine later.
+const DHCP_DEFAULT_LEASE_S = 24 * 3600;   // IOS: one day when no lease is set
+const DHCP_T1_FRAC = 0.5;                 // RFC 2131 s4.4.5
+const DHCP_T2_FRAC = 0.875;
+const DHCP_PING_PACKETS = 2;              // ip dhcp ping packets
+const DHCP_PING_TIMEOUT_MS = 500;         // ip dhcp ping timeout
+// RFC 2132 option codes, plus Cisco's option 150 (TFTP server address).
+const DHCP_OPT = { mask: 1, router: 3, dns: 6, hostname: 12, domain: 15,
+  broadcast: 28, leaseTime: 51, msgType: 53, serverId: 54, paramList: 55,
+  t1: 58, t2: 59, clientId: 61, tftpName: 66, bootfile: 67, tftpIp: 150 };
+
+// Option 61 for Ethernet is hardware type 01 followed by the MAC. IOS prints it
+// in the Client-ID column of `show ip dhcp binding` grouped in fours, e.g.
+// 0100.5079.6668.f1 — 14 hex digits, so the last group is a pair.
+function dhcpClientId(dev) {
+  const hex = '01' + deviceMac(dev).replace(/:/g, '').toLowerCase();
+  return hex.match(/.{1,4}/g).join('.');
+}
+
+// Bindings survive topology edits, exactly as a real client keeps its address
+// when you re-cable a switch. They only end at expiry, release, or a NAK.
+const _dhcpBindings = new Map();          // `${serverId}|${clientId}` -> binding
+const _dhcpConflicts = new Map();         // serverId -> [{ ip, at, method }]
+let _dhcpLeases = new Map();              // hostId -> binding (index for hostIp)
+let _dhcpLog = [];                        // packet log of the last resolve
+
+function broadcastOf(ip) { return ((ip.network | (~ip.mask >>> 0)) >>> 0); }
+function leaseSecsOf(pool) {
+  if (!pool) return DHCP_DEFAULT_LEASE_S;
+  if (pool.lease === 'infinite') return Infinity;
+  const l = pool.lease;
+  if (!l) return DHCP_DEFAULT_LEASE_S;
+  const s = (+l.days || 0) * 86400 + (+l.hours || 0) * 3600 + (+l.minutes || 0) * 60;
+  return s > 0 ? s : DHCP_DEFAULT_LEASE_S;
+}
+function leaseLabel(pool) {
+  const s = leaseSecsOf(pool);
+  if (!isFinite(s)) return 'infinite';
+  const d = Math.floor(s / 86400), h = Math.floor((s % 86400) / 3600), m = Math.floor((s % 3600) / 60);
+  return [d && `${d}d`, h && `${h}h`, m && `${m}m`].filter(Boolean).join(' ') || `${s}s`;
+}
+
+// Every scope a server holds, normalised. A scope without a valid network
+// statement is not a scope — IOS will not activate a pool with no network.
+function dhcpPools(server) {
+  const d = server.dhcp;
+  if (!d || !d.enabled) return [];
+  return (d.pools || []).map((p, i) => {
+    const net = parseIp(p.network);
+    if (!net) return null;
+    // Absent an explicit range, the scope is the whole subnet: IOS allocates
+    // from the network statement and you carve it back with excluded-address.
+    const lo = parseIp(p.poolStart), hi = parseIp(p.poolEnd);
+    const start = lo ? lo.int : (net.network + 1) >>> 0;
+    const end = hi ? hi.int : (broadcastOf(net) - 1) >>> 0;
+    return { ...p, name: p.name || `POOL${i + 1}`, net, start: Math.min(start, end),
+      end: Math.max(start, end), leaseSecs: leaseSecsOf(p) };
+  }).filter(Boolean);
+}
+// `ip dhcp excluded-address` is a GLOBAL command on IOS, not a pool subcommand,
+// so it lives on the device and applies to every scope it overlaps.
+function dhcpExcluded(server) {
+  return ((server.dhcp && server.dhcp.excluded) || []).map(r => {
+    const a = parseIp(r.from), b = parseIp(r.to || r.from);
+    return a ? { from: a.int, to: b ? Math.max(a.int, b.int) : a.int } : null;
+  }).filter(Boolean);
+}
+function isExcluded(server, int) {
+  return dhcpExcluded(server).some(r => int >= r.from && int <= r.to);
+}
+// A reservation is a manual binding: IOS `host <ip>` + `hardware-address` or
+// `client-identifier` inside a pool. It is matched before any dynamic address.
+function reservationFor(pool, mac, clientId) {
+  const m = (mac || '').toLowerCase(), c = (clientId || '').toLowerCase();
+  return (pool.reservations || []).find(r =>
+    (r.mac && r.mac.toLowerCase().replace(/[.:-]/g, '') === m.replace(/[.:-]/g, '')) ||
+    (r.clientId && r.clientId.toLowerCase() === c)) || null;
+}
+
+// Conflict detection. IOS pings a candidate address before offering it; an
+// answer means somebody is squatting the address and it goes on the conflict
+// list instead of being handed out. Our "ping" is authoritative rather than
+// probabilistic: we know exactly which devices hold which static addresses.
+function dhcpProbe(server, int) {
+  for (const d of state.devices) {
+    if (!d.ip || d.ip === 'dhcp' || !isPlaced(d)) continue;
+    const p = parseIp(d.ip);
+    if (p && p.int === int) return d;
+  }
+  for (const d of state.devices) {                       // router interfaces too
+    for (const i of deviceInterfaces(d)) if (i.ip.int === int) return d;
+  }
+  return null;
+}
+function noteConflict(serverId, int, holder) {
+  let list = _dhcpConflicts.get(serverId);
+  if (!list) _dhcpConflicts.set(serverId, list = []);
+  if (!list.some(c => c.ip === ipStr(int))) {
+    list.push({ ip: ipStr(int), at: simNow(), method: 'Ping', holder: holder ? holder.name : '?' });
+  }
+}
+// Addresses this server has already committed, so two clients never collide.
+// A client's own binding is not an obstacle to itself — that is what makes a
+// renewal keep the same address instead of walking up the pool every T1.
+function leasedInts(serverId, exceptClientId) {
+  const s = new Set();
+  for (const b of _dhcpBindings.values()) {
+    if (b.serverId !== serverId || b.state === 'EXPIRED') continue;
+    if (exceptClientId && b.clientId === exceptClientId) continue;
+    s.add(b.ipInt);
+  }
+  return s;
+}
+
+// Which servers can serve this client, and how the request reaches them.
+// Direct: the server has an interface in the client's segment and a scope for
+// that subnet. Relayed: a router on the segment carries `ip helper-address`,
+// stamps giaddr with its own address here, and forwards to the helper.
+function dhcpServerCandidates(client, walk, vlan) {
+  const out = [];
+  const seen = new Set();
+  const addDirect = (sv, ifaceIpParsed) => {
+    if (!sv || !sv.dhcp || !sv.dhcp.enabled || seen.has(sv.id)) return;
+    const pool = dhcpPools(sv).find(p => sameSubnet(p.net, ifaceIpParsed));
+    if (!pool) return;
+    seen.add(sv.id);
+    out.push({ server: sv, pool, via: 'direct', giaddr: null, serverIp: ifaceIpParsed });
+  };
+  for (const [rid, jack] of walk.routers) {
+    const sv = deviceById(rid);
+    const iface = sv && ifaceIp(sv, jack.port, vlan);
+    if (iface) addDirect(sv, iface.ip);
+  }
+  for (const hid of walk.hosts) {                        // a server appliance/VM
+    const sv = deviceById(hid);
+    const ip = sv && sv.ip && sv.ip !== 'dhcp' ? parseIp(sv.ip) : null;
+    if (ip) addDirect(sv, ip);
+  }
+  // Relay. The helper is configured on the interface facing the client, which
+  // is the interface whose address becomes giaddr.
+  for (const [rid, jack] of walk.routers) {
+    const relay = deviceById(rid);
+    if (!relay) continue;
+    const iface = ifaceIp(relay, jack.port, vlan);
+    if (!iface) continue;
+    for (const helperStr of helpersOn(relay, iface)) {
+      const helper = parseIp(helperStr);
+      if (!helper) continue;
+      const sv = deviceHolding(helper);
+      if (!sv || !sv.dhcp || !sv.dhcp.enabled) {
+        out.push({ error: `${relay.name} relays to ${helperStr}, but no DHCP server holds that address`, via: 'relay', relay });
+        continue;
       }
-      usedByServer.set(server.id, used);
+      // The relay unicasts to the helper, so it must have a route to it. Until
+      // routing tables land (roadmap item 9) that means directly connected.
+      const reachable = deviceInterfaces(relay).some(i => sameSubnet(i.ip, helper));
+      if (!reachable) {
+        out.push({ error: `${relay.name} has no interface in ${subnetLabel(helper)} — it cannot reach helper ${helperStr}`, via: 'relay', relay });
+        continue;
+      }
+      // giaddr selects the scope — this is the whole point of relaying.
+      const pool = dhcpPools(sv).find(p => sameSubnet(p.net, iface.ip));
+      if (!pool) {
+        out.push({ error: `${sv.name} has no scope for ${subnetLabel(iface.ip)} (giaddr ${ipStr(iface.ip.int)})`, via: 'relay', relay });
+        continue;
+      }
+      out.push({ server: sv, pool, via: 'relay', relay, giaddr: iface.ip, serverIp: helper });
     }
-    for (let a = pool.start; a <= pool.end; a++) {
-      if (!used.has(a)) { used.add(a); _dhcpLeases.set(h.id, { ip: ipStr(a), serverId: server.id, subnet: subnetLabel(pool.ip) }); break; }
+  }
+  return out;
+}
+// `ip helper-address` is an interface command, so helpers are keyed by the
+// interface name deviceInterfaces() reports.
+function helpersOn(dev, iface) {
+  const h = dev.helpers || {};
+  const key = iface.kind === 'svi' ? `Vlan${iface.vlan}` : `Port ${iface.port}`;
+  const v = h[key];
+  return Array.isArray(v) ? v : (v ? [v] : []);
+}
+function deviceHolding(ipParsed) {
+  for (const d of state.devices) {
+    if (d.ip && d.ip !== 'dhcp') { const p = parseIp(d.ip); if (p && p.int === ipParsed.int) return d; }
+    for (const i of deviceInterfaces(d)) if (i.ip.int === ipParsed.int) return d;
+  }
+  return null;
+}
+
+// Choose an address, in RFC 2131 s4.3.1 order: the client's existing binding,
+// then its requested address if it is free and in range, then the next free
+// address in the scope.
+function selectAddress(cand, client, requested) {
+  const { server, pool } = cand;
+  const mac = deviceMac(client), cid = dhcpClientId(client);
+  const res = reservationFor(pool, mac, cid);
+  if (res) {
+    const r = parseIp(res.ip);
+    if (r) return { int: r.int, type: 'Manual' };
+    return { error: `reservation for ${client.name} has an invalid address "${res.ip}"` };
+  }
+  const taken = leasedInts(server.id, cid);
+  const free = (int) => {
+    if (int <= pool.net.network || int >= broadcastOf(pool.net)) return false;
+    if (taken.has(int) || isExcluded(server, int)) return false;
+    return true;
+  };
+  const prior = _dhcpBindings.get(`${server.id}|${cid}`);
+  if (prior && prior.state !== 'EXPIRED' && free(prior.ipInt)) return { int: prior.ipInt, type: 'Automatic' };
+  if (requested && free(requested) && requested >= pool.start && requested <= pool.end) {
+    return { int: requested, type: 'Automatic' };
+  }
+  for (let a = pool.start; a <= pool.end; a++) {
+    if (!free(a)) continue;
+    const holder = dhcpProbe(server, a);               // ip dhcp ping, 2 x 500 ms
+    if (holder) { noteConflict(server.id, a, holder); taken.add(a); continue; }
+    return { int: a, type: 'Automatic' };
+  }
+  return { error: `scope ${pool.name} (${subnetLabel(pool.net)}) is exhausted` };
+}
+
+// The options a scope hands back with an ACK.
+function poolOptions(pool) {
+  const o = {};
+  o[DHCP_OPT.mask] = ipStr(pool.net.mask);
+  if (pool.defaultRouter) o[DHCP_OPT.router] = pool.defaultRouter;
+  if (pool.dns && pool.dns.length) o[DHCP_OPT.dns] = [].concat(pool.dns).join(', ');
+  if (pool.domain) o[DHCP_OPT.domain] = pool.domain;
+  if (pool.tftp) o[DHCP_OPT.tftpIp] = pool.tftp;
+  return o;
+}
+
+// One DORA exchange. Returns the binding and the packets, or the reason it
+// failed — the reason is what the UI shows, so it has to be the real one.
+function dhcpExchange(client, opts = {}) {
+  const log = [];
+  const vlan = hostVlan(client);
+  const walk = l2Walk(client, { vlan });
+  const mac = deviceMac(client), cid = dhcpClientId(client);
+  const say = (msg, dir, detail) => log.push({ client: client.name, msg, dir, detail });
+
+  if (!walk.start) {
+    return { ok: false, reason: walk.overLength
+      ? `${client.name}'s drop cable is over the 100 m channel limit — no link, so no DHCP`
+      : `${client.name} isn't cabled to anything`, log };
+  }
+  // Three ways a client asks, and they are genuinely different exchanges:
+  //   INIT      full DORA, broadcast, any server may answer
+  //   RENEWING  unicast REQUEST to the server that granted the lease (RFC 2131
+  //             s4.4.5) — no DISCOVER, and no other server may answer
+  //   REBINDING broadcast REQUEST, any server that knows the binding may ACK
+  const mode = opts.mode || 'INIT';
+  if (mode === 'INIT') {
+    say('DHCPDISCOVER', '→', `broadcast · xid, chaddr ${mac}, option 55 (mask, router, dns, domain)`);
+  }
+
+  const cands = dhcpServerCandidates(client, walk, vlan);
+  let usable = cands.filter(c => c.server);
+  if (mode === 'RENEWING') usable = usable.filter(c => c.server.id === opts.serverId);
+  if (!usable.length) {
+    const why = cands.find(c => c.error);
+    if (mode === 'RENEWING') {
+      return { ok: false, reason: `${client.name} can't reach the server that issued its lease`, log };
     }
+    return { ok: false, reason: why ? why.error
+      : `no DHCP server in ${client.name}'s broadcast domain (VLAN ${vlan}) and no relay configured`, log };
+  }
+  // Client takes the first offer, which is what real clients do.
+  const cand = usable[0];
+  const { server, pool } = cand;
+  if (cand.via === 'relay' && mode === 'INIT') {
+    say('DHCPDISCOVER', '↦', `relayed by ${cand.relay.name}, giaddr ${ipStr(cand.giaddr.int)} → ${server.name}`);
+  }
+  const requested = opts.requested !== undefined ? opts.requested : null;
+  const pick = selectAddress(cand, client, requested);
+  if (pick.error) return { ok: false, reason: `${server.name}: ${pick.error}`, log };
+  // A renewing client that cannot keep its address gets a NAK and starts over,
+  // rather than silently sliding onto a different address.
+  if (mode !== 'INIT' && requested && pick.int !== requested) {
+    say('DHCPNAK', '←', `${server.name} refuses ${ipStr(requested)} — client returns to INIT`);
+    return { ok: false, nak: true, reason: `${client.name}'s address ${ipStr(requested)} is no longer valid in ${pool.name}`, log };
+  }
+
+  const secs = pool.leaseSecs;
+  if (mode === 'INIT') {
+    say('DHCPOFFER', '←', `${server.name} offers ${ipStr(pick.int)} · lease ${leaseLabel(pool)}`);
+    say('DHCPREQUEST', '→', `broadcast · option 50 ${ipStr(pick.int)}, option 54 ${ipStr(cand.serverIp.int)}`);
+  } else {
+    say('DHCPREQUEST', '→', mode === 'RENEWING'
+      ? `unicast to ${server.name} ${ipStr(cand.serverIp.int)} · ciaddr ${ipStr(pick.int)} (T1 reached)`
+      : `broadcast · ciaddr ${ipStr(pick.int)} (T2 reached, rebinding)`);
+  }
+
+  const now = simNow();
+  const ms = isFinite(secs) ? secs * 1000 : Infinity;
+  const binding = {
+    clientId: cid, mac, hostId: client.id, serverId: server.id, poolName: pool.name,
+    ip: ipStr(pick.int), ipInt: pick.int, type: pick.type,
+    boundAt: now, leaseSecs: secs,
+    t1At: now + (isFinite(ms) ? ms * DHCP_T1_FRAC : Infinity),
+    t2At: now + (isFinite(ms) ? ms * DHCP_T2_FRAC : Infinity),
+    expiresAt: now + ms,
+    state: 'BOUND', renewals: opts.renewals || 0,
+    via: cand.via, giaddr: cand.giaddr ? ipStr(cand.giaddr.int) : null,
+    relayName: cand.relay ? cand.relay.name : null,
+    subnet: subnetLabel(pool.net), options: poolOptions(pool)
+  };
+  _dhcpBindings.set(`${server.id}|${cid}`, binding);
+  const opt = binding.options;
+  say('DHCPACK', '←', `${ipStr(pick.int)}/${pool.net.cidr} · router ${opt[3] || 'none'} · dns ${opt[6] || 'none'} · T1 ${fmtDur(isFinite(ms) ? ms * DHCP_T1_FRAC : Infinity)} · T2 ${fmtDur(isFinite(ms) ? ms * DHCP_T2_FRAC : Infinity)}`);
+  return { ok: true, binding, log };
+}
+
+// Advance every binding against the clock. This is the RFC 2131 client state
+// machine: BOUND → RENEWING at T1 (unicast to the leasing server) → REBINDING
+// at T2 (broadcast to any server) → EXPIRED, at which point the client must
+// stop using the address.
+// The per-host index the rest of the engine reads. An expired lease is not in
+// it: RFC 2131 s4.4.5 requires the client to stop using the address the moment
+// the lease runs out, so an expired host has no address at all.
+function indexLeases() {
+  _dhcpLeases = new Map();
+  for (const b of _dhcpBindings.values()) {
+    if (b.state !== 'EXPIRED') _dhcpLeases.set(b.hostId, b);
   }
   return _dhcpLeases;
 }
+
+function dhcpTick() {
+  const now = simNow();
+  for (const [key, b] of [..._dhcpBindings]) {
+    if (!isFinite(b.expiresAt)) continue;
+    const client = deviceById(b.hostId);
+    if (!client) { _dhcpBindings.delete(key); continue; }
+    if (now >= b.expiresAt) {
+      // Lease ran out with no successful renewal. Try a fresh DORA — if a
+      // server is still there the client re-leases, otherwise it goes dark.
+      _dhcpBindings.delete(key);
+      const again = dhcpExchange(client, { renewals: 0 });
+      if (!again.ok) {
+        b.state = 'EXPIRED';
+        _dhcpBindings.set(key, b);
+      }
+      continue;
+    }
+    if (now >= b.t2At && b.state !== 'REBINDING') b.state = 'REBINDING';
+    else if (now >= b.t1At && b.state === 'BOUND') b.state = 'RENEWING';
+    // A client in RENEWING/REBINDING that can still reach a server gets an ACK
+    // and its timers reset from the new lease — same address, new clock. If it
+    // can't, it stays in that state and keeps using the address until expiry,
+    // which is exactly what a real client does when a server goes away.
+    if (b.state === 'RENEWING' || b.state === 'REBINDING') {
+      const r = dhcpExchange(client, {
+        mode: b.state, serverId: b.serverId, requested: b.ipInt,
+        renewals: (b.renewals || 0) + 1
+      });
+      if (!r.ok && r.nak) { _dhcpBindings.delete(key); dhcpExchange(client); }
+    }
+  }
+  indexLeases();
+}
+
+// Make sure every host asking for DHCP has had a chance to lease, then rebuild
+// the per-host index the rest of the engine reads.
+function resolveDhcp() {
+  dhcpTick();
+  _dhcpLog = [];
+  const askers = state.devices
+    .filter(d => isPlaced(d) && netClass(d) === 'host' && d.ip === 'dhcp')
+    .sort((a, b) => a.id - b.id);
+  for (const h of askers) {
+    const cid = dhcpClientId(h);
+    let has = null;
+    for (const b of _dhcpBindings.values()) if (b.clientId === cid && b.state !== 'EXPIRED') { has = b; break; }
+    if (has) continue;
+    const r = dhcpExchange(h);
+    _dhcpLog.push({ host: h, ...r });
+  }
+  return indexLeases();
+}
+// `clear ip dhcp binding *`
+function dhcpClearBindings() { _dhcpBindings.clear(); _dhcpLeases = new Map(); }
+// A client giving the address back before the lease is up.
+function dhcpRelease(hostId) {
+  for (const [k, b] of [..._dhcpBindings]) if (b.hostId === hostId) _dhcpBindings.delete(k);
+  _dhcpLeases.delete(hostId);
+}
+
 function hostIp(dev) {
-  if (dev.ip === 'dhcp') { const l = _dhcpLeases.get(dev.id); return l ? parseIp(l.ip) : null; }
+  if (dev.ip === 'dhcp') { const l = _dhcpLeases.get(dev.id); return l ? parseIp(`${l.ip}/${parseIp(l.subnet).cidr}`) : null; }
   return parseIp(dev.ip);
 }
 // display string for a host's address, resolving a lease
 function hostAddr(dev) {
   if (dev.ip === 'dhcp') { const l = _dhcpLeases.get(dev.id); return l ? `${l.ip} (DHCP)` : 'dhcp (no lease)'; }
   return dev.ip || '—';
+}
+// The gateway a DHCP client was told to use (option 3) — a leased host has no
+// business inventing one, and a wrong option 3 is a real and common fault.
+function dhcpGateway(dev) {
+  const l = _dhcpLeases.get(dev.id);
+  return l && l.options ? l.options[DHCP_OPT.router] || null : null;
 }
 
 //////////////////// Layer-3 interface addressing ////////////////////
@@ -3383,16 +3790,21 @@ function gatewayForHost(host, walk, hostIpParsed) {
     const iface = ifaceIp(r, jack.port, vlan);
     if (iface && sameSubnet(iface.ip, hostIpParsed)) candidates.push({ id: rid, iface, router: r });
   }
-  // An explicitly configured default gateway must actually exist on the segment
-  // — a wrong or stale gateway address is one of the most common real faults.
-  if (host.gateway) {
-    const want = parseIp(host.gateway);
-    if (!want) return { error: `${host.name} has an invalid default gateway "${host.gateway}"` };
+  // A configured default gateway must actually exist on the segment — a wrong
+  // or stale gateway address is one of the most common real faults. For a DHCP
+  // client the gateway is whatever option 3 said, not a guess: if the scope
+  // hands out the wrong router, the client really is broken and must say so.
+  const viaDhcp = host.ip === 'dhcp' ? dhcpGateway(host) : null;
+  const declared = viaDhcp || host.gateway;
+  if (declared) {
+    const src = viaDhcp ? `DHCP option 3` : `default gateway`;
+    const want = parseIp(declared);
+    if (!want) return { error: `${host.name} has an invalid ${src} "${declared}"` };
     const match = candidates.find(c => c.iface.ip.int === want.int);
     if (!match) {
       return { error: candidates.length
-        ? `${host.name}'s default gateway ${host.gateway} isn't on this segment — the router here answers on ${candidates.map(c => ipStr(c.iface.ip.int)).join(', ')}`
-        : `${host.name}'s default gateway ${host.gateway} is unreachable — no router on this segment holds that address` };
+        ? `${host.name}'s ${src} ${declared} isn't on this segment — the router here answers on ${candidates.map(c => ipStr(c.iface.ip.int)).join(', ')}`
+        : `${host.name}'s ${src} ${declared} is unreachable — no router on this segment holds that address` };
     }
     return match;
   }
@@ -3523,7 +3935,7 @@ function deviceMac(dev) {
 function macLearn(devId, mac, port, vlan) {
   let t = macTables.get(devId);
   if (!t) macTables.set(devId, t = new Map());
-  t.set(mac, { port, vlan, at: Date.now() });
+  t.set(mac, { port, vlan, at: simNow() });
 }
 // Live entries only — anything past the aging time is gone, and is removed on
 // read the way a real table expires it.
@@ -3531,7 +3943,7 @@ function macEntries(devId, ageMs) {
   const t = macTables.get(devId);
   if (!t) return [];
   const limit = ageMs === undefined ? MAC_AGE_MS : ageMs;
-  const now = Date.now();
+  const now = simNow();
   for (const [mac, e] of [...t]) if (now - (e.at || 0) > limit) t.delete(mac);
   return [...t];
 }
@@ -3992,14 +4404,30 @@ function l2Reachable(a, b) {
 }
 
 // Full ping verdict, L2 + L3.
+// Why a host has no usable address. "No DHCP server in its broadcast domain"
+// used to be the only answer offered, which was a guess — an expired lease, an
+// exhausted scope and a dead relay are all different faults with different
+// fixes, and the engine already knows which one happened.
+function noAddressReason(d) {
+  if (d.ip !== 'dhcp') return `${d.name} has no valid IP`;
+  for (const b of _dhcpBindings.values()) {
+    if (b.hostId === d.id && b.state === 'EXPIRED') {
+      return `${d.name}'s DHCP lease expired and could not be renewed — it has stopped using ${b.ip}`;
+    }
+  }
+  const logged = _dhcpLog.find(l => l.host && l.host.id === d.id && !l.ok);
+  if (logged) return `${d.name} has no DHCP lease — ${logged.reason}`;
+  const r = dhcpExchange(d);
+  return r.ok ? `${d.name} has no valid IP` : `${d.name} has no DHCP lease — ${r.reason}`;
+}
+
 function pingHosts(aId, bId) {
   const a = deviceById(aId), b = deviceById(bId);
   if (!a || !b) return { ok: false, reason: 'device not found' };
   if (a.id === b.id) return { ok: true, mode: 'self', hops: [a.id], detail: 'loopback' };
   const ipA = hostIp(a), ipB = hostIp(b);
-  const dhcpFail = (d) => d.ip === 'dhcp' && !_dhcpLeases.get(d.id);
-  if (!ipA) return { ok: false, reason: dhcpFail(a) ? `${a.name} couldn't get a DHCP lease — no DHCP server in its broadcast domain` : `${a.name} has no valid IP` };
-  if (!ipB) return { ok: false, reason: dhcpFail(b) ? `${b.name} couldn't get a DHCP lease — no DHCP server in its broadcast domain` : `${b.name} has no valid IP` };
+  if (!ipA) return { ok: false, reason: noAddressReason(a) };
+  if (!ipB) return { ok: false, reason: noAddressReason(b) };
 
   if (sameSubnet(ipA, ipB)) {
     const l2 = l2Reachable(a, b);
@@ -5395,54 +5823,170 @@ function l2TablesHtml(dev) {
   return '';
 }
 
-// DHCP server config, shown on router-class devices only. A real gateway hands
-// out addresses on the subnets it serves; here one pool per device covers the
-// common case and keeps the config honest rather than pretending to more.
+// DHCP server config. A real server holds a scope per subnet with its own
+// range, lease and options, plus device-wide excluded ranges (excluded-address
+// is global on IOS, not a pool subcommand). Relay helpers are separate and
+// belong to any L3 device, server or not.
+const esc = s => String(s == null ? '' : s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+
+function scopeHtml(p, i) {
+  const l = p.lease === 'infinite' ? {} : (p.lease || {});
+  const inf = p.lease === 'infinite';
+  const res = (p.reservations || []).map((r, j) =>
+    `<div class="row" data-res="${i}:${j}">
+       <input type="text" class="dh-res-mac" style="width:118px" value="${esc(r.mac || '')}" placeholder="MAC">
+       <input type="text" class="dh-res-ip" style="width:96px" value="${esc(r.ip || '')}" placeholder="10.0.10.50">
+       <button class="dh-res-del" title="Remove reservation">×</button></div>`).join('');
+  return `
+  <div class="dh-scope" data-scope="${i}" style="border:1px solid var(--line);border-radius:6px;padding:8px;margin:8px 0">
+    <div class="row"><input type="text" class="dh-name" style="width:110px" value="${esc(p.name || '')}" placeholder="VLAN10">
+      <button class="dh-del" title="Delete scope">×</button></div>
+    <div class="row"><span class="k">network</span>
+      <input type="text" class="dh-net" style="width:132px" value="${esc(p.network || '')}" placeholder="10.0.10.0/24"></div>
+    <div class="row"><span class="k">range</span>
+      <input type="text" class="dh-start" style="width:104px" value="${esc(p.poolStart || '')}" placeholder="auto">
+      <input type="text" class="dh-end" style="width:104px" value="${esc(p.poolEnd || '')}" placeholder="auto"></div>
+    <div class="row"><span class="k">lease</span>
+      <input type="number" class="dh-ld" style="width:44px" min="0" value="${inf ? '' : (l.days ?? 1)}" title="days">d
+      <input type="number" class="dh-lh" style="width:44px" min="0" max="23" value="${inf ? '' : (l.hours ?? 0)}" title="hours">h
+      <input type="number" class="dh-lm" style="width:44px" min="0" max="59" value="${inf ? '' : (l.minutes ?? 0)}" title="minutes">m
+      <label style="font-size:11px"><input type="checkbox" class="dh-inf" ${inf ? 'checked' : ''}> infinite</label></div>
+    <div class="row"><span class="k">default-router</span>
+      <input type="text" class="dh-gw" style="width:118px" value="${esc(p.defaultRouter || '')}" placeholder="10.0.10.1"></div>
+    <div class="row"><span class="k">dns-server</span>
+      <input type="text" class="dh-dns" style="width:132px" value="${esc([].concat(p.dns || []).join(', '))}" placeholder="10.0.10.5, 1.1.1.1"></div>
+    <div class="row"><span class="k">domain-name</span>
+      <input type="text" class="dh-dom" style="width:132px" value="${esc(p.domain || '')}" placeholder="corp.local"></div>
+    <div class="row"><span class="k">option 150</span>
+      <input type="text" class="dh-tftp" style="width:118px" value="${esc(p.tftp || '')}" placeholder="TFTP server"></div>
+    <div class="row"><span class="k">reservations</span></div>${res}
+    <button class="dh-res-add" style="font-size:11px">+ reservation</button>
+  </div>`;
+}
+
 function dhcpPropsHtml(dev) {
-  if (netClass(dev) !== 'router') return '';
+  const cls = netClass(dev);
+  if (cls !== 'router' && cls !== 'switch' && cls !== 'host') return '';
   const d = dev.dhcp || {};
   const on = !!d.enabled;
+  const pools = d.pools || [];
+  const exc = (d.excluded || []).map((r, i) =>
+    `<div class="row" data-exc="${i}">
+       <input type="text" class="dh-exc-a" style="width:104px" value="${esc(r.from || '')}" placeholder="10.0.10.1">
+       <input type="text" class="dh-exc-b" style="width:104px" value="${esc(r.to || '')}" placeholder="10.0.10.99">
+       <button class="dh-exc-del" title="Remove">×</button></div>`).join('');
+  // ip helper-address, per interface — offered on anything with an L3 interface
+  const ifaces = deviceInterfaces(dev);
+  const helpers = ifaces.length ? `
+    <div class="row" style="margin-top:10px"><span class="k">ip helper-address</span></div>
+    ${ifaces.map(i => {
+      const key = i.kind === 'svi' ? `Vlan${i.vlan}` : `Port ${i.port}`;
+      const v = [].concat((dev.helpers || {})[key] || []).join(', ');
+      return `<div class="row"><span class="k" style="font-size:11px">${key}</span>
+        <input type="text" class="dh-helper" data-if="${esc(key)}" style="width:132px" value="${esc(v)}" placeholder="none"></div>`;
+    }).join('')}
+    <p class="cbl-edit-hint">A helper relays DHCP off-subnet: the relay stamps giaddr with this interface's address and the server picks the scope matching it.</p>` : '';
   return `
     <div class="row" style="margin-top:10px"><span class="k">DHCP server</span>
       <input type="checkbox" id="dev-dhcp-on" ${on ? 'checked' : ''}></div>
     <div id="dev-dhcp-cfg" style="${on ? '' : 'display:none'}">
-      <div class="row"><span class="k">Pool start</span>
-        <input type="text" id="dev-dhcp-a" style="width:118px" value="${d.poolStart || ''}" placeholder="10.0.10.100"></div>
-      <div class="row"><span class="k">Pool end</span>
-        <input type="text" id="dev-dhcp-b" style="width:118px" value="${d.poolEnd || ''}" placeholder="10.0.10.200"></div>
-      <p class="cbl-edit-hint">Hosts with IP set to <b>dhcp</b> on this segment lease from here.</p>
-    </div>`;
+      <div id="dh-scopes">${pools.map(scopeHtml).join('')}</div>
+      <button id="dh-add" style="font-size:11px">+ scope</button>
+      <div class="row" style="margin-top:8px"><span class="k">excluded-address</span></div>${exc}
+      <button id="dh-exc-add" style="font-size:11px">+ exclusion</button>
+      <p class="cbl-edit-hint">Excluded ranges are device-wide, as on IOS. Hosts with IP set to <b>dhcp</b> lease from the scope matching their subnet.</p>
+    </div>
+    ${helpers}`;
 }
 
 function wireDhcpProps(dev) {
   const cb = document.getElementById('dev-dhcp-on');
-  if (!cb) return;
-  const cfg = document.getElementById('dev-dhcp-cfg');
-  const a = document.getElementById('dev-dhcp-a'), b = document.getElementById('dev-dhcp-b');
+  const root = propsBody;
+  const redraw = () => { showDeviceProps(dev.id); };
+  // Read the whole editor back into the model — one direction, no partial state.
   const save = () => {
-    dev.dhcp = {
-      enabled: cb.checked,
-      poolStart: (a.value || '').trim(),
-      poolEnd: (b.value || '').trim()
-    };
+    if (!cb) return;
+    const pools = [...root.querySelectorAll('.dh-scope')].map(el => {
+      const g = c => (el.querySelector('.' + c) || {}).value;
+      const inf = (el.querySelector('.dh-inf') || {}).checked;
+      const dns = (g('dh-dns') || '').split(',').map(s => s.trim()).filter(Boolean);
+      const reservations = [...el.querySelectorAll('[data-res]')].map(r => ({
+        mac: (r.querySelector('.dh-res-mac').value || '').trim(),
+        ip: (r.querySelector('.dh-res-ip').value || '').trim()
+      })).filter(r => r.mac && r.ip);
+      return {
+        name: (g('dh-name') || '').trim(),
+        network: (g('dh-net') || '').trim(),
+        poolStart: (g('dh-start') || '').trim(),
+        poolEnd: (g('dh-end') || '').trim(),
+        lease: inf ? 'infinite' : { days: +g('dh-ld') || 0, hours: +g('dh-lh') || 0, minutes: +g('dh-lm') || 0 },
+        defaultRouter: (g('dh-gw') || '').trim(),
+        dns, domain: (g('dh-dom') || '').trim(), tftp: (g('dh-tftp') || '').trim(),
+        reservations
+      };
+    });
+    const excluded = [...root.querySelectorAll('[data-exc]')].map(r => ({
+      from: (r.querySelector('.dh-exc-a').value || '').trim(),
+      to: (r.querySelector('.dh-exc-b').value || '').trim()
+    })).filter(r => r.from);
+    dev.dhcp = { enabled: cb.checked, pools, excluded };
+    const helpers = {};
+    for (const h of root.querySelectorAll('.dh-helper')) {
+      const list = (h.value || '').split(',').map(s => s.trim()).filter(Boolean);
+      if (list.length) helpers[h.dataset.if] = list;
+    }
+    dev.helpers = helpers;
     resolveDhcp();
     refreshSimPickers();
   };
+  for (const el of root.querySelectorAll('.dh-helper')) el.onchange = save;
+  if (!cb) return;
+  const cfg = document.getElementById('dev-dhcp-cfg');
   cb.onchange = () => {
     cfg.style.display = cb.checked ? '' : 'none';
-    // sensible starting pool so enabling it does something immediately
-    if (cb.checked && !a.value) {
-      const seed = state.devices.map(d => d.ip).filter(ip => ip && ip !== 'dhcp').map(parseIp).filter(Boolean)[0];
-      if (seed) {
-        const net = seed.network >>> 0;
-        a.value = ipStr(net + 100);
-        b.value = ipStr(net + 200);
-      }
+    // Enabling with no scopes seeds one from an interface this device actually
+    // holds, so the first scope is real rather than a placeholder.
+    if (cb.checked && !(dev.dhcp && dev.dhcp.pools || []).length) {
+      const i = deviceInterfaces(dev)[0];
+      dev.dhcp = { enabled: true, excluded: [], pools: [i ? {
+        name: i.kind === 'svi' ? `VLAN${i.vlan}` : `PORT${i.port}`,
+        network: subnetLabel(i.ip), poolStart: '', poolEnd: '',
+        lease: { days: 1, hours: 0, minutes: 0 },
+        defaultRouter: ipStr(i.ip.int), dns: [], domain: '', tftp: '', reservations: []
+      } : { name: 'POOL1', network: '', lease: { days: 1, hours: 0, minutes: 0 }, reservations: [] }] };
+      if (i) dev.dhcp.excluded = [{ from: ipStr(i.ip.network + 1), to: ipStr(i.ip.int) }];
+      redraw(); return;
     }
     save();
   };
-  a.onchange = save;
-  b.onchange = save;
+  for (const el of root.querySelectorAll('#dev-dhcp-cfg input')) {
+    if (el.id !== 'dev-dhcp-on') el.onchange = save;
+  }
+  const add = document.getElementById('dh-add');
+  if (add) add.onclick = () => {
+    save();
+    dev.dhcp.pools.push({ name: `POOL${dev.dhcp.pools.length + 1}`, network: '', poolStart: '', poolEnd: '',
+      lease: { days: 1, hours: 0, minutes: 0 }, defaultRouter: '', dns: [], domain: '', tftp: '', reservations: [] });
+    redraw();
+  };
+  const excAdd = document.getElementById('dh-exc-add');
+  if (excAdd) excAdd.onclick = () => { save(); dev.dhcp.excluded.push({ from: '', to: '' }); redraw(); };
+  for (const b of root.querySelectorAll('.dh-del')) b.onclick = e => {
+    const i = +e.target.closest('.dh-scope').dataset.scope;
+    save(); dev.dhcp.pools.splice(i, 1); redraw();
+  };
+  for (const b of root.querySelectorAll('.dh-exc-del')) b.onclick = e => {
+    const i = +e.target.closest('[data-exc]').dataset.exc;
+    save(); dev.dhcp.excluded.splice(i, 1); redraw();
+  };
+  for (const b of root.querySelectorAll('.dh-res-add')) b.onclick = e => {
+    const i = +e.target.closest('.dh-scope').dataset.scope;
+    save(); (dev.dhcp.pools[i].reservations ||= []).push({ mac: '', ip: '' }); redraw();
+  };
+  for (const b of root.querySelectorAll('.dh-res-del')) b.onclick = e => {
+    const [i, j] = e.target.closest('[data-res]').dataset.res.split(':').map(Number);
+    save(); dev.dhcp.pools[i].reservations.splice(j, 1); redraw();
+  };
 }
 
 function showDeviceProps(id) {
@@ -6479,6 +7023,29 @@ function migrateCableSides(cables) {
   }
 }
 
+// Saves written when a device had one flat pool ({enabled, poolStart, poolEnd}).
+// That pool becomes a scope, with its subnet taken from the start address and
+// its gateway from whichever interface of this device sits in that subnet —
+// which is what the old code assumed anyway, just never wrote down. Dropping
+// these silently would turn a working saved map into a server with no scopes.
+function migrateDhcpScopes(devices) {
+  for (const d of devices || []) {
+    const dh = d.dhcp;
+    if (!dh || Array.isArray(dh.pools)) continue;
+    if (!dh.poolStart) { d.dhcp = { enabled: !!dh.enabled, pools: [], excluded: [] }; continue; }
+    const start = parseIp(dh.poolStart);
+    if (!start) { d.dhcp = { enabled: !!dh.enabled, pools: [], excluded: [] }; continue; }
+    const iface = deviceInterfaces(d).find(i => sameSubnet(i.ip, start));
+    d.dhcp = { enabled: !!dh.enabled, excluded: [], pools: [{
+      name: 'POOL1', network: subnetLabel(start),
+      poolStart: dh.poolStart, poolEnd: dh.poolEnd || dh.poolStart,
+      lease: { days: 1, hours: 0, minutes: 0 },
+      defaultRouter: iface ? ipStr(iface.ip.int) : '',
+      dns: [], domain: '', tftp: '', reservations: []
+    }] };
+  }
+}
+
 function restore(json) {
   let data;
   try { data = JSON.parse(json); } catch { setStatus('Could not parse that file.'); return; }
@@ -6490,6 +7057,7 @@ function restore(json) {
   };
   nextId = data.nextId || 1000;
   migrateCableSides(state.cables);
+  migrateDhcpScopes(state.devices);
   // re-register custom devices BEFORE rebuilding anything that uses them
   Object.assign(DEVICE_TYPES, state.customTypes);
   populateLibrary();
@@ -7082,23 +7650,83 @@ document.getElementById('sim-matrix').onclick = runMatrix;
 
 function runDhcp() {
   resolveDhcp();
-  const servers = state.devices.filter(d => isPlaced(d) && netClass(d) === 'router' && d.dhcp && d.dhcp.enabled && dhcpPool(d));
-  if (!servers.length) { aiPrint('<p>No DHCP servers. Enable DHCP on a router/gateway in its properties.</p>'); return; }
+  const servers = state.devices.filter(d => isPlaced(d) && d.dhcp && d.dhcp.enabled && dhcpPools(d).length);
+  const now = simNow();
   let html = '';
+  if (_simSkewMs) {
+    html += `<p class="ai-meta">Simulation clock is ${fmtDur(_simSkewMs)} ahead of real time.</p>`;
+  }
+  if (!servers.length) {
+    html += '<p>No DHCP scopes. Enable DHCP on a gateway or server and add a scope in its properties.</p>';
+  }
   for (const sv of servers) {
-    const pool = dhcpPool(sv);
-    const leases = [...(_dhcpLeases)].filter(([, l]) => l.serverId === sv.id);
-    html += `<h4>${sv.name} · DHCP</h4><p class="ai-meta">pool ${sv.dhcp.poolStart}–${sv.dhcp.poolEnd} · ${leases.length} leased</p>`;
-    if (leases.length) {
-      html += `<table class="sim-table">${leases.map(([hid, l]) => {
-        const h = deviceById(hid);
-        return `<tr><td>${h ? h.name : '?'}</td><td>${l.ip}</td></tr>`;
+    const pools = dhcpPools(sv);
+    html += `<h4>${sv.name} · show ip dhcp pool</h4>`;
+    html += `<table class="sim-table"><tr><th>Pool</th><th>Subnet</th><th>Range</th><th>Total</th><th>Leased</th><th>Lease</th></tr>${
+      pools.map(p => {
+        const total = p.end - p.start + 1;
+        let excl = 0;
+        for (let a = p.start; a <= p.end; a++) if (isExcluded(sv, a)) excl++;
+        const leased = [..._dhcpBindings.values()].filter(b => b.serverId === sv.id && b.poolName === p.name && b.state !== 'EXPIRED').length;
+        return `<tr><td>${p.name}</td><td>${subnetLabel(p.net)}</td><td>${ipStr(p.start)}–${ipStr(p.end)}</td>` +
+          `<td>${total - excl}${excl ? ` <span class="ai-meta">(${excl} excl)</span>` : ''}</td><td>${leased}</td><td>${leaseLabel(p)}</td></tr>`;
       }).join('')}</table>`;
+    const opts = pools.filter(p => p.defaultRouter || (p.dns || []).length || p.domain || p.tftp);
+    if (opts.length) {
+      html += `<table class="sim-table"><tr><th>Pool</th><th>router (3)</th><th>dns (6)</th><th>domain (15)</th><th>tftp (150)</th></tr>${
+        opts.map(p => `<tr><td>${p.name}</td><td>${p.defaultRouter || '—'}</td><td>${[].concat(p.dns || []).join(', ') || '—'}</td><td>${p.domain || '—'}</td><td>${p.tftp || '—'}</td></tr>`).join('')}</table>`;
+    }
+    const binds = [..._dhcpBindings.values()].filter(b => b.serverId === sv.id).sort((a, b) => a.ipInt - b.ipInt);
+    if (binds.length) {
+      html += `<h4>${sv.name} · show ip dhcp binding</h4>`;
+      html += `<table class="sim-table"><tr><th>IP address</th><th>Client-ID/Hardware</th><th>Lease expiration</th><th>Type</th><th>State</th></tr>${
+        binds.map(b => {
+          const h = deviceById(b.hostId);
+          const left = b.expiresAt - now;
+          const cls = b.state === 'EXPIRED' ? 'ai-bad' : (b.state === 'BOUND' ? '' : 'ai-warn');
+          return `<tr><td>${b.ip}</td><td>${b.clientId}<br><span class="ai-meta">${h ? h.name : '?'} · ${b.mac}</span></td>` +
+            `<td>${fmtDur(left)}${b.via === 'relay' ? `<br><span class="ai-meta">via ${b.relayName}, giaddr ${b.giaddr}</span>` : ''}</td>` +
+            `<td>${b.type}</td><td class="${cls}">${b.state}${b.renewals ? ` <span class="ai-meta">(${b.renewals} renewals)</span>` : ''}</td></tr>`;
+        }).join('')}</table>`;
+    }
+    const conf = _dhcpConflicts.get(sv.id) || [];
+    if (conf.length) {
+      html += `<h4>${sv.name} · show ip dhcp conflict</h4><p class="ai-meta">probed with ${DHCP_PING_PACKETS} pings, ${DHCP_PING_TIMEOUT_MS} ms timeout</p>`;
+      html += `<table class="sim-table"><tr><th>IP address</th><th>Detection method</th><th>Held by</th></tr>${
+        conf.map(c => `<tr><td>${c.ip}</td><td>${c.method}</td><td class="ai-warn">${c.holder}</td></tr>`).join('')}</table>`;
     }
   }
-  const noLease = state.devices.filter(d => isPlaced(d) && d.ip === 'dhcp' && !_dhcpLeases.get(d.id));
-  if (noLease.length) html += `<p class="ai-bad">${noLease.map(d => d.name).join(', ')} — no lease (no server in broadcast domain).</p>`;
+  // Anything that asked and did not get an address, with the actual reason.
+  const failures = _dhcpLog.filter(l => !l.ok);
+  if (failures.length) {
+    html += `<h4>No lease</h4>` + failures.map(f =>
+      `<p class="ai-bad">${f.host.name} — ${f.reason}</p>`).join('');
+  }
+  // The exchange itself, because "it got an address" is not the same as
+  // knowing which server answered and what it sent.
+  const shown = _dhcpLog.filter(l => l.log && l.log.length).slice(0, 4);
+  if (shown.length) {
+    html += `<h4>Exchange</h4>`;
+    for (const l of shown) {
+      html += `<p class="ai-meta">${l.host.name}</p><table class="sim-table">${
+        l.log.map(p => `<tr><td style="white-space:nowrap">${p.dir} ${p.msg}</td><td class="ai-meta">${p.detail}</td></tr>`).join('')}</table>`;
+    }
+  }
+  const leasedNow = [..._dhcpLeases.keys()].length;
+  html += `<div class="row" style="margin-top:10px;gap:6px;flex-wrap:wrap">
+    <button id="dh-adv-1h">+1 hour</button>
+    <button id="dh-adv-12h">+12 hours</button>
+    <button id="dh-adv-1d">+1 day</button>
+    <button id="dh-clock-reset">Reset clock</button>
+    <button id="dh-clear" class="danger">clear ip dhcp binding *</button></div>
+    <p class="cbl-edit-hint">${leasedNow} active lease${leasedNow === 1 ? '' : 's'}. Winding the clock forward runs the real RFC 2131 timers — T1 at 50% of the lease, T2 at 87.5%, then expiry.</p>`;
   aiPrint(html);
+  const bind = (id, fn) => { const b = document.getElementById(id); if (b) b.onclick = () => { fn(); runDhcp(); }; };
+  bind('dh-adv-1h', () => simAdvance(3600));
+  bind('dh-adv-12h', () => simAdvance(12 * 3600));
+  bind('dh-adv-1d', () => simAdvance(86400));
+  bind('dh-clock-reset', () => simResetClock());
+  bind('dh-clear', () => dhcpClearBindings());
 }
 document.getElementById('sim-dhcp').onclick = runDhcp;
 
@@ -7698,9 +8326,27 @@ function referenceSite() {
   // Core gateway. It routes between VLANs on SVIs — one interface per VLAN, each
   // holding the .1 of that subnet. That is what makes it the default gateway for
   // those subnets; a router merely sitting on the wire routes nothing.
+  // One scope per VLAN, not one pool per device — each carries its own range,
+  // lease and options. Lease lengths follow real practice: a day for wired
+  // staff, half a day for transient wireless clients, a week for cameras that
+  // never move. The .1–.99 of every subnet is excluded for static infrastructure.
   const udm = mk('u_udmpromax', 35, { ip: '10.0.0.254', notes: 'core gateway',
     svi: { 10: '10.0.10.1/24', 20: '10.0.20.1/24', 30: '10.0.30.1/24' },
-    dhcp: { enabled: true, poolStart: '10.0.10.100', poolEnd: '10.0.10.200' } });
+    dhcp: { enabled: true,
+      excluded: [{ from: '10.0.10.1', to: '10.0.10.99' },
+                 { from: '10.0.20.1', to: '10.0.20.99' },
+                 { from: '10.0.30.1', to: '10.0.30.99' }],
+      pools: [
+        { name: 'SERVERS', network: '10.0.10.0/24', poolStart: '10.0.10.100', poolEnd: '10.0.10.200',
+          lease: { days: 1, hours: 0, minutes: 0 }, defaultRouter: '10.0.10.1',
+          dns: ['10.0.10.5', '1.1.1.1'], domain: 'corp.local', tftp: '', reservations: [] },
+        { name: 'WIFI', network: '10.0.20.0/24', poolStart: '10.0.20.100', poolEnd: '10.0.20.200',
+          lease: { days: 0, hours: 12, minutes: 0 }, defaultRouter: '10.0.20.1',
+          dns: ['10.0.10.5', '1.1.1.1'], domain: 'corp.local', tftp: '', reservations: [] },
+        { name: 'CCTV', network: '10.0.30.0/24', poolStart: '10.0.30.100', poolEnd: '10.0.30.200',
+          lease: { days: 7, hours: 0, minutes: 0 }, defaultRouter: '10.0.30.1',
+          dns: ['10.0.10.5'], domain: 'corp.local', tftp: '', reservations: [] }
+      ] } });
   const pmax = mk('u_promax24', 33, { ip: '10.0.0.4', notes: 'Etherlighting demo' });
   mk('firewall', 37, { ip: '10.0.0.254' });
   const srv = mk('server', 20, { ip: '10.0.10.5', gateway: '10.0.10.1' });
