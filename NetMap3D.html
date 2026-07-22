@@ -404,7 +404,7 @@ select:focus, input:focus { border-color: var(--accent); }
        Row 2 carries options for whichever tool is active, so the palette can
        keep growing without the bar ever running off the screen again. -->
   <div id="toolbar">
-    <span class="logo">NetMap<b>3D</b><span class="ver">v0.19.1</span></span>
+    <span class="logo">NetMap<b>3D</b><span class="ver">v0.20.0</span></span>
     <span id="proj-name"></span>
     <span class="sep"></span>
     <div id="modescroll">
@@ -5630,24 +5630,25 @@ const RACK_BASE = 2;        // floor to bottom of U1
 const RACK_H = RACK_BASE + RACK_UNITS * U + 1;
 
 const DEVICE_TYPES = {
-  switch48: { label: '48-Port Switch',      uh: 1, ports: 48, rows: 2, depth: 14, color: 0x2f3b4d,
+  switch48: { role: 'switch', label: '48-Port Switch',      uh: 1, ports: 48, rows: 2, depth: 14, color: 0x2f3b4d,
     portLayout: [{ type: 'rj', cols: 24, rows: 2 }] },
-  switch24: { label: '24-Port Switch',      uh: 1, ports: 24, rows: 1, depth: 12, color: 0x33445a,
+  switch24: { role: 'switch', label: '24-Port Switch',      uh: 1, ports: 24, rows: 1, depth: 12, color: 0x33445a,
     portLayout: [{ type: 'rj', cols: 24, rows: 1 }] },
   patch24:  { label: '24-Port Patch Panel', uh: 1, ports: 24, rows: 1, depth: 4,  color: 0x1c1f26, passthrough: true,
     portLayout: [{ type: 'rj', cols: 6 }, { type: 'rj', cols: 6, gapBefore: 0.3 }, { type: 'rj', cols: 6, gapBefore: 0.3 }, { type: 'rj', cols: 6, gapBefore: 0.3 }] },
-  router:   { label: 'Router',              uh: 1, ports: 8,  rows: 1, depth: 12, color: 0x3d3550, wan: 1,
+  router:   { role: 'router', label: 'Router',              uh: 1, ports: 8,  rows: 1, depth: 12, color: 0x3d3550, wan: 1,
     portLayout: [{ type: 'rj', cols: 1 }, { type: 'rj', cols: 7, gapBefore: 0.45 }] },
-  firewall: { label: 'Firewall',            uh: 1, ports: 6,  rows: 1, depth: 12, color: 0x50333a, wan: 1,
+  firewall: { role: 'router', label: 'Firewall',            uh: 1, ports: 6,  rows: 1, depth: 12, color: 0x50333a, wan: 1,
     portLayout: [{ type: 'rj', cols: 1 }, { type: 'rj', cols: 5, gapBefore: 0.45 }] },
-  server:   { label: 'Server',              uh: 2, ports: 4,  rows: 1, depth: 26, color: 0x3a4148,
+  server:   { role: 'host', label: 'Server',              uh: 2, ports: 4,  rows: 1, depth: 26, color: 0x3a4148,
     portLayout: [{ type: 'rj', cols: 4, rows: 1 }] },
   ups:      { label: 'UPS',                 uh: 2, ports: 0,  rows: 0, depth: 24, color: 0x22262c, powerDevice: true, outlets: 8 },
   hcm:      { label: 'Horiz. Cable Manager',uh: 1, ports: 0,  rows: 0, depth: 5,  color: 0x15181d, manager: true },
   vcm:      { label: 'Vert. Cable Manager', uh: 0, ports: 0,  rows: 0, depth: 5,  color: 0x15181d, manager: true, vertical: true },
-  ap:       { label: 'Access Point',        uh: 0, ports: 1,  rows: 1, depth: 0,  color: 0xe8ebef, field: true, mountH: 96, mounts: ['ceiling', 'wall'], shape: 'disc' },
-  camera:   { label: 'IP Camera',           uh: 0, ports: 1,  rows: 1, depth: 0,  color: 0xdfe3e8, field: true, mountH: 96, mounts: ['ceiling', 'wall'], shape: 'bullet' },
-  person:   { label: 'Reference Person (5\'10")', short: 'Person', uh: 0, ports: 0, rows: 0, depth: 0, color: 0x3a4148, field: true, mounts: ['desk'], shape: 'person' }
+  ap:       { role: 'host', label: 'Access Point', uh: 0, ports: 1,  rows: 1, depth: 0,  color: 0xe8ebef, field: true, mountH: 96, mounts: ['ceiling', 'wall'], shape: 'disc' },
+  camera:   { role: 'host', label: 'IP Camera',    uh: 0, ports: 1,  rows: 1, depth: 0,  color: 0xdfe3e8, field: true, mountH: 96, mounts: ['ceiling', 'wall'], shape: 'bullet' },
+  // Scenery, not a network device — it must never appear as a pingable host.
+  person:   { role: 'prop', label: 'Reference Person (5\'10")', short: 'Person', uh: 0, ports: 0, rows: 0, depth: 0, color: 0x3a4148, field: true, mounts: ['desk'], shape: 'person' }
 };
 for (const k of Object.keys(DEVICE_TYPES)) DEVICE_TYPES[k].cat = 'Generic';
 
@@ -5672,32 +5673,37 @@ const SPEC_SOURCES = {
   u_promax48: 'https://techspecs.ui.com/unifi/switching/usw-pro-max-48-poe'
 };
 
+// Field builder — APs, cameras, phones, desk gear. These are endpoints unless
+// the SKU says otherwise (a desk switch or a desk gateway overrides via extra).
 const F = (label, short, mounts, shape, ports = 1, extra = {}) =>
-  ({ label, short, uh: 0, ports, rows: 1, depth: 0, color: 0xe8ebef, field: true, mountH: 96, mounts, shape, ...extra });
+  ({ label, short, uh: 0, ports, rows: 1, depth: 0, color: 0xe8ebef, field: true, mountH: 96, mounts, shape, role: 'host', ...extra });
+// Rack-mount builder. `role` defaults to switch because that is what the vast
+// majority of rack SKUs in this catalog are; routers/gateways override it via
+// extra, and the override wins since extra is spread last.
 const R = (label, short, ports, rows = 1, uh = 1, depth = 14, extra = {}) =>
-  ({ label, short, uh, ports, rows, depth, color: UI_SILVER, ...extra });
+  ({ label, short, uh, ports, rows, depth, color: UI_SILVER, role: 'switch', ...extra });
 const UNIFI_CATALOG = {
   // Gateways
   // UDM family, true front panel: 2×4 RJ45 LAN block · RJ45 WAN · stacked SFP+ pair · touchscreen right
-  u_udmpromax: { ...R('UDM Pro Max', 'UDMPM', 11, 2, 1, 17, {
+  u_udmpromax: { ...R('UDM Pro Max', 'UDMPM', 11, 2, 1, 17, { role: 'router',
     sfp: 2, roleMap: { 9: 'WAN', 10: 'WAN' }, faceInsetL: 3, faceInsetR: 3.4, display: { side: 'R', w: 2.1, h: 1.1 },
     portLayout: [{ type: 'rj', cols: 4, rows: 2 }, { type: 'rj', cols: 1, rows: 1, gapBefore: 0.5 }, { type: 'sfp', cols: 1, rows: 2, gapBefore: 0.5 }]
   }), cat: 'UniFi Gateways' },
-  u_udmse:     { ...R('UDM SE', 'UDMSE', 11, 2, 1, 17, {
+  u_udmse:     { ...R('UDM SE', 'UDMSE', 11, 2, 1, 17, { role: 'router',
     sfp: 2, roleMap: { 9: 'WAN', 10: 'WAN' }, faceInsetL: 3, faceInsetR: 3.4, display: { side: 'R', w: 2.1, h: 1.1 },
     portLayout: [{ type: 'rj', cols: 4, rows: 2 }, { type: 'rj', cols: 1, rows: 1, gapBefore: 0.5 }, { type: 'sfp', cols: 1, rows: 2, gapBefore: 0.5 }]
   }), cat: 'UniFi Gateways' },
   // UXG Pro: RJ45 LAN · RJ45 WAN · SFP+ LAN · SFP+ WAN in one row, no display
-  u_uxgpro:    { ...R('UXG Pro', 'UXG', 4, 1, 1, 12, {
+  u_uxgpro:    { ...R('UXG Pro', 'UXG', 4, 1, 1, 12, { role: 'router',
     sfp: 2, roleMap: { 2: 'WAN', 4: 'WAN' },
     portLayout: [{ type: 'rj', cols: 1 }, { type: 'rj', cols: 1, gapBefore: 0.4 }, { type: 'sfp', cols: 2, gapBefore: 0.5 }]
   }), cat: 'UniFi Gateways' },
-  u_dr7:       { ...F('Dream Router 7', 'DR7', ['desk'], 'tower', 5, { wan: 1 }), cat: 'UniFi Gateways' },
-  u_ucgultra:  { ...F('Cloud Gateway Ultra', 'UCG', ['desk'], 'deskbox', 5, { wan: 1 }), cat: 'UniFi Gateways' },
-  u_ucgmax:    { ...F('Cloud Gateway Max', 'UCGMax', ['desk'], 'deskbox', 5, { wan: 1 }), cat: 'UniFi Gateways' },
-  u_ucgfiber:  { ...F('Cloud Gateway Fiber', 'UCGF', ['desk'], 'deskbox', 6, { sfp: 2, roleMap: { 6: 'WAN' } }), cat: 'UniFi Gateways' },
-  u_express7:  { ...F('Express 7', 'EX7', ['desk', 'wall'], 'deskbox', 2, { wan: 1 }), cat: 'UniFi Gateways' },
-  u_cgindustrial: { ...F('Cloud Gateway Industrial', 'CGI', ['wall'], 'box', 9, { wan: 1 }), cat: 'UniFi Gateways' },
+  u_dr7:       { ...F('Dream Router 7', 'DR7', ['desk'], 'tower', 5, { role: 'router', wan: 1 }), cat: 'UniFi Gateways' },
+  u_ucgultra:  { ...F('Cloud Gateway Ultra', 'UCG', ['desk'], 'deskbox', 5, { role: 'router', wan: 1 }), cat: 'UniFi Gateways' },
+  u_ucgmax:    { ...F('Cloud Gateway Max', 'UCGMax', ['desk'], 'deskbox', 5, { role: 'router', wan: 1 }), cat: 'UniFi Gateways' },
+  u_ucgfiber:  { ...F('Cloud Gateway Fiber', 'UCGF', ['desk'], 'deskbox', 6, { role: 'router', sfp: 2, roleMap: { 6: 'WAN' } }), cat: 'UniFi Gateways' },
+  u_express7:  { ...F('Express 7', 'EX7', ['desk', 'wall'], 'deskbox', 2, { role: 'router', wan: 1 }), cat: 'UniFi Gateways' },
+  u_cgindustrial: { ...F('Cloud Gateway Industrial', 'CGI', ['wall'], 'box', 9, { role: 'router', wan: 1 }), cat: 'UniFi Gateways' },
   // Switches
   // UniFi switches: one continuous RJ45 block (no Cisco-style gaps) + stacked SFP+ at right
   // Pro Max 48 PoE: 16× 2.5G (8 PoE+, 8 PoE++) then 32× 1G (24 PoE+, 8 PoE++),
@@ -5722,9 +5728,12 @@ const UNIFI_CATALOG = {
     portLayout: [{ type: 'sfp', cols: 8, rows: 1 }] }), cat: 'UniFi Switches' },
   u_proagg:    { ...R('Pro Aggregation', 'ProAgg', 32, 2, 1, 14, { sfp: 32, faceInsetL: 2.2, display: { side: 'L', w: 1.4, h: 1.0 },
     portLayout: [{ type: 'sfp', cols: 14, rows: 2 }, { type: 'sfp', cols: 2, rows: 2, gapBefore: 0.6 }] }), cat: 'UniFi Switches' },
-  u_ultra8:    { ...F('Switch Ultra (8 PoE)', 'Ultra8', ['desk', 'wall'], 'deskbox', 8), cat: 'UniFi Switches' },
-  u_flex25g8:  { ...F('Flex 2.5G 8 PoE', 'Flex8', ['desk', 'wall'], 'deskbox', 9, { sfp: 1 }), cat: 'UniFi Switches' },
-  u_flexmini:  { ...F('Flex Mini 2.5G', 'FlexM', ['desk', 'wall'], 'deskbox', 5), cat: 'UniFi Switches' },
+  // Desk/wall switches. F() defaults to host because most field gear is an
+  // endpoint, so these must declare that they bridge — a Flex Mini really is a
+  // 5-port switch and has to behave like one in the simulation.
+  u_ultra8:    { ...F('Switch Ultra (8 PoE)', 'Ultra8', ['desk', 'wall'], 'deskbox', 8, { role: 'switch' }), cat: 'UniFi Switches' },
+  u_flex25g8:  { ...F('Flex 2.5G 8 PoE', 'Flex8', ['desk', 'wall'], 'deskbox', 9, { role: 'switch', sfp: 1 }), cat: 'UniFi Switches' },
+  u_flexmini:  { ...F('Flex Mini 2.5G', 'FlexM', ['desk', 'wall'], 'deskbox', 5, { role: 'switch' }), cat: 'UniFi Switches' },
   // Access points
   u_u7pro:     { ...F('U7 Pro', 'U7Pro', ['ceiling', 'wall'], 'disc'), cat: 'UniFi APs' },
   u_u7promax:  { ...F('U7 Pro Max', 'U7PMax', ['ceiling', 'wall'], 'disc'), cat: 'UniFi APs' },
@@ -5752,10 +5761,10 @@ const UNIFI_CATALOG = {
   u_intercomview: { ...F('Intercom Viewer', 'IView', ['wall'], 'panel'), cat: 'UniFi Door Access' },
   u_accesshub:  { ...F('Access Hub', 'AHub', ['wall'], 'box', 4), cat: 'UniFi Door Access' },
   // Storage & power
-  u_unvr:     { ...R('UNVR', 'UNVR', 2, 1, 1, 20, { sfp: 1, bays: 4, faceInsetL: 12 }), cat: 'UniFi Storage & Power' },
-  u_unvrpro:  { ...R('UNVR Pro', 'UNVRP', 2, 1, 2, 20, { sfp: 1, bays: 7, faceInsetL: 12 }), cat: 'UniFi Storage & Power' },
-  u_unaspro:  { ...R('UNAS Pro', 'UNAS', 2, 1, 2, 20, { sfp: 1, bays: 7, faceInsetL: 12, display: { side: 'L', w: 1.6, h: 1.0 } }), cat: 'UniFi Storage & Power' },
-  u_pdupro:   { ...R('USP PDU Pro', 'PDU', 0, 0, 1, 10, { faceInsetR: 3, display: { side: 'R', w: 1.6, h: 0.9 }, powerDevice: true, outlets: 8 }), cat: 'UniFi Storage & Power' },
+  u_unvr:     { ...R('UNVR', 'UNVR', 2, 1, 1, 20, { role: 'host', sfp: 1, bays: 4, faceInsetL: 12 }), cat: 'UniFi Storage & Power' },
+  u_unvrpro:  { ...R('UNVR Pro', 'UNVRP', 2, 1, 2, 20, { role: 'host', sfp: 1, bays: 7, faceInsetL: 12 }), cat: 'UniFi Storage & Power' },
+  u_unaspro:  { ...R('UNAS Pro', 'UNAS', 2, 1, 2, 20, { role: 'host', sfp: 1, bays: 7, faceInsetL: 12, display: { side: 'L', w: 1.6, h: 1.0 } }), cat: 'UniFi Storage & Power' },
+  u_pdupro:   { ...R('USP PDU Pro', 'PDU', 0, 0, 1, 10, { role: 'power', faceInsetR: 3, display: { side: 'R', w: 1.6, h: 0.9 }, powerDevice: true, outlets: 8 }), cat: 'UniFi Storage & Power' },
   u_unas2:    { ...F('UNAS 2', 'UNAS2', ['desk'], 'box', 1), cat: 'UniFi Storage & Power' }
 };
 Object.assign(DEVICE_TYPES, UNIFI_CATALOG);
@@ -5788,7 +5797,7 @@ const BRAND_PACK = {
   // MX85: 4 dedicated WAN (2× SFP + 2× RJ45, one of them PoE+) and 10 LAN
   // (8× RJ45 + 2× SFP), plus a management RJ45. The four SFP cages were missing
   // entirely, so the appliance had no fibre uplink path at all.
-  b_mx85:    { ...R('Meraki MX85', 'MX85', 15, 1, 1, 14, { wan: 4, sfp: 4, verified: true,
+  b_mx85:    { ...R('Meraki MX85', 'MX85', 15, 1, 1, 14, { role: 'router', wan: 4, sfp: 4, verified: true,
     roleMap: { 1: 'WAN', 2: 'WAN', 3: 'WAN', 4: 'WAN', 15: 'MGMT' },
     portLayout: [
       { type: 'sfp', cols: 2, speed: SPEED.ge, role: 'WAN' },
@@ -5806,12 +5815,12 @@ const BRAND_PACK = {
   b_gs728:   { ...R('Netgear GS728TPP', 'GS728', 28, 2, 1, 12, { sfp: 4,
     portLayout: [{ type: 'rj', cols: 12, rows: 2 }, { type: 'sfp', cols: 2, rows: 2, gapBefore: 0.5 }] }), cat: 'Netgear' },
   b_wax630:  { ...F('Netgear WAX630', 'WAX630', ['ceiling', 'wall'], 'disc'), cat: 'Netgear' },
-  b_er8411:  { ...R('Omada ER8411 Router', 'ER8411', 10, 1, 1, 14, { wan: 2, sfp: 2,
+  b_er8411:  { ...R('Omada ER8411 Router', 'ER8411', 10, 1, 1, 14, { role: 'router', wan: 2, sfp: 2,
     portLayout: [{ type: 'sfp', cols: 1 }, { type: 'rj', cols: 1, gapBefore: 0.25 }, { type: 'rj', cols: 6, gapBefore: 0.5 }, { type: 'sfp', cols: 2, gapBefore: 0.5 }] }), cat: 'TP-Link Omada' },
   b_sg3452:  { ...R('Omada SG3452P', 'SG3452', 52, 2, 1, 17, { sfp: 4,
     portLayout: [{ type: 'rj', cols: 24, rows: 2 }, { type: 'sfp', cols: 2, rows: 2, gapBefore: 0.6 }] }), cat: 'TP-Link Omada' },
   b_eap670:  { ...F('Omada EAP670', 'EAP670', ['ceiling', 'wall'], 'disc'), cat: 'TP-Link Omada' },
-  b_ccr2004: { ...R('MikroTik CCR2004-16G-2S+', 'CCR2004', 18, 2, 1, 12, { wan: 1, sfp: 2,
+  b_ccr2004: { ...R('MikroTik CCR2004-16G-2S+', 'CCR2004', 18, 2, 1, 12, { role: 'router', wan: 1, sfp: 2,
     portLayout: [{ type: 'rj', cols: 8, rows: 2 }, { type: 'sfp', cols: 2, rows: 1, gapBefore: 0.5 }] }), cat: 'MikroTik' },
   b_crs326:  { ...R('MikroTik CRS326-24G-2S+', 'CRS326', 26, 2, 1, 11, { sfp: 2,
     portLayout: [{ type: 'rj', cols: 12, rows: 2 }, { type: 'sfp', cols: 2, rows: 1, gapBefore: 0.5 }] }), cat: 'MikroTik' }
@@ -5887,7 +5896,7 @@ const CISCO_PACK = {
   // --- Firepower NGFW ---
   // 1010 is copper-only with two PoE+ ports; 1120/1140 add four SFP cages.
   // All three carry a separate management RJ45 alongside the data ports.
-  c_fpr1010: { ...R('Firepower 1010', 'FPR1010', 9, 1, 1, 12, { verified: true,
+  c_fpr1010: { ...R('Firepower 1010', 'FPR1010', 9, 1, 1, 12, { role: 'router', verified: true,
     roleMap: { 1: 'WAN', 9: 'MGMT' },
     portLayout: [
       { type: 'rj', cols: 1, speed: SPEED.ge, role: 'WAN' },
@@ -5895,7 +5904,7 @@ const CISCO_PACK = {
       { type: 'rj', cols: 2, speed: SPEED.ge, poe: POE.at },
       { type: 'rj', cols: 1, gapBefore: 0.5, speed: SPEED.ge, role: 'MGMT' }
     ] }), cat: 'Cisco & Meraki' },
-  c_fpr1120: { ...R('Firepower 1120', 'FPR1120', 13, 1, 1, 16, { sfp: 4, verified: true,
+  c_fpr1120: { ...R('Firepower 1120', 'FPR1120', 13, 1, 1, 16, { role: 'router', sfp: 4, verified: true,
     roleMap: { 1: 'WAN', 13: 'MGMT' },
     portLayout: [
       { type: 'rj', cols: 1, speed: SPEED.ge, role: 'WAN' },
@@ -5903,7 +5912,7 @@ const CISCO_PACK = {
       { type: 'sfp', cols: 4, gapBefore: 0.5, speed: SPEED.ge },
       { type: 'rj', cols: 1, gapBefore: 0.5, speed: SPEED.ge, role: 'MGMT' }
     ] }), cat: 'Cisco & Meraki' },
-  c_fpr1140: { ...R('Firepower 1140', 'FPR1140', 13, 1, 1, 16, { sfp: 4, verified: true,
+  c_fpr1140: { ...R('Firepower 1140', 'FPR1140', 13, 1, 1, 16, { role: 'router', sfp: 4, verified: true,
     roleMap: { 1: 'WAN', 13: 'MGMT' },
     portLayout: [
       { type: 'rj', cols: 1, speed: SPEED.ge, role: 'WAN' },
@@ -5913,7 +5922,7 @@ const CISCO_PACK = {
     ] }), cat: 'Cisco & Meraki' },
 
   // --- Meraki MX ---
-  c_mx67: { ...R('Meraki MX67', 'MX67', 6, 1, 1, 10, { wan: 2, verified: true,
+  c_mx67: { ...R('Meraki MX67', 'MX67', 6, 1, 1, 10, { role: 'router', wan: 2, verified: true,
     roleMap: { 1: 'WAN', 2: 'WAN' },
     portLayout: [
       { type: 'rj', cols: 2, speed: SPEED.ge, role: 'WAN' },
@@ -5921,7 +5930,7 @@ const CISCO_PACK = {
     ] }), cat: 'Cisco & Meraki' },
   // MX95/105 share a port table: 2× 10G SFP+ and 2× 2.5G mGig for WAN, then
   // 4× 1G copper and 2× 10G fibre for LAN.
-  c_mx95: { ...R('Meraki MX95', 'MX95', 10, 1, 1, 16, { wan: 4, sfp: 4, verified: true,
+  c_mx95: { ...R('Meraki MX95', 'MX95', 10, 1, 1, 16, { role: 'router', wan: 4, sfp: 4, verified: true,
     roleMap: { 1: 'WAN', 2: 'WAN', 3: 'WAN', 4: 'WAN' },
     portLayout: [
       { type: 'sfp', cols: 2, speed: SPEED.x10, role: 'WAN' },
@@ -5929,7 +5938,7 @@ const CISCO_PACK = {
       { type: 'rj', cols: 4, gapBefore: 0.5, speed: SPEED.ge },
       { type: 'sfp', cols: 2, gapBefore: 0.4, speed: SPEED.x10 }
     ] }), cat: 'Cisco & Meraki' },
-  c_mx105: { ...R('Meraki MX105', 'MX105', 10, 1, 1, 16, { wan: 4, sfp: 4, verified: true,
+  c_mx105: { ...R('Meraki MX105', 'MX105', 10, 1, 1, 16, { role: 'router', wan: 4, sfp: 4, verified: true,
     roleMap: { 1: 'WAN', 2: 'WAN', 3: 'WAN', 4: 'WAN' },
     portLayout: [
       { type: 'sfp', cols: 2, speed: SPEED.x10, role: 'WAN' },
@@ -8798,16 +8807,28 @@ function sameSubnet(a, b) {
 function subnetLabel(ip) { return ip ? `${ipStr(ip.network)}/${ip.cidr}` : '—'; }
 
 // ---- device role in the network graph ----
+// A device's network role is DECLARED by its catalog entry, never inferred.
+// The old version guessed "8 or more ports means switch", which misclassified
+// a 5-port desk switch as a host and a 4-NIC server as a switch. Role is a
+// property of the product, so the product data has to carry it.
 function netClass(dev) {
   const def = DEVICE_TYPES[dev.type];
   if (!def) return 'other';
+  if (def.role) return def.role;                // explicit wins, always
   if (def.manager) return 'manager';
   if (def.powerDevice) return 'power';
   if (def.passthrough) return 'patch';
-  const hasWan = !!def.wan || (def.roleMap && Object.values(def.roleMap).includes('WAN'));
-  if (hasWan || dev.type === 'router' || dev.type === 'firewall') return 'router';
-  if (/switch/i.test(def.cat || '') || /^switch/.test(dev.type) || (def.ports || 0) >= 8) return 'switch';
-  return 'host';                                // servers, APs, cameras, workstations, phones
+  if (def.isInternet) return 'internet';
+  if (def.isDemarc || def.isCpeTerm) return 'wanterm';
+  // Anything reaching here has no declared role — that is a catalog gap, not
+  // something to paper over with a guess. Flag it loudly in dev and treat it as
+  // a host, the least destructive assumption.
+  if (!netClass._warned) netClass._warned = new Set();
+  if (!netClass._warned.has(dev.type)) {
+    netClass._warned.add(dev.type);
+    console.warn(`netClass: ${dev.type} has no declared role in DEVICE_TYPES — add role: 'switch'|'router'|'host'`);
+  }
+  return 'host';
 }
 function isHostDev(dev) { return isPlaced(dev) && dev.ip && netClass(dev) === 'host'; }
 
