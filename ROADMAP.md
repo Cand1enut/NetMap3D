@@ -366,6 +366,50 @@ seller by default, with grey-market listings shown only if the owner opts in and
 clearly labelled. Order links are per-SKU and should prefer a stable product URL,
 falling back to a search URL keyed on the exact manufacturer part number.
 
+**7. Export configs the real hardware can actually load.**
+The design should port to the gear: take what was configured in NetMap3D and
+emit it in the form that specific device consumes, so a switch can be preloaded
+rather than hand-typed on site. This is what turns the file into an install
+plan, and it must share one config model with the terminal (item 5) — two
+renderers of the same config will drift, and the drift will be discovered on a
+live switch.
+
+**The fault line: some vendors take a config file, some genuinely cannot.**
+Fabricating an artifact for the second group would be the worst kind of fake in
+this project, because a file that looks loadable and isn't wastes a site visit.
+
+Text-config devices — a real, loadable file:
+- **Cisco IOS / IOS-XE** — plain CLI text, delivered by `copy tftp: startup-config`,
+  SCP, `configure replace`, or console paste.
+- **Aruba AOS-CX** — CLI text, and it also accepts declarative JSON via REST.
+- **MikroTik RouterOS** — an `/export`-style script loaded with `/import file=`.
+- **Netgear/others with text backup** — case by case; verify per model, never assume.
+
+Controller and cloud devices — no per-device config file exists:
+- **UniFi** — config lives in the controller, not the switch. Export must be
+  API calls against the Network API or a provisioning payload. Do NOT emit a
+  fake `.unf`.
+- **Meraki** — Dashboard API only; cloud-managed, no file.
+- **Omada / Instant On** — controller-held; binary backups are proprietary.
+For these, the export is an API script plus a human-readable worklist, and the
+UI says plainly that the device cannot be file-preloaded.
+
+Zero-touch is the payoff and it is already half-built: the DHCP work models
+option 150 (TFTP server) and option 67 (bootfile). A real Cisco ZTP flow is
+exactly that — switch boots factory-default, DHCPs, pulls its config from TFTP
+by filename. NetMap3D already knows the topology, the scopes and the per-device
+config, so it can emit both the config files and the DHCP scope that serves
+them, named per device. That is a genuine end-to-end install artifact.
+
+Guardrails, because a generated config can black-hole a switch:
+- flag any line that changes the interface the operator is likely connected
+  through, and never bury it silently in the middle of a file
+- emit VLANs and trunk allowed-lists explicitly (`switchport trunk allowed vlan
+  add`, not a bare `vlan` that replaces the list)
+- mark the export as reviewed-by-a-human-before-load, and show a diff against
+  the device's current running config when one has been imported
+- round-trip test: export a config, re-import it, and the model must be identical
+
 ## Definition of done — the data centre build
 
 Owner-set acceptance test for the whole simulation: **build an entire data
