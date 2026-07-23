@@ -4231,6 +4231,347 @@ function l2Walk(startDev, opts = {}) {
   return { hosts: reachedHosts, routers: reachedRouters, prev, start };
 }
 
+
+//////////////////// PDU engine ////////////////////
+// This is the difference between answering "can A reach B" and Packet Tracer.
+// The reachability engine walks the topology and returns a verdict; this walks
+// a real frame, hop by hop, and records what every device did with it and why.
+//
+// A PDU carries genuine layered headers whose fields come from device state —
+// the source MAC is the sending NIC's MAC, the destination MAC is whatever ARP
+// resolved, TTL decrements at every router, NAT rewrites the L3 source. Nothing
+// here is decorative: if a field is wrong on screen it is wrong in the model.
+//
+// Events are processed from an ordered queue, one device handling one PDU per
+// step, so the simulation can be stepped forward and back deterministically.
+// No random timers anywhere — see the collaboration section of ROADMAP.md.
+
+let _pduSeq = 0;
+function newPdu(spec) {
+  return {
+    id: ++_pduSeq,
+    proto: spec.proto || 'icmp',        // icmp | tcp | udp | arp
+    l2: { srcMac: spec.srcMac || null, dstMac: spec.dstMac || null, vlan: spec.vlan, etherType: spec.proto === 'arp' ? 0x0806 : 0x0800 },
+    l3: spec.proto === 'arp' ? null : {
+      src: spec.srcInt, dst: spec.dstInt, ttl: spec.ttl === undefined ? 64 : spec.ttl,
+      proto: spec.proto, icmpType: spec.icmpType || null
+    },
+    l4: (spec.proto === 'tcp' || spec.proto === 'udp') ? {
+      srcPort: spec.srcPort, dstPort: spec.dstPort, flags: spec.flags || (spec.proto === 'tcp' ? 'SYN' : null)
+    } : null,
+    arp: spec.proto === 'arp' ? {
+      op: spec.arpOp || 'request', senderMac: spec.srcMac, senderIp: spec.srcInt,
+      targetMac: spec.arpOp === 'reply' ? spec.dstMac : '00:00:00:00:00:00', targetIp: spec.dstInt
+    } : null,
+    label: spec.label || null,
+    origin: spec.origin || null
+  };
+}
+function clonePdu(p) {
+  return JSON.parse(JSON.stringify(p));
+}
+// Human-readable one-liner, the way the event list shows it.
+function pduSummary(p) {
+  if (p.proto === 'arp') {
+    return p.arp.op === 'request'
+      ? `ARP who has ${ipStr(p.arp.targetIp)}? tell ${ipStr(p.arp.senderIp)}`
+      : `ARP ${ipStr(p.arp.senderIp)} is at ${p.arp.senderMac}`;
+  }
+  const port = p.l4 ? `:${p.l4.dstPort}` : '';
+  const t = p.proto === 'icmp' ? ` ${p.l3.icmpType}` : (p.l4 && p.l4.flags ? ` [${p.l4.flags}]` : '');
+  return `${p.proto.toUpperCase()}${t} ${ipStr(p.l3.src)} → ${ipStr(p.l3.dst)}${port}`;
+}
+
+// One simulation run: a queue of events, each "device D receives PDU P on
+// interface I", plus the trace of what already happened.
+function newPduSim() {
+  return { queue: [], trace: [], step: 0, done: false, delivered: false, dropped: null };
+}
+function pduEnqueue(sim, ev) { sim.queue.push(ev); }
+
+// Resolve a destination MAC the way a host does: ARP cache, or an ARP exchange
+// that is itself simulated and appears in the trace. Returns the MAC plus the
+// exchange it took, so the caller can show the ARP that a ping really needs.
+function pduArpResolve(sim, host, nicPort, targetIp, vlan) {
+  const cache = arpCaches.get(host.id);
+  const known = cache && cache.get(ipStr(targetIp));
+  if (known) return { mac: known, cached: true };
+  const owner = deviceHoldingAddr(targetIp);
+  const req = newPdu({ proto: 'arp', arpOp: 'request', srcMac: nicMac(host, nicPort),
+    srcInt: (nicIp(host, nicPort) || {}).int, dstInt: targetIp, vlan,
+    label: `ARP request for ${ipStr(targetIp)}` });
+  sim.trace.push({ kind: 'arp', devId: host.id, iface: nicPort, pdu: req,
+    action: 'broadcast', why: `no ARP entry for ${ipStr(targetIp)} — flooding a request in VLAN ${vlan}` });
+  if (!owner) return { mac: null, failed: `nothing on VLAN ${vlan} answered ARP for ${ipStr(targetIp)}` };
+  const oPort = owner.nicPort !== undefined ? owner.nicPort : hostPort(owner.dev);
+  const replyMac = owner.iface ? deviceMac(owner.dev) : nicMac(owner.dev, oPort);
+  const reply = newPdu({ proto: 'arp', arpOp: 'reply', srcMac: replyMac, srcInt: targetIp,
+    dstMac: nicMac(host, nicPort), dstInt: (nicIp(host, nicPort) || {}).int, vlan,
+    label: `ARP reply from ${owner.dev.name}` });
+  sim.trace.push({ kind: 'arp', devId: owner.dev.id, iface: oPort, pdu: reply,
+    action: 'reply', why: `${owner.dev.name} owns ${ipStr(targetIp)} — answering with its MAC` });
+  arpLearn(host.id, ipStr(targetIp), replyMac);
+  return { mac: replyMac, resolved: true };
+}
+// Whoever holds an address: a host NIC or a router interface.
+function deviceHoldingAddr(addrInt) {
+  for (const d of state.devices) {
+    if (!isPlaced(d)) continue;
+    if (netClass(d) === 'host') {
+      for (const n of hostNics(d)) {
+        const ip = nicIp(d, n.port);
+        if (ip && ip.int === addrInt) return { dev: d, nicPort: n.port };
+      }
+    }
+    for (const i of deviceInterfaces(d)) if (i.ip.int === addrInt) return { dev: d, iface: i };
+  }
+  return null;
+}
+
+// Walk one PDU from a source host to a destination address, recording every
+// device decision. This is the observable version of pingHosts: same model, but
+// it reports the journey rather than the verdict.
+const PDU_MAX_EVENTS = 200;
+function pduSend(srcDev, dstInt, spec = {}) {
+  const sim = newPduSim();
+  const srcNic = hostEgressNic(srcDev, dstInt);
+  if (!srcNic) { sim.dropped = { why: `${srcDev.name} has no addressed NIC` }; sim.done = true; return sim; }
+  const srcIp = nicIp(srcDev, srcNic.port);
+  if (!srcIp) { sim.dropped = { why: noAddressReason(srcDev) }; sim.done = true; return sim; }
+  const vlan = hostVlan(srcDev, srcNic.port);
+
+  // A host sends to its gateway's MAC when the destination is off-subnet — the
+  // L3 destination stays the far host, the L2 destination is the router. Getting
+  // that pair right is most of what makes a frame walk read correctly.
+  const offSubnet = !ipInSubnet(dstInt, srcIp);
+  let nextHopIp = dstInt;
+  if (offSubnet) {
+    const gwStr = srcNic.gateway || (srcNic.ip === 'dhcp' ? dhcpGateway(srcDev, srcNic.port) : null);
+    const gw = gwStr ? parseIp(gwStr) : null;
+    if (!gw) {
+      sim.dropped = { devId: srcDev.id, why: `${srcDev.name} has no default gateway and ${ipStr(dstInt)} is off-subnet` };
+      sim.done = true; return sim;
+    }
+    nextHopIp = gw.int;
+  }
+  const arp = pduArpResolve(sim, srcDev, srcNic.port, nextHopIp, vlan);
+  if (!arp.mac) {
+    sim.dropped = { devId: srcDev.id, why: arp.failed || `ARP failed for ${ipStr(nextHopIp)}` };
+    sim.done = true; return sim;
+  }
+  const pdu = newPdu({ ...spec, proto: spec.proto || 'icmp', icmpType: spec.icmpType || 'echo',
+    srcMac: nicMac(srcDev, srcNic.port), dstMac: arp.mac, vlan,
+    srcInt: srcIp.int, dstInt, srcPort: spec.srcPort, dstPort: spec.dstPort,
+    origin: srcDev.id });
+  sim.trace.push({ kind: 'send', devId: srcDev.id, iface: srcNic.port, pdu: clonePdu(pdu),
+    action: 'transmit',
+    why: offSubnet
+      ? `${ipStr(dstInt)} is off-subnet — sending to the gateway's MAC ${arp.mac}, L3 destination unchanged`
+      : `${ipStr(dstInt)} is on ${subnetLabel(srcIp)} — sending directly to ${arp.mac}` });
+  const first = hopThroughPatches(srcDev, srcNic.port, FRONT);
+  if (!first) {
+    sim.dropped = { devId: srcDev.id, why: linkDownReason(srcDev, srcNic.port) || `${srcDev.name} is not cabled` };
+    sim.done = true; return sim;
+  }
+  pduEnqueue(sim, { devId: first.dev.id, iface: first.port, pdu, vlan, fromId: srcDev.id });
+  pduRun(sim, dstInt);
+  return sim;
+}
+
+// Process the queue until the PDU is delivered or dropped.
+function pduRun(sim, dstInt) {
+  let guard = 0;
+  while (sim.queue.length && guard++ < PDU_MAX_EVENTS) {
+    const ev = sim.queue.shift();
+    const dev = deviceById(ev.devId);
+    if (!dev) continue;
+    const cls = netClass(dev);
+    if (cls === 'switch' || cls === 'patch') { pduSwitch(sim, dev, ev); continue; }
+    if (cls === 'router') { if (pduRouter(sim, dev, ev, dstInt)) return; continue; }
+    if (cls === 'host') { pduHost(sim, dev, ev, dstInt); if (sim.done) return; continue; }
+  }
+  if (!sim.done) { sim.done = true; if (!sim.dropped) sim.dropped = { why: 'PDU stopped with nowhere to go' }; }
+}
+
+// A switch: learn the source MAC, then forward by table or flood.
+function pduSwitch(sim, dev, ev) {
+  const pdu = ev.pdu;
+  const vlan = ev.vlan;
+  if (!portCarries(dev, ev.iface, vlan)) {
+    sim.trace.push({ kind: 'drop', devId: dev.id, iface: ev.iface, pdu: clonePdu(pdu), action: 'drop',
+      why: `port ${ev.iface} does not carry VLAN ${vlan} — frame discarded on ingress` });
+    sim.done = true; sim.dropped = { devId: dev.id, why: `VLAN ${vlan} is not allowed on ${dev.name} port ${ev.iface}` };
+    return;
+  }
+  if (stpBlocked(dev.id, ev.iface, vlan)) {
+    sim.trace.push({ kind: 'drop', devId: dev.id, iface: ev.iface, pdu: clonePdu(pdu), action: 'drop',
+      why: `port ${ev.iface} is ${stpPortState(dev.id, ev.iface, vlan).state} in the VLAN ${vlan} spanning tree` });
+    sim.done = true; sim.dropped = { devId: dev.id, why: `spanning tree is blocking ${dev.name} port ${ev.iface}` };
+    return;
+  }
+  macLearn(dev.id, pdu.l2.srcMac, ev.iface, vlan);
+  const table = new Map(macEntries(dev.id));
+  const hit = table.get(pdu.l2.dstMac);
+  const def = DEVICE_TYPES[dev.type];
+  const out = [];
+  if (hit && hit.vlan === vlan && hit.port !== ev.iface) {
+    out.push(hit.port);
+    sim.trace.push({ kind: 'switch', devId: dev.id, iface: ev.iface, pdu: clonePdu(pdu), action: 'forward',
+      why: `learned ${pdu.l2.srcMac} on port ${ev.iface} · MAC table has ${pdu.l2.dstMac} on port ${hit.port} in VLAN ${vlan}` });
+  } else {
+    for (let p = 1; p <= (def.ports || 0); p++) {
+      if (p === ev.iface || portRole(def, p) === 'PWR') continue;
+      if (!portCarries(dev, p, vlan)) continue;
+      if (stpBlocked(dev.id, p, vlan)) continue;
+      out.push(p);
+    }
+    sim.trace.push({ kind: 'switch', devId: dev.id, iface: ev.iface, pdu: clonePdu(pdu),
+      action: out.length ? 'flood' : 'drop',
+      why: out.length
+        ? `no MAC entry for ${pdu.l2.dstMac} in VLAN ${vlan} — flooding to ${out.length} port${out.length === 1 ? '' : 's'} in that VLAN`
+        : `no MAC entry and no other port carries VLAN ${vlan} — nowhere to flood` });
+  }
+  for (const p of out) {
+    const nb = hopThroughPatches(dev, p, FRONT);
+    if (!nb) continue;
+    pduEnqueue(sim, { devId: nb.dev.id, iface: nb.port, pdu: clonePdu(pdu), vlan, fromId: dev.id });
+  }
+}
+
+// A router: ACL in, TTL, route lookup, NAT, ACL out, re-frame for the next hop.
+function pduRouter(sim, dev, ev, dstInt) {
+  const pdu = ev.pdu;
+  const ingressIf = pduIngressIface(dev, ev);
+  // A router is a NIC before it is a router: a frame addressed to somebody
+  // else's MAC is discarded at layer 2 and never reaches the routing table.
+  // Without this a flooded frame gets routed by every router that sees it,
+  // which is not what happens and would double-deliver.
+  if (pdu.l2.dstMac && pdu.l2.dstMac !== 'ff:ff:ff:ff:ff:ff' && pdu.l2.dstMac !== deviceMac(dev)) {
+    sim.trace.push({ kind: 'drop', devId: dev.id, iface: ingressIf, pdu: clonePdu(pdu), action: 'drop',
+      why: `frame is addressed to ${pdu.l2.dstMac}, this interface is ${deviceMac(dev)} — not for this router` });
+    return false;
+  }
+  // Is this router itself the destination?
+  const mine = deviceInterfaces(dev).find(i => i.ip.int === pdu.l3.dst);
+  const aclIn = aclCheck(dev, { in: ingressIf, out: null }, pduToPacket(pdu));
+  if (aclIn.blocked) {
+    sim.trace.push({ kind: 'drop', devId: dev.id, iface: ingressIf, pdu: clonePdu(pdu), action: 'drop', why: aclIn.reason });
+    sim.done = true; sim.dropped = { devId: dev.id, why: aclIn.reason };
+    return true;
+  }
+  if (mine) {
+    sim.trace.push({ kind: 'deliver', devId: dev.id, iface: ingressIf, pdu: clonePdu(pdu), action: 'deliver',
+      why: `${ipStr(pdu.l3.dst)} is this router's own ${mine.kind === 'svi' ? 'Vlan' + mine.vlan : 'port ' + mine.port} address` });
+    sim.done = true; sim.delivered = true;
+    return true;
+  }
+  pdu.l3.ttl--;
+  if (pdu.l3.ttl <= 0) {
+    sim.trace.push({ kind: 'drop', devId: dev.id, iface: ingressIf, pdu: clonePdu(pdu), action: 'drop',
+      why: 'TTL reached zero — router discards the packet and sends ICMP time-exceeded' });
+    sim.done = true; sim.dropped = { devId: dev.id, why: `TTL expired at ${dev.name}` };
+    return true;
+  }
+  const route = lookupRoute(dev, pdu.l3.dst);
+  if (!route) {
+    sim.trace.push({ kind: 'drop', devId: dev.id, iface: ingressIf, pdu: clonePdu(pdu), action: 'drop',
+      why: `no route to ${ipStr(pdu.l3.dst)} — routing table has no matching prefix` });
+    sim.done = true; sim.dropped = { devId: dev.id, why: `${dev.name} has no route to ${ipStr(pdu.l3.dst)}` };
+    return true;
+  }
+  const egressIf = ifKey(route.ifRef);
+  const aclOut = aclCheck(dev, { in: null, out: egressIf }, pduToPacket(pdu));
+  if (aclOut.blocked) {
+    sim.trace.push({ kind: 'drop', devId: dev.id, iface: egressIf, pdu: clonePdu(pdu), action: 'drop', why: aclOut.reason });
+    sim.done = true; sim.dropped = { devId: dev.id, why: aclOut.reason };
+    return true;
+  }
+  // NAT on the way out, if this router translates and the source is inside.
+  let natNote = null;
+  if (natCfg(dev) && natCfg(dev).enabled && isPrivateIp(pdu.l3.src) && !isPrivateIp(pdu.l3.dst)) {
+    const res = natTranslateOutbound(dev, pduToPacket(pdu), pdu.l3.dst);
+    if (res && res.entry) {
+      natNote = `NAT: ${ipStr(pdu.l3.src)}${pdu.l4 ? ':' + pdu.l4.srcPort : ''} → ${ipStr(res.entry.insideGlobal)}${res.entry.insideGlobalPort ? ':' + res.entry.insideGlobalPort : ''}`;
+      pdu.l3.src = res.entry.insideGlobal;
+      if (pdu.l4) pdu.l4.srcPort = res.entry.insideGlobalPort;
+    } else if (res && res.error) {
+      sim.trace.push({ kind: 'drop', devId: dev.id, iface: egressIf, pdu: clonePdu(pdu), action: 'drop', why: res.error });
+      sim.done = true; sim.dropped = { devId: dev.id, why: res.error };
+      return true;
+    }
+  }
+  // Re-frame: a router rewrites both MACs at every hop. That is the single most
+  // commonly misunderstood part of forwarding, so it is stated explicitly.
+  const nextHop = route.via !== null ? route.via : pdu.l3.dst;
+  const outVlan = route.ifRef && route.ifRef.kind === 'svi' ? route.ifRef.vlan : (ev.vlan || DEFAULT_VLAN);
+  const target = deviceHoldingAddr(nextHop);
+  const oldSrc = pdu.l2.srcMac, oldDst = pdu.l2.dstMac;
+  pdu.l2.srcMac = deviceMac(dev);
+  pdu.l2.dstMac = target
+    ? (target.iface ? deviceMac(target.dev) : nicMac(target.dev, target.nicPort))
+    : 'ff:ff:ff:ff:ff:ff';
+  pdu.l2.vlan = outVlan;
+  sim.trace.push({ kind: 'route', devId: dev.id, iface: ingressIf, egress: egressIf, pdu: clonePdu(pdu), action: 'route',
+    why: `${route.src} route ${ipStr(route.prefix)}/${route.cidr} [${route.ad}/${route.metric}]` +
+      `${route.via !== null ? ` via ${ipStr(route.via)}` : ' directly connected'} out ${route.iface}` +
+      ` · TTL ${pdu.l3.ttl + 1}→${pdu.l3.ttl} · re-framed ${oldSrc}→${pdu.l2.srcMac}, ${oldDst}→${pdu.l2.dstMac}` +
+      (natNote ? ` · ${natNote}` : '') });
+  // Hand to whatever is on the egress interface.
+  const outPort = route.ifRef && route.ifRef.kind === 'svi' ? null : (route.ifRef ? route.ifRef.port : null);
+  if (outPort !== null) {
+    const nb = hopThroughPatches(dev, outPort, FRONT);
+    if (!nb) { sim.done = true; sim.dropped = { devId: dev.id, why: `${dev.name} ${route.iface} is not cabled` }; return true; }
+    pduEnqueue(sim, { devId: nb.dev.id, iface: nb.port, pdu, vlan: outVlan, fromId: dev.id });
+  } else {
+    // SVI egress: the frame goes back out whichever port reaches the next hop.
+    const def = DEVICE_TYPES[dev.type];
+    for (let p = 1; p <= (def.ports || 0); p++) {
+      if (portRole(def, p) === 'PWR') continue;
+      if (!portCarries(dev, p, outVlan)) continue;
+      const nb = hopThroughPatches(dev, p, FRONT);
+      if (!nb) continue;
+      pduEnqueue(sim, { devId: nb.dev.id, iface: nb.port, pdu, vlan: outVlan, fromId: dev.id });
+      break;
+    }
+  }
+  return false;
+}
+function pduIngressIface(dev, ev) {
+  for (const i of deviceInterfaces(dev)) {
+    if (i.kind === 'svi' && i.vlan === ev.vlan) return ifKey(i);
+    if (i.kind === 'routed' && i.port === ev.iface) return ifKey(i);
+  }
+  return ev.iface;
+}
+function pduToPacket(pdu) {
+  return { proto: pdu.proto, srcInt: pdu.l3 ? pdu.l3.src : 0, dstInt: pdu.l3 ? pdu.l3.dst : 0,
+    srcPort: pdu.l4 ? pdu.l4.srcPort : null, dstPort: pdu.l4 ? pdu.l4.dstPort : null,
+    icmpType: pdu.l3 ? pdu.l3.icmpType : null,
+    established: pdu.l4 && pdu.l4.flags ? /ACK|RST/.test(pdu.l4.flags) : false };
+}
+
+// A host: is this frame for me?
+function pduHost(sim, dev, ev, dstInt) {
+  const pdu = ev.pdu;
+  const nic = hostNics(dev).find(n => n.port === ev.iface) || hostNics(dev)[0];
+  const myMac = nic ? nicMac(dev, nic.port) : deviceMac(dev);
+  const myIp = nic ? nicIp(dev, nic.port) : null;
+  if (pdu.l2.dstMac !== myMac && pdu.l2.dstMac !== 'ff:ff:ff:ff:ff:ff') {
+    sim.trace.push({ kind: 'drop', devId: dev.id, iface: ev.iface, pdu: clonePdu(pdu), action: 'drop',
+      why: `frame is addressed to ${pdu.l2.dstMac}, this NIC is ${myMac} — the NIC discards it` });
+    return;
+  }
+  if (myIp && pdu.l3 && pdu.l3.dst === myIp.int) {
+    arpLearn(dev.id, ipStr(pdu.l3.src), pdu.l2.srcMac);
+    sim.trace.push({ kind: 'deliver', devId: dev.id, iface: ev.iface, pdu: clonePdu(pdu), action: 'deliver',
+      why: `${ipStr(pdu.l3.dst)} is this NIC's address — delivered up the stack` });
+    sim.done = true; sim.delivered = true;
+    return;
+  }
+  sim.trace.push({ kind: 'drop', devId: dev.id, iface: ev.iface, pdu: clonePdu(pdu), action: 'drop',
+    why: myIp ? `packet is for ${ipStr(pdu.l3.dst)}, this NIC is ${ipStr(myIp.int)} — not mine` : 'host has no address on this NIC' });
+}
+
 //////////////////// MAC learning + ARP ////////////////////
 // Switches learn a source MAC on the port a frame arrived from; hosts cache the
 // IP->MAC of whoever they talked to. Both are runtime state, not design state,
@@ -9008,6 +9349,92 @@ function runAcl() {
   };
 }
 document.getElementById('sim-acl').onclick = runAcl;
+
+
+// The Packet panel: send one PDU and step through every device decision it
+// causes. This is the observable half of the simulation — everything else
+// answers "does it work", this answers "what exactly happened".
+let _pduCur = null, _pduAt = 0;
+function runPdu() {
+  const hosts = state.devices.filter(d => isPlaced(d) && netClass(d) === 'host' && hostNics(d).length);
+  if (hosts.length < 2) { aiPrint('<p>Place at least two addressed hosts to send a packet between.</p>'); return; }
+  const opts = hosts.map(h => `<option value="${h.id}">${esc(h.name)}</option>`).join('');
+  const sel = (id, def) => `<select id="${id}" style="width:104px">${opts}</select>`;
+  let html = `<div class="row" style="gap:4px;flex-wrap:wrap">
+      ${sel('pdu-a')}<span class="sim-arrow">→</span>${sel('pdu-b')}
+      <select id="pdu-proto" style="width:60px">
+        <option value="icmp">icmp</option><option value="tcp">tcp</option><option value="udp">udp</option></select>
+      <input type="text" id="pdu-port" style="width:64px" placeholder="port">
+      <button id="pdu-send">Send</button></div>
+    <div id="pdu-out"></div>`;
+  aiPrint(html);
+  const a = document.getElementById('pdu-a'), b = document.getElementById('pdu-b');
+  a.value = hosts[0].id; b.value = hosts[1].id;
+  document.getElementById('pdu-send').onclick = () => {
+    flushL2Tables();
+    const src = deviceById(+a.value), dst = deviceById(+b.value);
+    const proto = document.getElementById('pdu-proto').value;
+    const raw = (document.getElementById('pdu-port').value || '').trim();
+    const dstNic = hostNics(dst).find(n => nicIp(dst, n.port));
+    if (!dstNic) { document.getElementById('pdu-out').innerHTML = `<p class="ai-bad">${esc(dst.name)} has no address.</p>`; return; }
+    const spec = proto === 'icmp' ? { proto: 'icmp', icmpType: 'echo' }
+      : { proto, srcPort: 49152, dstPort: raw ? (aclPortNum(raw, proto) || +raw || 80) : 80, flags: proto === 'tcp' ? 'SYN' : null };
+    _pduCur = pduSend(src, nicIp(dst, dstNic.port).int, spec);
+    _pduAt = _pduCur.trace.length;
+    drawPduTrace();
+  };
+}
+function drawPduTrace() {
+  const out = document.getElementById('pdu-out');
+  if (!out || !_pduCur) return;
+  const sim = _pduCur;
+  const shown = sim.trace.slice(0, _pduAt);
+  const icon = { arp: 'ARP', send: 'TX', switch: 'SW', route: 'RT', deliver: 'OK', drop: 'X' };
+  let html = `<div class="row" style="gap:6px;margin:8px 0;flex-wrap:wrap">
+      <button id="pdu-back">← Step back</button>
+      <button id="pdu-fwd">Step →</button>
+      <button id="pdu-all">Play all</button>
+      <span class="ai-meta">${_pduAt} / ${sim.trace.length}</span></div>`;
+  html += `<table class="sim-table"><tr><th>#</th><th>Device</th><th>If</th><th>Action</th><th>What happened</th></tr>`;
+  shown.forEach((t, i) => {
+    const d = deviceById(t.devId);
+    const cls = t.action === 'drop' ? 'ai-bad' : (t.action === 'deliver' ? 'ai-good' : '');
+    html += `<tr><td>${i + 1}</td><td>${esc(d ? d.name : '?')}</td><td>${t.egress ? `${t.iface}→${t.egress}` : t.iface}</td>` +
+      `<td class="${cls}">${t.action}</td><td>${esc(t.why)}</td></tr>`;
+  });
+  html += '</table>';
+  // The headers of the PDU as it stood at the current step — this is the
+  // "open the packet" view, and every field is read from the model.
+  const cur = shown[shown.length - 1];
+  if (cur) {
+    const p = cur.pdu;
+    html += `<h4>PDU at step ${shown.length} — ${esc(pduSummary(p))}</h4><table class="sim-table">`;
+    html += `<tr><th>Layer 2</th><td>src ${p.l2.srcMac || '—'}<br>dst ${p.l2.dstMac || '—'}<br>VLAN ${p.l2.vlan}` +
+      ` · ethertype 0x${(p.l2.etherType || 0).toString(16)}</td></tr>`;
+    if (p.l3) html += `<tr><th>Layer 3</th><td>src ${ipStr(p.l3.src)}<br>dst ${ipStr(p.l3.dst)}<br>TTL ${p.l3.ttl}` +
+      ` · proto ${p.l3.proto}${p.l3.icmpType ? ' · type ' + p.l3.icmpType : ''}</td></tr>`;
+    if (p.l4) html += `<tr><th>Layer 4</th><td>src port ${p.l4.srcPort}<br>dst port ${p.l4.dstPort}` +
+      `${p.l4.flags ? '<br>flags ' + p.l4.flags : ''}</td></tr>`;
+    if (p.arp) html += `<tr><th>ARP</th><td>${p.arp.op} · sender ${p.arp.senderMac} ${ipStr(p.arp.senderIp)}` +
+      `<br>target ${p.arp.targetMac} ${ipStr(p.arp.targetIp)}</td></tr>`;
+    html += '</table>';
+  }
+  if (_pduAt === sim.trace.length) {
+    html += sim.delivered
+      ? `<p class="ai-good">Delivered in ${sim.trace.length} step${sim.trace.length === 1 ? '' : 's'}.</p>`
+      : `<p class="ai-bad">Dropped — ${esc(sim.dropped ? sim.dropped.why : 'unknown')}</p>`;
+  }
+  out.innerHTML = html;
+  const bind = (id, fn) => { const el = document.getElementById(id); if (el) el.onclick = () => { fn(); drawPduTrace(); }; };
+  bind('pdu-back', () => { _pduAt = Math.max(1, _pduAt - 1); });
+  bind('pdu-fwd', () => { _pduAt = Math.min(sim.trace.length, _pduAt + 1); });
+  bind('pdu-all', () => { _pduAt = sim.trace.length; });
+  // Light the path in 3D so the trace and the model agree visually.
+  const ids = shown.map(t => t.devId);
+  if (typeof showPingPath === 'function') { try { showPingPath(ids); } catch (e) {} }
+}
+const pduBtn = document.getElementById('sim-pdu');
+if (pduBtn) pduBtn.onclick = runPdu;
 
 function runStp() {
   flushL2Tables();
