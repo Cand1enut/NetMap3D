@@ -11312,6 +11312,213 @@ function routerAdjacency() {
   }
   return adj;
 }
+
+//////////////////// OSPF (RFC 2328) ////////////////////
+// A link-state protocol: every router floods what it is connected to, all of
+// them build the same map, and each runs Dijkstra from itself. That is a real
+// difference from static routes — routes appear without being typed, and they
+// disappear when a link goes down, which is the whole point of running it.
+//
+// Cost = reference bandwidth / interface bandwidth, minimum 1. Cisco's default
+// reference is 100 Mbps (10^8 bits/s), which is why every link at 100 M and
+// above costs 1 unless you raise it with `auto-cost reference-bandwidth` —
+// verified against Cisco's own docs and two further references. That default
+// is a genuine trap in real networks and the panel says so.
+const OSPF_REF_BW_MBPS = 100;
+function ospfEnabled(dev) { return !!(dev.ospf && dev.ospf.enabled); }
+function ospfRefBw(dev) { return (dev.ospf && +dev.ospf.refBw) || OSPF_REF_BW_MBPS; }
+function ospfCost(dev, speedGbps) {
+  const mbps = (speedGbps || 1) * 1000;
+  return Math.max(1, Math.round(ospfRefBw(dev) / mbps));
+}
+// Router ID: configured, else the highest loopback, else the highest interface
+// address — RFC 2328 §8.1 and Cisco's selection order.
+function ospfRouterId(dev) {
+  if (dev.ospf && dev.ospf.routerId) { const p = parseIp(dev.ospf.routerId); if (p) return p.int; }
+  let best = 0;
+  for (const i of deviceInterfaces(dev)) if (i.ip.int > best) best = i.ip.int;
+  return best;
+}
+// Which area an interface is in. `network <addr> <wild> area N` in IOS; here the
+// area is per interface, which is the same thing expressed directly.
+function ospfAreaOf(dev, iface) {
+  const per = dev.ospf && dev.ospf.areas;
+  if (per) {
+    for (const k of ifKeyAliases(iface)) if (per[k] !== undefined) return +per[k];
+  }
+  return (dev.ospf && +dev.ospf.area) || 0;
+}
+// An interface can be named three ways and all three are natural to type:
+// the bare port number (what ifKey returns), "Port 3" (what deviceInterfaces
+// calls it), and "Vlan20" for an SVI. Config that only matched one of them
+// silently did nothing — passive-interface and per-interface areas both looked
+// applied and were not.
+// What to print. ifKey is the lookup key; this is the human name.
+function ifName(iface) {
+  if (!iface) return '—';
+  return iface.kind === 'svi' ? `Vlan${iface.vlan}` : `Port ${iface.port}`;
+}
+function ifKeyAliases(iface) {
+  if (!iface) return [];
+  if (iface.kind === 'svi') return [`Vlan${iface.vlan}`, iface.vlan, String(iface.vlan)];
+  return [iface.port, String(iface.port), `Port ${iface.port}`, `port ${iface.port}`];
+}
+// An interface participates unless it is passive — a passive interface still
+// advertises its subnet but never forms an adjacency, which is exactly what you
+// want on a user VLAN and is the most common OSPF hardening step.
+function ospfPassive(dev, iface) {
+  const p = dev.ospf && dev.ospf.passive;
+  if (!p) return false;
+  const keys = ifKeyAliases(iface);
+  if (Array.isArray(p)) return p.some(x => keys.includes(x) || keys.includes(String(x)));
+  return keys.some(k => !!p[k]);
+}
+
+// Adjacencies: two OSPF routers that share a subnet and can see each other at
+// layer 2 become neighbours, unless either side is passive or the areas differ.
+// Mismatched areas on a link is a real and commonly-hit misconfiguration, so it
+// is reported rather than silently ignored.
+function ospfNeighbors() {
+  const routers = state.devices.filter(d => isPlaced(d) && ospfEnabled(d));
+  const out = [], problems = [];
+  for (let i = 0; i < routers.length; i++) {
+    for (let j = i + 1; j < routers.length; j++) {
+      const A = routers[i], B = routers[j];
+      for (const ia of deviceInterfaces(A)) {
+        for (const ib of deviceInterfaces(B)) {
+          if (!sameSubnet(ia.ip, ib.ip)) continue;
+          if (!ospfSegmentConnected(A, ia, B, ib)) continue;
+          if (ospfPassive(A, ia) || ospfPassive(B, ib)) continue;
+          const aa = ospfAreaOf(A, ia), ab = ospfAreaOf(B, ib);
+          if (aa !== ab) {
+            problems.push(`${A.name} ${ifName(ia)} is in area ${aa} but ${B.name} ${ifName(ib)} is in area ${ab} — no adjacency forms across an area mismatch`);
+            continue;
+          }
+          const speed = ospfLinkSpeed(A, ia, B, ib);
+          out.push({ a: A, ia, b: B, ib, area: aa,
+            costA: ospfCost(A, speed), costB: ospfCost(B, speed), speed });
+        }
+      }
+    }
+  }
+  return { adj: out, problems };
+}
+// Do these two interfaces actually share a wire? An address match is not enough
+// — two routers can be numbered in the same subnet and not be cabled together.
+function ospfSegmentConnected(A, ia, B, ib) {
+  const def = DEVICE_TYPES[A.type];
+  for (let p = 1; p <= (def.ports || 0); p++) {
+    if (portRole(def, p) === 'PWR') continue;
+    if (ia.kind === 'routed' && ia.port !== p) continue;
+    const vlan = ia.kind === 'svi' ? ia.vlan : undefined;
+    if (vlan !== undefined && !portCarries(A, p, vlan)) continue;
+    const walk = l2Walk(A, { startPort: p, vlan, ignoreVlan: vlan === undefined });
+    if (walk.routers.has(B.id)) return true;
+  }
+  return false;
+}
+function ospfLinkSpeed(A, ia, B, ib) {
+  // The slower end of the physical link, negotiated.
+  let best = null;
+  for (const c of state.cables) {
+    const da = deviceById(c.a.deviceId), db = deviceById(c.b.deviceId);
+    if (!da || !db) continue;
+    const pair = (da.id === A.id && db.id === B.id) || (da.id === B.id && db.id === A.id);
+    if (!pair) continue;
+    const sp = linkSpeed(c);
+    if (best === null || sp < best) best = sp;
+  }
+  return best === null ? 1 : best;
+}
+
+// Run SPF from one router and return the routes it learns.
+function ospfRoutes(dev) {
+  if (!ospfEnabled(dev)) return [];
+  const { adj } = ospfNeighbors();
+  if (!adj.length) return [];
+  // Build the graph. Nodes are routers; an edge carries the cost of leaving a
+  // router by that link, which is why cost is directional.
+  const graph = new Map();
+  const addEdge = (from, to, cost, viaIp, viaIface) => {
+    if (!graph.has(from)) graph.set(from, []);
+    graph.get(from).push({ to, cost, viaIp, viaIface });
+  };
+  for (const a of adj) {
+    addEdge(a.a.id, a.b.id, a.costA, a.ib.ip.int, a.ia);
+    addEdge(a.b.id, a.a.id, a.costB, a.ia.ip.int, a.ib);
+  }
+  // Dijkstra from this router.
+  const dist = new Map([[dev.id, 0]]);
+  const prev = new Map();
+  const todo = new Set([dev.id, ...graph.keys()]);
+  for (const e of adj) { todo.add(e.a.id); todo.add(e.b.id); }
+  while (todo.size) {
+    let cur = null;
+    for (const id of todo) if (cur === null || (dist.get(id) ?? Infinity) < (dist.get(cur) ?? Infinity)) cur = id;
+    if (cur === null || (dist.get(cur) ?? Infinity) === Infinity) break;
+    todo.delete(cur);
+    for (const e of graph.get(cur) || []) {
+      if (!todo.has(e.to)) continue;
+      const nd = dist.get(cur) + e.cost;
+      if (nd < (dist.get(e.to) ?? Infinity)) {
+        dist.set(e.to, nd);
+        // The next hop is the first hop out of THIS router, carried forward —
+        // a route two hops away still points at the neighbour, not the far end.
+        const first = cur === dev.id ? e : prev.get(cur).first;
+        prev.set(e.to, { from: cur, edge: e, first });
+      }
+    }
+  }
+  // Every subnet on every reachable router becomes a route.
+  const routes = [];
+  const mine = new Set(deviceInterfaces(dev).map(i => `${i.ip.network}/${i.ip.cidr}`));
+  for (const [rid, cost] of dist) {
+    if (rid === dev.id) continue;
+    const r = deviceById(rid);
+    if (!r) continue;
+    const hop = prev.get(rid);
+    if (!hop) continue;
+    for (const i of deviceInterfaces(r)) {
+      const key = `${i.ip.network}/${i.ip.cidr}`;
+      if (mine.has(key)) continue;                    // connected wins, always
+      if (ospfPassive(r, i) && false) continue;
+      routes.push({ prefix: i.ip.network >>> 0, cidr: i.ip.cidr, mask: i.ip.mask >>> 0,
+        via: hop.first.viaIp, iface: ifKey(hop.first.viaIface), ifRef: hop.first.viaIface,
+        ad: AD.ospf, metric: cost, src: 'ospf', code: AD_CODE.ospf,
+        area: ospfAreaOf(r, i), learnedFrom: r.name });
+    }
+  }
+  // Keep the lowest metric per prefix — equal-cost paths would both install on
+  // a real box, but the table shows one line per prefix here.
+  const best = new Map();
+  for (const r of routes) {
+    const k = `${r.prefix}/${r.cidr}`;
+    if (!best.has(k) || r.metric < best.get(k).metric) best.set(k, r);
+  }
+  return [...best.values()];
+}
+
+// `show ip ospf neighbor`
+function showIpOspfNeighbor(dev) {
+  if (!ospfEnabled(dev)) return `${dev.name}: OSPF is not enabled`;
+  const { adj, problems } = ospfNeighbors();
+  const mine = adj.filter(a => a.a.id === dev.id || a.b.id === dev.id);
+  const lines = [`Router ID ${ipStr(ospfRouterId(dev))} · reference bandwidth ${ospfRefBw(dev)} Mbps`, ''];
+  if (!mine.length) lines.push('No neighbours — no other OSPF router shares a segment with this one.');
+  else {
+    lines.push('Neighbor ID       Pri  State     Address          Interface   Cost');
+    for (const a of mine) {
+      const far = a.a.id === dev.id ? a.b : a.a;
+      const farIf = a.a.id === dev.id ? a.ib : a.ia;
+      const myIf = a.a.id === dev.id ? a.ia : a.ib;
+      const cost = a.a.id === dev.id ? a.costA : a.costB;
+      lines.push(`${ipStr(ospfRouterId(far)).padEnd(17)} 1    FULL      ${ipStr(farIf.ip.int).padEnd(16)} ${ifName(myIf).padEnd(11)} ${cost}`);
+    }
+  }
+  for (const p of problems) lines.push('! ' + p);
+  return lines.join('\n');
+}
+
 //////////////////// Routing table ////////////////////
 // A router does not "find a path"; it looks up a destination in a table and
 // forwards to a next hop. Building this as a real table is what makes traceroute
@@ -11344,6 +11551,9 @@ function routingTable(dev) {
       via: null, iface: ifName, ad: AD.connected, metric: 0, src: 'local',
       code: AD_CODE.local, ifRef: i, local: true });
   }
+  // Learned routes. They lose to connected (AD 0) and static (AD 1) on the same
+  // prefix, which is what administrative distance is for.
+  for (const r of ospfRoutes(dev)) out.push(r);
   for (const r of dev.routes || []) {
     const dst = parseIp(r.prefix);
     if (!dst) continue;
@@ -12957,6 +13167,63 @@ function wireDnsProps(dev) {
   };
 }
 
+// OSPF config. Enabling it and picking an area is most of what people type; the
+// reference bandwidth is here because leaving it at Cisco's 100 Mbps default
+// makes every link 1G and above cost the same, which is a real trap.
+function ospfPropsHtml(dev) {
+  if (!deviceInterfaces(dev).length) return '';
+  const o = dev.ospf || {};
+  const on = !!o.enabled;
+  const ifaces = deviceInterfaces(dev);
+  return `
+    <div class="row" style="margin-top:10px"><span class="k">OSPF</span>
+      <input type="checkbox" id="dev-ospf-on" ${on ? 'checked' : ''}></div>
+    <div id="dev-ospf-cfg" style="${on ? '' : 'display:none'}">
+      <div class="row"><span class="k">router-id</span>
+        <input type="text" id="os-rid" style="width:118px" value="${esc(o.routerId || '')}"
+          placeholder="${ipStr(ospfRouterId(dev))} (auto)"></div>
+      <div class="row"><span class="k">area (default)</span>
+        <input type="number" id="os-area" style="width:60px" value="${o.area === undefined ? 0 : o.area}"></div>
+      <div class="row"><span class="k">reference bw</span>
+        <input type="number" id="os-ref" style="width:74px" value="${o.refBw || OSPF_REF_BW_MBPS}">
+        <span class="unit">Mbps</span></div>
+      ${o.refBw ? '' : '<p class="cbl-edit-hint">At the 100 Mbps default every link 100 M and faster costs 1 — raise this to 10000 to tell 1 G and 10 G apart.</p>'}
+      <div class="row"><span class="k">per interface</span></div>
+      ${ifaces.map(i => {
+        const k = ifKey(i);
+        const area = ospfAreaOf(dev, i);
+        return `<div class="row" data-ospfif="${esc(String(k))}">
+          <span class="k" style="font-size:11px">${ifName(i)}</span>
+          <input type="number" class="os-ifarea" style="width:54px" value="${area}" title="area">
+          <label style="font-size:11px"><input type="checkbox" class="os-ifpass" ${ospfPassive(dev, i) ? 'checked' : ''}> passive</label>
+          <span class="ai-meta">cost ${ospfCost(dev, 1)}</span></div>`;
+      }).join('')}
+      <div class="row" style="margin-top:8px"><span class="k">show ip ospf neighbor</span></div>
+      <pre style="font-size:10px;white-space:pre-wrap;margin:2px 0">${esc(showIpOspfNeighbor(dev))}</pre>
+    </div>`;
+}
+function wireOspfProps(dev) {
+  const cb = document.getElementById('dev-ospf-on');
+  if (!cb) return;
+  const root = propsBody;
+  const save = () => {
+    const g = id => (document.getElementById(id) || {}).value;
+    const areas = {}, passive = [];
+    for (const el of root.querySelectorAll('[data-ospfif]')) {
+      const k = el.dataset.ospfif;
+      const a = el.querySelector('.os-ifarea').value;
+      if (a !== '') areas[k] = +a;
+      if (el.querySelector('.os-ifpass').checked) passive.push(isNaN(+k) ? k : +k);
+    }
+    dev.ospf = { enabled: cb.checked, routerId: (g('os-rid') || '').trim(),
+      area: +g('os-area') || 0, refBw: +g('os-ref') || OSPF_REF_BW_MBPS, areas, passive };
+    flushL2Tables();
+    showDeviceProps(dev.id);
+  };
+  cb.onchange = save;
+  for (const el of root.querySelectorAll('#dev-ospf-cfg input')) el.onchange = save;
+}
+
 function wireAclProps(dev) {
   const ta = document.getElementById('dev-acl');
   if (!ta) return;
@@ -13204,6 +13471,7 @@ function showDeviceProps(id) {
     ${nicPropsHtml(dev)}
     ${dnsPropsHtml(dev)}
     ${routePropsHtml(dev)}
+    ${ospfPropsHtml(dev)}
     ${natPropsHtml(dev)}
     ${aclPropsHtml(dev)}
     ${l2TablesHtml(dev)}
@@ -13222,6 +13490,7 @@ function showDeviceProps(id) {
   wireNicProps(dev);
   wireDnsProps(dev);
   wireRouteProps(dev);
+  wireOspfProps(dev);
   wireNatProps(dev);
   wireAclProps(dev);
   const placeBtn = document.getElementById('dev-place');

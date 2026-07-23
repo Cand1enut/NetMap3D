@@ -545,8 +545,9 @@ be specced in full before a line is written.
 
 **Protocols still missing for parity** (the audit items are all closed as of
 v0.30.0; DNS and TCP handshake landed in v0.33.0): HTTP, EtherChannel/LACP,
-IPv6, VTP, and dynamic routing (OSPF/EIGRP/BGP). Each gets a full spec before it
-is started, same rule as everything else.
+IPv6, VTP, and the remaining dynamic routing protocols (EIGRP, BGP, RIP —
+**OSPF landed in v0.34.0**). Each gets a full spec before it is started, same
+rule as everything else.
 
 **Challenges / practice mode — priority 3.** Packet Tracer's Activity Wizard is
 the model: an authored scenario ships with an initial topology, an instructions
@@ -792,8 +793,11 @@ this order — the first one is foundational and several others depend on it.
    an `ip route` editor. Forwarding is now a hop-by-hop table lookup instead of
    a graph search, so a missing or wrong route fails where it really would.
    Return-path and per-hop transit ACLs are evaluated too. STILL MISSING and
-   still on this list: OSPF, EIGRP, RIP, BGP, VRFs — dynamic routing has not
-   been started.
+   still on this list: EIGRP, RIP, BGP, VRFs. **OSPF landed in v0.34.0** —
+   adjacency formation over real shared segments, per-interface areas, passive
+   interfaces, cost from reference bandwidth over negotiated link speed, SPF
+   (Dijkstra) per router, and routes installed at AD 110 that lose to static
+   and connected. Verified to reconverge when a link is shut.
 10. ~~**Hosts assume a single NIC on port 1**~~ — FIXED v0.30.0. A host has
     NICs: each with its own port, address, gateway, MAC, VLAN and DHCP lease.
     A dual-homed server really does get two leases on two subnets from two MACs.
