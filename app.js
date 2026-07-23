@@ -7289,6 +7289,51 @@ function wireNicProps(dev) {
   };
 }
 
+// DNS records a host serves, and the resolvers it uses. A host with records is
+// a DNS server; a host with resolvers is a client. Both are just fields, which
+// is what they are on a real machine too.
+function dnsPropsHtml(dev) {
+  if (netClass(dev) !== 'host') return '';
+  const recs = Object.entries(dev.dns || {}).map(([n, a], i) =>
+    `<div class="row" data-dnsrec="${i}">
+       <input type="text" class="dn-name" style="width:130px" value="${esc(n)}" placeholder="host.corp.local">
+       <input type="text" class="dn-addr" style="width:96px" value="${esc(a)}" placeholder="10.0.10.5">
+       <button class="dn-del" title="Remove record">\u00d7</button></div>`).join('');
+  const usesDhcp = hostNics(dev).some(n => n.ip === 'dhcp');
+  return `
+    <div class="row" style="margin-top:10px"><span class="k">DNS servers</span>
+      <input type="text" id="dn-servers" style="width:132px"
+        value="${esc([].concat(dev.dnsServers || []).join(', '))}"
+        placeholder="${usesDhcp ? 'from DHCP option 6' : '10.0.10.5'}"></div>
+    ${usesDhcp ? '<p class="cbl-edit-hint">Blank means whatever DHCP option 6 handed out.</p>' : ''}
+    <div class="row"><span class="k">DNS records served</span></div>${recs}
+    <button id="dn-add" style="font-size:11px">+ record</button>`;
+}
+function wireDnsProps(dev) {
+  const root = propsBody;
+  const save = () => {
+    const sv = (document.getElementById('dn-servers') || {}).value || '';
+    dev.dnsServers = sv.split(',').map(x => x.trim()).filter(Boolean);
+    const recs = {};
+    for (const el of root.querySelectorAll('[data-dnsrec]')) {
+      const n = (el.querySelector('.dn-name').value || '').trim().toLowerCase();
+      const a = (el.querySelector('.dn-addr').value || '').trim();
+      if (n && a) recs[n] = a;
+    }
+    dev.dns = recs;
+    showDeviceProps(dev.id);
+  };
+  for (const el of root.querySelectorAll('#dn-servers,.dn-name,.dn-addr')) el.onchange = save;
+  const add = document.getElementById('dn-add');
+  if (add) add.onclick = () => { dev.dns = { ...(dev.dns || {}), '': '' }; showDeviceProps(dev.id); };
+  for (const b of root.querySelectorAll('.dn-del')) b.onclick = e => {
+    const i = +e.target.closest('[data-dnsrec]').dataset.dnsrec;
+    const keys = Object.keys(dev.dns || {});
+    const next = { ...dev.dns }; delete next[keys[i]];
+    dev.dns = next; showDeviceProps(dev.id);
+  };
+}
+
 function wireAclProps(dev) {
   const ta = document.getElementById('dev-acl');
   if (!ta) return;
@@ -7534,6 +7579,7 @@ function showDeviceProps(id) {
     ${dhcpPropsHtml(dev)}
     ${circuitPropsHtml(dev)}
     ${nicPropsHtml(dev)}
+    ${dnsPropsHtml(dev)}
     ${routePropsHtml(dev)}
     ${natPropsHtml(dev)}
     ${aclPropsHtml(dev)}
@@ -7551,6 +7597,7 @@ function showDeviceProps(id) {
   wireDhcpProps(dev);
   wireCircuitProps(dev);
   wireNicProps(dev);
+  wireDnsProps(dev);
   wireRouteProps(dev);
   wireNatProps(dev);
   wireAclProps(dev);
@@ -9352,6 +9399,87 @@ document.getElementById('sim-acl').onclick = runAcl;
 
 
 
+
+// ---- TCP three-way handshake and teardown ----
+// RFC 793: SYN → SYN,ACK → ACK opens a connection; FIN,ACK → ACK in each
+// direction closes it. Modelling it as real exchanges matters because it is
+// what `established` in an ACL actually keys on — a returning SYN,ACK carries
+// ACK and is admitted, while a fresh inbound SYN is not. Simulating a single
+// packet could never show that.
+function tcpHandshake(srcDev, dstDev, dstPort) {
+  const dstNic = hostNics(dstDev).find(n => nicIp(dstDev, n.port));
+  if (!dstNic) return { ok: false, why: noAddressReason(dstDev), legs: [] };
+  const dstIp = nicIp(dstDev, dstNic.port).int;
+  const srcNic = hostEgressNic(srcDev, dstIp);
+  const srcIp = nicIp(srcDev, srcNic.port);
+  if (!srcIp) return { ok: false, why: noAddressReason(srcDev), legs: [] };
+  const sp = 49152;
+  const legs = [];
+  const step = (from, toInt, flags, label) => {
+    const sim = pduSend(from, toInt, { proto: 'tcp', srcPort: from === srcDev ? sp : dstPort,
+      dstPort: from === srcDev ? dstPort : sp, flags, label });
+    legs.push({ label, flags, sim, ok: !!sim.delivered,
+      why: sim.delivered ? null : (sim.dropped ? sim.dropped.why : 'dropped') });
+    return sim.delivered;
+  };
+  if (!step(srcDev, dstIp, 'SYN', 'SYN — client opens')) return finish();
+  if (!step(dstDev, srcIp.int, 'SYN,ACK', 'SYN,ACK — server accepts')) return finish();
+  if (!step(srcDev, dstIp, 'ACK', 'ACK — connection established')) return finish();
+  if (!step(srcDev, dstIp, 'FIN,ACK', 'FIN,ACK — client closes')) return finish();
+  step(dstDev, srcIp.int, 'ACK', 'ACK — server acknowledges close');
+  return finish();
+  function finish() {
+    const failed = legs.find(l => !l.ok);
+    return { ok: !failed, legs, why: failed ? `${failed.label}: ${failed.why}` : null,
+      established: legs.length >= 3 && legs.slice(0, 3).every(l => l.ok) };
+  }
+}
+
+// ---- DNS ----
+// A resolver query is a real UDP/53 exchange to a real server, and the server
+// only answers for names it holds. That means a wrong DNS option handed out by
+// DHCP, or a firewall rule blocking 53, breaks name resolution exactly the way
+// it does in life — and the trace shows which.
+function dnsRecords(dev) { return dev.dns || {}; }
+function dnsServersFor(host, nicPort) {
+  const nic = hostNics(host).find(n => n.port === nicPort) || hostNics(host)[0];
+  if (!nic) return [];
+  if (nic.ip === 'dhcp') {
+    const l = _dhcpLeases.get(leaseKey(host.id, nic.port));
+    const opt = l && l.options ? l.options[DHCP_OPT.dns] : null;
+    if (opt) return String(opt).split(',').map(x => x.trim()).filter(Boolean);
+  }
+  return [].concat(nic.dns || host.dnsServers || []);
+}
+function dnsResolve(host, name) {
+  const nic = hostEgressNic(host, 0) || hostNics(host)[0];
+  if (!nic) return { ok: false, why: `${host.name} has no NIC` };
+  const servers = dnsServersFor(host, nic.port);
+  if (!servers.length) {
+    return { ok: false, why: `${host.name} has no DNS server configured — nothing to ask` };
+  }
+  for (const sv of servers) {
+    const svIp = parseIp(sv);
+    if (!svIp) continue;
+    const query = pduSend(host, svIp.int, { proto: 'udp', srcPort: 49152, dstPort: 53,
+      label: `DNS query ${name}` });
+    if (!query.delivered) {
+      return { ok: false, query, server: sv,
+        why: `${host.name} cannot reach DNS server ${sv} — ${query.dropped ? query.dropped.why : 'dropped'}` };
+    }
+    const owner = deviceHoldingAddr(svIp.int);
+    const rec = owner ? dnsRecords(owner.dev)[name.toLowerCase()] : null;
+    if (!rec) {
+      return { ok: false, query, server: sv,
+        why: `${sv} answered but has no record for ${name} (NXDOMAIN)` };
+    }
+    const answer = pduSend(owner.dev, (nicIp(host, nic.port) || {}).int,
+      { proto: 'udp', srcPort: 53, dstPort: 49152, label: `DNS answer ${name} = ${rec}` });
+    return { ok: true, query, answer, server: sv, name, address: rec };
+  }
+  return { ok: false, why: `none of ${host.name}'s DNS servers (${servers.join(', ')}) are valid addresses` };
+}
+
 // A ping is a request AND a reply. Simulating only the outbound leg is exactly
 // the asymmetry bug that pingHosts had before v0.26.0 — an ACL or a missing
 // return route can let the request through and strand the answer, and that is
@@ -9431,6 +9559,10 @@ function runPdu() {
         <option value="icmp">icmp</option><option value="tcp">tcp</option><option value="udp">udp</option></select>
       <input type="text" id="pdu-port" style="width:60px" placeholder="port">
       <button id="pdu-send">Send</button></div>
+    <div class="row" style="gap:4px;margin-top:4px;flex-wrap:wrap">
+      <button id="pdu-tcp">TCP handshake</button>
+      <input type="text" id="pdu-name" style="width:130px" placeholder="name to resolve">
+      <button id="pdu-dns">DNS lookup</button></div>
     <div id="pdu-out"></div>`);
   const a = document.getElementById('pdu-a'), b = document.getElementById('pdu-b');
   a.value = hosts[0].id; b.value = hosts[1].id;
@@ -9447,13 +9579,52 @@ function runPdu() {
     _pduAt = _pduCur.request ? _pduCur.request.trace.length : 0;
     drawPduTrace();
   };
+  // A TCP connection is five exchanges, not one packet, and `established` only
+  // means anything once you can see which of them carries ACK.
+  document.getElementById('pdu-tcp').onclick = () => {
+    flushL2Tables(); pduStop();
+    const raw = (document.getElementById('pdu-port').value || '').trim();
+    const port = raw ? (aclPortNum(raw, 'tcp') || +raw || 80) : 80;
+    const h = tcpHandshake(deviceById(+a.value), deviceById(+b.value), port);
+    let html = `<h4>TCP ${port} — ${h.ok ? 'connection opened and closed' : 'failed'}</h4>` +
+      `<table class="sim-table"><tr><th>Segment</th><th>Flags</th><th>Result</th></tr>` +
+      h.legs.map(l => `<tr><td>${esc(l.label)}</td><td>${esc(l.flags)}</td>` +
+        `<td class="${l.ok ? 'ai-good' : 'ai-bad'}">${l.ok ? 'delivered' : esc(l.why)}</td></tr>`).join('') +
+      '</table>';
+    if (!h.ok) html += `<p class="ai-bad">${esc(h.why)}</p>`;
+    else html += `<p class="ai-meta">Three-way handshake completed, then FIN/ACK teardown. An ACL matching <b>established</b> admits every segment here except the opening SYN.</p>`;
+    document.getElementById('pdu-out').innerHTML = html;
+  };
+  document.getElementById('pdu-dns').onclick = () => {
+    flushL2Tables(); pduStop();
+    const name = (document.getElementById('pdu-name').value || '').trim();
+    if (!name) { document.getElementById('pdu-out').innerHTML = '<p>Type a hostname to resolve. Add records to a host in its properties.</p>'; return; }
+    const r = dnsResolve(deviceById(+a.value), name);
+    let html = `<h4>DNS · ${esc(name)}</h4>`;
+    html += r.ok
+      ? `<p class="ai-good">${esc(name)} = ${r.address} <span class="ai-meta">(answered by ${r.server})</span></p>`
+      : `<p class="ai-bad">${esc(r.why)}</p>`;
+    // The query and the answer are ordinary PDU walks, so hand them to the
+    // normal trace view — a DNS failure is then debuggable exactly like a ping.
+    if (r.query) {
+      _pduCur = { request: r.query, reply: r.answer || null, ok: r.ok, why: r.why };
+      _pduLeg = 'request';
+      _pduAt = r.query.trace.length;
+      document.getElementById('pdu-out').innerHTML = html;
+      const sub = document.createElement('div');
+      document.getElementById('pdu-out').appendChild(sub);
+      drawPduTrace(sub);
+      return;
+    }
+    document.getElementById('pdu-out').innerHTML = html;
+  };
 }
 function pduLegSim() {
   if (!_pduCur) return null;
   return _pduLeg === 'reply' ? _pduCur.reply : _pduCur.request;
 }
-function drawPduTrace() {
-  const out = document.getElementById('pdu-out');
+function drawPduTrace(target) {
+  const out = target || document.getElementById('pdu-out');
   if (!out || !_pduCur) return;
   const sim = pduLegSim();
   if (!sim) { out.innerHTML = `<p class="ai-bad">${esc(_pduCur.why || 'no packet')}</p>`; return; }
@@ -9507,19 +9678,19 @@ function drawPduTrace() {
     }
   }
   out.innerHTML = html;
-  const bind = (id, fn) => { const el = document.getElementById(id); if (el) el.onclick = () => { fn(); drawPduTrace(); }; };
+  const bind = (id, fn) => { const el = out.querySelector('#' + id); if (el) el.onclick = () => { fn(); drawPduTrace(out); }; };
   bind('pdu-back', () => { pduStop(); _pduAt = Math.max(1, _pduAt - 1); });
   bind('pdu-fwd', () => { pduStop(); _pduAt = Math.min(full.length, _pduAt + 1); });
   bind('pdu-all', () => { pduStop(); _pduAt = full.length; });
   bind('pdu-stop', () => pduStop());
   bind('pdu-leg-req', () => { pduStop(); _pduLeg = 'request'; _pduAt = _pduCur.request.trace.length; });
   bind('pdu-leg-rep', () => { pduStop(); if (_pduCur.reply) { _pduLeg = 'reply'; _pduAt = _pduCur.reply.trace.length; } });
-  const f = document.getElementById('pdu-filter');
-  if (f) f.onchange = () => { _pduFilter = f.value; drawPduTrace(); };
-  const play = document.getElementById('pdu-play');
+  const f = out.querySelector('#pdu-filter');
+  if (f) f.onchange = () => { _pduFilter = f.value; drawPduTrace(out); };
+  const play = out.querySelector('#pdu-play');
   if (play) play.onclick = () => {
     _pduAt = 0;
-    pduPlay(full, (i) => { _pduAt = i; drawPduTrace(); });
+    pduPlay(full, (i) => { _pduAt = i; drawPduTrace(out); });
   };
   pduShowAt(full, _pduAt - 1);
   showPingPath(shown.map(t => t.devId));

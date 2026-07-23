@@ -513,8 +513,8 @@ every device decision is recorded with the table entry that drove it; the trace
 steps forward and back or plays in realtime; a marker follows the packet through
 the 3D scene; a protocol filter narrows the view; and a ping is a genuine
 request AND reply, so a blocked or unroutable return path fails the ping and
-says exactly where. Remaining for parity: DNS, HTTP, the TCP three-way handshake
-and teardown, EtherChannel/LACP, IPv6, VTP. Original gap statement kept below
+says exactly where. DNS and the TCP three-way handshake landed in v0.33.0.
+Remaining for parity: HTTP, EtherChannel/LACP, IPv6, VTP. Original gap statement kept below
 because it is what the work was measured against.
 
 **The honest gap, stated plainly: NetMap3D has a verdict engine, not a packet
@@ -543,11 +543,10 @@ be specced in full before a line is written.
 - ARP resolution as observable exchanges, not an assumption.
 - Deterministic ordering — see the collaboration section; no random timers.
 
-**Protocols still missing for parity**, beyond the five open audit items (NAT,
-STP port states/timers/RSTP/PVST+, routing tables and protocols, speed/duplex
-negotiation, multi-NIC hosts): DNS, HTTP, the TCP three-way handshake and
-teardown, EtherChannel/LACP, IPv6, and VTP. Each gets a full spec before it is
-started, same rule as everything else.
+**Protocols still missing for parity** (the audit items are all closed as of
+v0.30.0; DNS and TCP handshake landed in v0.33.0): HTTP, EtherChannel/LACP,
+IPv6, VTP, and dynamic routing (OSPF/EIGRP/BGP). Each gets a full spec before it
+is started, same rule as everything else.
 
 **Challenges / practice mode — priority 3.** Packet Tracer's Activity Wizard is
 the model: an authored scenario ships with an initial topology, an instructions
