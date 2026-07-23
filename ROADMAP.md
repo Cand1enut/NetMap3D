@@ -762,10 +762,18 @@ this order — the first one is foundational and several others depend on it.
    60 s). Entries are created by the first packet and age out. Unsolicited
    inbound with no matching translation is dropped, which is what makes NAT a
    de-facto inbound filter. `show ip nat translations` and a config UI.
-7. **STP converges instantly with no port states.** Real 802.1D moves
-   blocking -> listening -> learning -> forwarding on timers (hello 2s,
-   forward delay 15s, max age 20s), has PortFast/edge ports, and elects on
-   BPDUs. Also missing: RSTP/PVST+, which is what Cisco actually runs.
+7. ~~**STP converges instantly with no port states**~~ — FIXED v0.29.0.
+   Port states on real timers (listening 15 s, learning 15 s, forwarding at
+   30 s), PortFast/edge ports that skip them, and a warning when PortFast is on
+   a switch-to-switch link (what BPDU guard exists to catch). PVST+ with one
+   tree per VLAN and 802.1t extended system ID, so a configured priority is a
+   multiple of 4096 and the advertised value is priority + VLAN — different
+   VLANs elect different roots and block different ports, which is the load
+   distribution PVST+ is for. RSTP roles (alternate vs backup) and the
+   discarding state, with rapid-pvst skipping the timer wait. STP cost now
+   follows the NEGOTIATED link speed, so a gig port that trained to 100 M
+   really does cost 200000. Still computed rather than exchanged as BPDUs —
+   that arrives with the PDU engine.
 8. ~~**MAC tables never age**~~ — FIXED v0.22.0. Entries timestamped, 300 s
    Cisco default, expired on read.
 9. ~~**No routing protocols and no routing table**~~ — PARTIALLY FIXED v0.26.0.

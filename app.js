@@ -3061,7 +3061,10 @@ function buildConnector(port, color, isPower) {
 // Is this cable a blocked STP link? True when either end's port is blocking.
 function cableStpBlocked(cable) {
   try {
-    return stpBlocked(cable.a.deviceId, cable.a.port) || stpBlocked(cable.b.deviceId, cable.b.port);
+    for (const v of [undefined, ...stpVlans()]) {
+      if (stpBlocked(cable.a.deviceId, cable.a.port, v) || stpBlocked(cable.b.deviceId, cable.b.port, v)) return true;
+    }
+    return false;
   } catch (e) { return false; }
 }
 
@@ -4131,11 +4134,11 @@ function l2Walk(startDev, opts = {}) {
       const nports = def.ports || 0;
       // a blocked port drops the frame — that's the whole point of STP, and it
       // is also what stops this walk looping forever on a redundant topology
-      if (!opts.ignoreStp && cls === 'switch' && stpBlocked(cur.dev.id, cur.port)) continue;
+      if (!opts.ignoreStp && cls === 'switch' && stpBlocked(cur.dev.id, cur.port, vlan)) continue;
       for (let q2 = 1; q2 <= nports; q2++) {
         if (q2 === cur.port) continue;
         if (!opts.ignoreVlan && vlan !== undefined && !portCarries(cur.dev, q2, vlan)) continue;
-        if (!opts.ignoreStp && cls === 'switch' && stpBlocked(cur.dev.id, q2)) continue;
+        if (!opts.ignoreStp && cls === 'switch' && stpBlocked(cur.dev.id, q2, vlan)) continue;
         const nb = hopThroughPatches(cur.dev, q2, FRONT);
         if (!nb) continue;
         if (!opts.ignoreLength && ((nb.cable && (nb.cable.lengthIn || 0) / 12) > COPPER_LIMIT_FT)) continue;
@@ -4898,16 +4901,50 @@ function stpCost(speedGbps) {
   const mbps = (speedGbps || 1) * 1000;
   return Math.max(1, Math.round(20000000 / mbps));
 }
-function bridgePriority(dev) {
-  const p = dev.stpPriority;
-  return (p === undefined || p === null || isNaN(+p)) ? STP_PRIO_DEFAULT : +p;
+// PVST+ runs one tree per VLAN, and the bridge ID carries the VLAN in it.
+// IEEE 802.1t splits the old 16-bit priority into a 4-bit priority plus a
+// 12-bit extended system ID holding the VLAN, which is why a configured
+// priority must be a multiple of 4096 and why the value a switch actually
+// advertises is priority + VLAN. Verified against Cisco's Rapid PVST+ guide
+// and two independent references.
+const STP_PRIO_STEP = 4096;
+function bridgePriority(dev, vlan) {
+  const per = dev.stpPriorityPerVlan && vlan !== undefined ? dev.stpPriorityPerVlan[vlan] : undefined;
+  const raw = per !== undefined ? per : dev.stpPriority;
+  let base = (raw === undefined || raw === null || isNaN(+raw)) ? STP_PRIO_DEFAULT : +raw;
+  base = Math.round(base / STP_PRIO_STEP) * STP_PRIO_STEP;      // 802.1t: multiples of 4096 only
+  return base + (vlan === undefined ? 0 : vlan);                // extended system ID
 }
 // Comparable bridge ID: priority first, then MAC — exactly 802.1D's ordering.
-function bridgeIdKey(dev) {
-  return String(bridgePriority(dev)).padStart(6, '0') + '|' + deviceMac(dev);
+function bridgeIdKey(dev, vlan) {
+  return String(bridgePriority(dev, vlan)).padStart(6, '0') + '|' + deviceMac(dev);
+}
+// The mode a switch runs. Cisco defaults to PVST+; rapid-pvst is what modern
+// deployments use and changes convergence, not topology.
+function stpMode(dev) { return (dev && dev.stpMode) || 'pvst'; }   // 'pvst' | 'rapid-pvst' | 'mst'
+
+// 802.1D port states and their real timers. A port coming up does not forward
+// immediately: it listens for BPDUs for one forward delay, learns MACs for
+// another, and only then forwards. That 30 s is exactly why PortFast exists and
+// why plugging in a PC feels broken without it.
+const STP_HELLO_S = 2, STP_FWD_DELAY_S = 15, STP_MAX_AGE_S = 20;
+const STP_STATES = ['blocking', 'listening', 'learning', 'forwarding'];
+// PortFast/edge ports skip straight to forwarding — correct for a host port,
+// and a loop waiting to happen on a switch-to-switch link, which is why BPDU
+// guard exists and why we flag it below.
+function isEdgePort(dev, port) {
+  const cfg = portCfgOf(dev, port);
+  if (cfg.portfast !== undefined) return !!cfg.portfast;
+  const nb = hopThroughPatches(dev, port, FRONT);
+  return !nb || netClass(nb.dev) !== 'switch';
 }
 // A link runs at the slower of its two ends.
 function linkSpeed(cable) {
+  // The NEGOTIATED speed, not the port's rated one. A gig port that trained to
+  // 100M because of the far end or a forced setting really does cost 200000 in
+  // spanning tree, and that can change which link blocks.
+  const n = negotiateLink(cable);
+  if (n && n.up && n.speed) return n.speed;
   const sp = (ep) => {
     const d = deviceById(ep.deviceId);
     if (!d) return 1;
@@ -4918,11 +4955,20 @@ function linkSpeed(cable) {
 }
 
 let _stp = null;   // cached result; invalidated with the L2 tables
-function stpState() {
-  if (_stp) return _stp;
+// One tree per VLAN (PVST+). `_stp` caches per VLAN key; the untagged/global
+// view is vlan undefined, which is what the plain 802.1D view used to be.
+function stpState(vlan) {
+  const key = vlan === undefined ? '*' : String(vlan);
+  if (_stp && _stp[key]) return _stp[key];
+  if (!_stp) _stp = {};
+  const res = computeStp(vlan);
+  _stp[key] = res;
+  return res;
+}
+function computeStp(vlan) {
   const switches = state.devices.filter(d => isPlaced(d) && netClass(d) === 'switch');
   const roles = new Map();     // "devId:port" -> role
-  if (switches.length < 2) return (_stp = { rootId: switches[0] && switches[0].id, roles, cost: new Map() });
+  if (switches.length < 2) return { rootId: switches[0] && switches[0].id, roles, cost: new Map(), vlan, links: [] };
 
   // switch-to-switch links only; host and router ports are edge ports
   const links = [];
@@ -4933,9 +4979,12 @@ function stpState() {
     if (!ea) continue;
     if (netClass(da) !== 'switch' || netClass(ea.dev) !== 'switch') continue;
     if (da.id === ea.dev.id) continue;
+    // A per-VLAN tree only spans links that actually carry that VLAN — which is
+    // the whole point of PVST+: VLAN 20 can block a link that VLAN 10 forwards.
+    if (vlan !== undefined && !(portCarries(da, c.a.port, vlan) && portCarries(ea.dev, ea.port, vlan))) continue;
     links.push({ aId: da.id, aPort: c.a.port, bId: ea.dev.id, bPort: ea.port, cost: stpCost(linkSpeed(c)), cable: c });
   }
-  if (!links.length) return (_stp = { rootId: switches[0].id, roles, cost: new Map() });
+  if (!links.length) return { rootId: switches[0].id, roles, cost: new Map(), vlan, links: [] };
 
   // Each connected component elects its own root — an isolated group of
   // switches is its own L2 island with its own spanning tree, not a set of
@@ -4963,7 +5012,7 @@ function stpState() {
       }
     }
     // 1. root of this component = lowest bridge ID within it
-    const root = comp.map(deviceById).sort((x, y) => bridgeIdKey(x) < bridgeIdKey(y) ? -1 : 1)[0];
+    const root = comp.map(deviceById).sort((x, y) => bridgeIdKey(x, vlan) < bridgeIdKey(y, vlan) ? -1 : 1)[0];
     if (!globalRoot) globalRoot = root;
     cost.set(root.id, 0);
     // 2. least-cost path to that root (Dijkstra over this component)
@@ -4980,7 +5029,7 @@ function stpState() {
         const nc = cost.get(cur) + l.cost;
         const better = nc < cost.get(far) ||
           (nc === cost.get(far) && via.get(far) &&
-            bridgeIdKey(deviceById(cur)) < bridgeIdKey(deviceById(via.get(far).peerId)));
+            bridgeIdKey(deviceById(cur), vlan) < bridgeIdKey(deviceById(via.get(far).peerId), vlan));
         if (better) { cost.set(far, nc); via.set(far, { link: l, port: farPort, peerId: cur }); }
       }
     }
@@ -4992,18 +5041,88 @@ function stpState() {
     const ca = cost.get(l.aId), cb = cost.get(l.bId);
     let desig;
     if (ca !== cb) desig = ca < cb ? 'a' : 'b';
-    else desig = bridgeIdKey(deviceById(l.aId)) < bridgeIdKey(deviceById(l.bId)) ? 'a' : 'b';
+    else desig = bridgeIdKey(deviceById(l.aId), vlan) < bridgeIdKey(deviceById(l.bId), vlan) ? 'a' : 'b';
     const dKey = desig === 'a' ? `${l.aId}:${l.aPort}` : `${l.bId}:${l.bPort}`;
     const oKey = desig === 'a' ? `${l.bId}:${l.bPort}` : `${l.aId}:${l.aPort}`;
     if (roles.get(dKey) !== 'root') roles.set(dKey, 'designated');
-    // 5. anything neither root nor designated blocks
-    if (!roles.has(oKey)) roles.set(oKey, 'blocking');
+    // 5. Anything neither root nor designated does not forward. 802.1D calls it
+    // blocking; RSTP splits it by WHY: an alternate port is a spare path to the
+    // root (a different bridge is designated on that segment), a backup port is
+    // a second port of this bridge onto a segment it is already designated for.
+    // The distinction is what lets RSTP fail over without recomputing.
+    if (!roles.has(oKey)) {
+      const oId = desig === 'a' ? l.bId : l.aId;
+      const oPort = desig === 'a' ? l.bPort : l.aPort;
+      const dId = desig === 'a' ? l.aId : l.bId;
+      roles.set(oKey, oId === dId ? 'backup' : 'alternate');
+    }
   }
-  _stp = { rootId: globalRoot && globalRoot.id, roles, cost, links };
-  return _stp;
+  return { rootId: globalRoot && globalRoot.id, roles, cost, links, vlan };
 }
-function stpRole(devId, port) { return stpState().roles.get(`${devId}:${port}`) || null; }
-function stpBlocked(devId, port) { return stpRole(devId, port) === 'blocking'; }
+// 802.1D role names for the classic view; RSTP keeps alternate/backup distinct.
+function stpRole(devId, port, vlan) {
+  const r = stpState(vlan).roles.get(`${devId}:${port}`) || null;
+  if (!r) return null;
+  const dev = deviceById(devId);
+  if (stpMode(dev) === 'rapid-pvst') return r;
+  return (r === 'alternate' || r === 'backup') ? 'blocking' : r;
+}
+// A port is blocked when its role does not forward — under either protocol.
+function stpBlocked(devId, port, vlan) {
+  const r = stpState(vlan).roles.get(`${devId}:${port}`);
+  return r === 'blocking' || r === 'alternate' || r === 'backup';
+}
+
+// The state a port is in, and when it will next change. Real 802.1D walks
+// blocking -> listening -> learning -> forwarding, 15 s per step, so a port that
+// just came up needs 30 s before it passes traffic. RSTP skips that on a
+// point-to-point link, and an edge port skips it under both.
+const _stpPortUp = new Map();            // "devId:port" -> simNow() when it came up
+function stpPortUpAt(devId, port) {
+  const k = `${devId}:${port}`;
+  if (!_stpPortUp.has(k)) _stpPortUp.set(k, simNow());
+  return _stpPortUp.get(k);
+}
+function stpPortState(devId, port, vlan) {
+  const role = stpState(vlan).roles.get(`${devId}:${port}`);
+  const dev = deviceById(devId);
+  if (!role) {
+    // Not a switch-to-switch port: an access port for a host.
+    return { state: 'forwarding', role: 'designated', edge: true,
+      note: isEdgePort(dev, port) ? 'edge port (PortFast) — forwards immediately' : null };
+  }
+  if (role === 'blocking' || role === 'alternate' || role === 'backup') {
+    return { state: stpMode(dev) === 'rapid-pvst' ? 'discarding' : 'blocking', role };
+  }
+  if (isEdgePort(dev, port)) return { state: 'forwarding', role, edge: true, note: 'edge port (PortFast)' };
+  if (stpMode(dev) === 'rapid-pvst') {
+    return { state: 'forwarding', role, note: 'rapid-pvst: proposal/agreement on a point-to-point link, no timer wait' };
+  }
+  const elapsed = (simNow() - stpPortUpAt(devId, port)) / 1000;
+  if (elapsed < STP_FWD_DELAY_S) {
+    return { state: 'listening', role, secsLeft: Math.ceil(STP_FWD_DELAY_S - elapsed),
+      note: `listening — ${Math.ceil(STP_FWD_DELAY_S - elapsed)} s to learning` };
+  }
+  if (elapsed < STP_FWD_DELAY_S * 2) {
+    return { state: 'learning', role, secsLeft: Math.ceil(STP_FWD_DELAY_S * 2 - elapsed),
+      note: `learning MACs — ${Math.ceil(STP_FWD_DELAY_S * 2 - elapsed)} s to forwarding` };
+  }
+  return { state: 'forwarding', role };
+}
+// Which VLANs have their own tree — every VLAN any switch carries.
+function stpVlans() {
+  const set = new Set();
+  for (const d of state.devices) {
+    if (!isPlaced(d) || netClass(d) !== 'switch') continue;
+    for (const v of vlanDb(d).keys()) set.add(v);
+    const def = DEVICE_TYPES[d.type];
+    for (let p = 1; p <= (def.ports || 0); p++) {
+      const c = carriedVlans(d, p);
+      if (c !== 'ALL') for (const v of c) set.add(v);
+    }
+  }
+  return [...set].sort((a, b) => a - b);
+}
 
 // Layer-2 reachable? Plus the reason it isn't, discovered by relaxing rules.
 function l2Reachable(a, b) {
@@ -8714,50 +8833,86 @@ document.getElementById('sim-acl').onclick = runAcl;
 
 function runStp() {
   flushL2Tables();
-  const st = stpState();
   const switches = state.devices.filter(d => isPlaced(d) && netClass(d) === 'switch');
   if (switches.length < 2) { aiPrint('<p>Spanning tree needs at least two switches.</p>'); return; }
-  if (!st.links || !st.links.length) {
+  const base = stpState();
+  if (!base.links || !base.links.length) {
     aiPrint('<p>No switch-to-switch links — nothing for spanning tree to do. ' +
             'Add a redundant link between two switches to see a port block.</p>');
     return;
   }
-  // group by component root so isolated islands read as separate trees
-  const byRoot = new Map();
-  for (const d of switches) {
-    let r = d.id, guard = 0;
-    // walk to the root of this device's tree
-    while (st.cost.get(r) > 0 && guard++ < 64) {
-      const k = [...st.roles].find(([kk, v]) => v === 'root' && kk.startsWith(r + ':'));
-      if (!k) break;
-      const link = st.links.find(l => (l.aId === r && String(l.aPort) === k[0].split(':')[1]) ||
-                                      (l.bId === r && String(l.bPort) === k[0].split(':')[1]));
-      if (!link) break;
-      r = link.aId === r ? link.bId : link.aId;
-    }
-    if (!byRoot.has(r)) byRoot.set(r, []);
-    byRoot.get(r).push(d);
-  }
-  let html = '';
-  for (const [rootId, members] of byRoot) {
-    const root = deviceById(rootId);
-    html += `<h4>Spanning tree · root ${root ? root.name : '?'}</h4>` +
-      `<p class="ai-meta">bridge ID ${bridgePriority(root)}.${deviceMac(root)} · ` +
-      `802.1D-2004 costs (1G = 20000)</p><table class="sim-table">` +
-      `<tr><th>Switch</th><th>Cost to root</th><th>Port roles</th></tr>`;
-    for (const d of members.sort((x, y) => st.cost.get(x.id) - st.cost.get(y.id))) {
-      const roles = [...st.roles].filter(([k]) => k.startsWith(d.id + ':'))
-        .map(([k, v]) => `${k.split(':')[1]}=${v === 'blocking' ? '<b class="ai-bad">block</b>' : v}`).join(', ');
-      html += `<tr><td>${d.name}${d.id === rootId ? ' <b>(root)</b>' : ''}</td>` +
-        `<td>${st.cost.get(d.id) === 0 ? '0' : (st.cost.get(d.id) || '—')}</td><td>${roles || '—'}</td></tr>`;
+  // PVST+ runs a tree per VLAN, so the panel does too. The untagged view first,
+  // then each VLAN that has its own tree — that is the point of PVST+ and
+  // showing only one tree hides the case where VLAN 20 blocks a link VLAN 10
+  // forwards.
+  const vlans = stpVlans();
+  const views = [{ key: undefined, label: 'All VLANs (CST)' },
+    ...vlans.map(v => ({ key: v, label: `VLAN ${v}` }))];
+  const mode = stpMode(switches[0]);
+  let html = `<p class="ai-meta">mode ${mode === 'rapid-pvst' ? 'rapid-pvst (802.1w)' : 'pvst (802.1D)'} · ` +
+    `hello ${STP_HELLO_S}s · forward delay ${STP_FWD_DELAY_S}s · max age ${STP_MAX_AGE_S}s · ` +
+    `802.1D-2004 costs (1G = 20000)</p>`;
+  for (const view of views) {
+    const st = stpState(view.key);
+    if (!st.links || !st.links.length) continue;
+    const root = deviceById(st.rootId);
+    if (!root) continue;
+    html += `<h4>${view.label} · root ${root.name}</h4>` +
+      `<p class="ai-meta">bridge ID ${bridgePriority(root, view.key)}` +
+      `${view.key !== undefined ? ` (${bridgePriority(root, view.key) - view.key} + VLAN ${view.key})` : ''}` +
+      `.${deviceMac(root)}</p>` +
+      `<table class="sim-table"><tr><th>Switch</th><th>Cost</th><th>Port</th><th>Role</th><th>State</th></tr>`;
+    for (const d of switches.slice().sort((x, y) => (st.cost.get(x.id) ?? 1e9) - (st.cost.get(y.id) ?? 1e9))) {
+      const mine = [...st.roles].filter(([k]) => k.startsWith(d.id + ':'));
+      if (!mine.length) continue;
+      let first = true;
+      for (const [k, role] of mine) {
+        const port = k.split(':')[1];
+        const ps = stpPortState(d.id, port, view.key);
+        const cls = ps.state === 'forwarding' ? 'ai-good'
+          : (ps.state === 'blocking' || ps.state === 'discarding') ? 'ai-bad' : 'ai-warn';
+        html += `<tr><td>${first ? d.name + (d.id === st.rootId ? ' <b>(root)</b>' : '') : ''}</td>` +
+          `<td>${first ? (st.cost.get(d.id) === 0 ? '0' : (st.cost.get(d.id) ?? '—')) : ''}</td>` +
+          `<td>${port}</td><td>${role}</td>` +
+          `<td class="${cls}">${ps.state}${ps.secsLeft ? ` <span class="ai-meta">${ps.secsLeft}s</span>` : ''}</td></tr>`;
+        first = false;
+      }
     }
     html += '</table>';
+    const blocked = [...st.roles].filter(([, v]) => v !== 'root' && v !== 'designated').length;
+    if (blocked) html += `<p class="ai-meta">${blocked} port${blocked === 1 ? '' : 's'} not forwarding — the link is up, the tree is keeping it out of the loop.</p>`;
   }
-  const blocked = [...st.roles].filter(([, v]) => v === 'blocking').length;
-  html += blocked
-    ? `<p class="ai-meta">${blocked} port${blocked === 1 ? '' : 's'} blocking — those links are up but not forwarding (shown amber).</p>`
-    : `<p class="ai-meta">No blocked ports — the topology has no loop.</p>`;
+  // A PortFast port on a switch-to-switch link is a loop waiting to happen —
+  // it forwards before the tree has converged. This is exactly what BPDU guard
+  // exists to catch, so flag it rather than letting it look fine.
+  const risky = [];
+  for (const d of switches) {
+    const def = DEVICE_TYPES[d.type];
+    for (let p = 1; p <= (def.ports || 0); p++) {
+      if (portRole(def, p) === 'PWR') continue;
+      if (!portCfgOf(d, p).portfast) continue;
+      const nb = hopThroughPatches(d, p, FRONT);
+      if (nb && netClass(nb.dev) === 'switch') risky.push(`${d.name} port ${p} → ${nb.dev.name}`);
+    }
+  }
+  if (risky.length) {
+    html += `<h4 class="ai-bad">PortFast on a switch link</h4>` +
+      `<p class="ai-bad">${risky.join('<br>')}</p>` +
+      `<p class="ai-meta">PortFast skips listening and learning, so this port forwards before the tree converges — that is a loop. Real deployments pair PortFast with BPDU guard, which shuts the port down the moment a BPDU arrives on it.</p>`;
+  }
+  html += `<div class="row" style="margin-top:10px;gap:6px;flex-wrap:wrap">
+    <button id="stp-conv">Watch convergence (+5s)</button>
+    <button id="stp-reset">Restart ports</button>
+    <button id="stp-mode">Toggle pvst / rapid-pvst</button></div>`;
   aiPrint(html);
+  const bind = (id, fn) => { const b = document.getElementById(id); if (b) b.onclick = () => { fn(); runStp(); }; };
+  bind('stp-conv', () => simAdvance(5));
+  bind('stp-reset', () => { _stpPortUp.clear(); simResetClock(); });
+  bind('stp-mode', () => {
+    const next = mode === 'rapid-pvst' ? 'pvst' : 'rapid-pvst';
+    for (const d of switches) d.stpMode = next;
+    _stpPortUp.clear(); simResetClock();
+  });
 }
 document.getElementById('sim-stp').onclick = runStp;
 
