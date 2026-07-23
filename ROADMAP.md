@@ -785,7 +785,14 @@ this order — the first one is foundational and several others depend on it.
    Return-path and per-hop transit ACLs are evaluated too. STILL MISSING and
    still on this list: OSPF, EIGRP, RIP, BGP, VRFs — dynamic routing has not
    been started.
-10. **Hosts assume a single NIC on port 1** (`hostVlan`, `hostPort`).
+10. ~~**Hosts assume a single NIC on port 1**~~ — FIXED v0.30.0. A host has
+    NICs: each with its own port, address, gateway, MAC, VLAN and DHCP lease.
+    A dual-homed server really does get two leases on two subnets from two MACs.
+    Egress NIC is chosen the way a host routing table chooses (connected subnet
+    first, then a NIC with a gateway), and a ping to a multi-homed host prefers
+    the NIC that shares a subnet with the source rather than routing round to
+    another one. `dev.ip` remains the primary NIC so every existing map loads
+    unchanged.
 11. ~~**No VLAN database**~~ — FIXED v0.23.0. Named VLANs, VLAN 1 builtin,
     access vs trunk modes, explicit native VLAN, allowed-list pruning, and
     detection of native-VLAN mismatch and ports in undeclared VLANs. VTP still

@@ -3499,7 +3499,7 @@ function netClass(dev) {
   }
   return 'host';
 }
-function isHostDev(dev) { return isPlaced(dev) && dev.ip && netClass(dev) === 'host'; }
+function isHostDev(dev) { return isPlaced(dev) && netClass(dev) === 'host' && hostNics(dev).length > 0; }
 
 //////////////////// Simulation clock ////////////////////
 // Protocol timers are real: a one-day DHCP lease is 86400 seconds, a MAC entry
@@ -3580,10 +3580,13 @@ const DHCP_OPT = { mask: 1, router: 3, dns: 6, hostname: 12, domain: 15,
 // Option 61 for Ethernet is hardware type 01 followed by the MAC. IOS prints it
 // in the Client-ID column of `show ip dhcp binding` grouped in fours, e.g.
 // 0100.5079.6668.f1 — 14 hex digits, so the last group is a pair.
-function dhcpClientId(dev) {
-  const hex = '01' + deviceMac(dev).replace(/:/g, '').toLowerCase();
+function dhcpClientId(dev, port) {
+  const hex = '01' + nicMac(dev, port).replace(/:/g, '').toLowerCase();
   return hex.match(/.{1,4}/g).join('.');
 }
+// Leases are per NIC, not per device — a dual-homed host DHCPs twice, with two
+// MACs, and gets two independent leases on two subnets.
+function leaseKey(devId, port) { return `${devId}:${port}`; }
 
 // Bindings survive topology edits, exactly as a real client keeps its address
 // when you re-cable a switch. They only end at expiry, release, or a NAK.
@@ -3800,15 +3803,16 @@ function poolOptions(pool) {
 // failed — the reason is what the UI shows, so it has to be the real one.
 function dhcpExchange(client, opts = {}) {
   const log = [];
-  const vlan = hostVlan(client);
-  const walk = l2Walk(client, { vlan });
-  const mac = deviceMac(client), cid = dhcpClientId(client);
+  const port = opts.port !== undefined ? opts.port : hostPort(client);
+  const vlan = hostVlan(client, port);
+  const walk = l2Walk(client, { vlan, startPort: port });
+  const mac = nicMac(client, port), cid = dhcpClientId(client, port);
   const say = (msg, dir, detail) => log.push({ client: client.name, msg, dir, detail });
 
   if (!walk.start) {
     return { ok: false, reason: walk.overLength
       ? `${client.name}'s drop cable is over the 100 m channel limit — no link, so no DHCP`
-      : (linkDownReason(client, hostPort(client)) || `${client.name} isn't cabled to anything`), log };
+      : (linkDownReason(client, port) || `${client.name} isn't cabled to anything`), log };
   }
   // Three ways a client asks, and they are genuinely different exchanges:
   //   INIT      full DORA, broadcast, any server may answer
@@ -3860,7 +3864,7 @@ function dhcpExchange(client, opts = {}) {
   const now = simNow();
   const ms = isFinite(secs) ? secs * 1000 : Infinity;
   const binding = {
-    clientId: cid, mac, hostId: client.id, serverId: server.id, poolName: pool.name,
+    clientId: cid, mac, hostId: client.id, hostNic: port, serverId: server.id, poolName: pool.name,
     ip: ipStr(pick.int), ipInt: pick.int, type: pick.type,
     boundAt: now, leaseSecs: secs,
     t1At: now + (isFinite(ms) ? ms * DHCP_T1_FRAC : Infinity),
@@ -3887,7 +3891,7 @@ function dhcpExchange(client, opts = {}) {
 function indexLeases() {
   _dhcpLeases = new Map();
   for (const b of _dhcpBindings.values()) {
-    if (b.state !== 'EXPIRED') _dhcpLeases.set(b.hostId, b);
+    if (b.state !== 'EXPIRED') _dhcpLeases.set(leaseKey(b.hostId, b.hostNic), b);
   }
   return _dhcpLeases;
 }
@@ -3902,7 +3906,7 @@ function dhcpTick() {
       // Lease ran out with no successful renewal. Try a fresh DORA — if a
       // server is still there the client re-leases, otherwise it goes dark.
       _dhcpBindings.delete(key);
-      const again = dhcpExchange(client, { renewals: 0 });
+      const again = dhcpExchange(client, { port: b.hostNic, renewals: 0 });
       if (!again.ok) {
         b.state = 'EXPIRED';
         _dhcpBindings.set(key, b);
@@ -3918,9 +3922,9 @@ function dhcpTick() {
     if (b.state === 'RENEWING' || b.state === 'REBINDING') {
       const r = dhcpExchange(client, {
         mode: b.state, serverId: b.serverId, requested: b.ipInt,
-        renewals: (b.renewals || 0) + 1
+        port: b.hostNic, renewals: (b.renewals || 0) + 1
       });
-      if (!r.ok && r.nak) { _dhcpBindings.delete(key); dhcpExchange(client); }
+      if (!r.ok && r.nak) { _dhcpBindings.delete(key); dhcpExchange(client, { port: b.hostNic }); }
     }
   }
   indexLeases();
@@ -3932,39 +3936,63 @@ function resolveDhcp() {
   dhcpTick();
   _dhcpLog = [];
   const askers = state.devices
-    .filter(d => isPlaced(d) && netClass(d) === 'host' && d.ip === 'dhcp')
+    .filter(d => isPlaced(d) && netClass(d) === 'host')
     .sort((a, b) => a.id - b.id);
   for (const h of askers) {
-    const cid = dhcpClientId(h);
-    let has = null;
-    for (const b of _dhcpBindings.values()) if (b.clientId === cid && b.state !== 'EXPIRED') { has = b; break; }
-    if (has) continue;
-    const r = dhcpExchange(h);
-    _dhcpLog.push({ host: h, ...r });
+    for (const n of hostNics(h)) {
+      if (n.ip !== 'dhcp') continue;
+      const cid = dhcpClientId(h, n.port);
+      let has = null;
+      for (const b of _dhcpBindings.values()) if (b.clientId === cid && b.state !== 'EXPIRED') { has = b; break; }
+      if (has) continue;
+      const r = dhcpExchange(h, { port: n.port });
+      _dhcpLog.push({ host: h, nic: n.port, ...r });
+    }
   }
   return indexLeases();
 }
 // `clear ip dhcp binding *`
 function dhcpClearBindings() { _dhcpBindings.clear(); _dhcpLeases = new Map(); }
 // A client giving the address back before the lease is up.
-function dhcpRelease(hostId) {
-  for (const [k, b] of [..._dhcpBindings]) if (b.hostId === hostId) _dhcpBindings.delete(k);
-  _dhcpLeases.delete(hostId);
+function dhcpRelease(hostId, port) {
+  for (const [k, b] of [..._dhcpBindings]) {
+    if (b.hostId === hostId && (port === undefined || b.hostNic === port)) _dhcpBindings.delete(k);
+  }
+  indexLeases();
 }
 
-function hostIp(dev) {
-  if (dev.ip === 'dhcp') { const l = _dhcpLeases.get(dev.id); return l ? parseIp(`${l.ip}/${parseIp(l.subnet).cidr}`) : null; }
-  return parseIp(dev.ip);
+// A specific NIC's address. Leases are keyed per NIC because each NIC DHCPs
+// separately with its own MAC — a dual-homed host really does get two leases.
+function nicIp(dev, port) {
+  const nics = hostNics(dev);
+  const n = port === undefined ? nics[0] : nics.find(x => x.port === port);
+  if (!n) return null;
+  if (n.ip === 'dhcp') {
+    const l = _dhcpLeases.get(leaseKey(dev.id, n.port));
+    return l ? parseIp(`${l.ip}/${parseIp(l.subnet).cidr}`) : null;
+  }
+  return parseIp(n.ip);
 }
+function hostIp(dev, port) { return nicIp(dev, port === undefined ? hostPort(dev) : port); }
 // display string for a host's address, resolving a lease
+function nicAddr(dev, port) {
+  const n = hostNics(dev).find(x => x.port === port);
+  if (!n) return '—';
+  if (n.ip === 'dhcp') {
+    const l = _dhcpLeases.get(leaseKey(dev.id, port));
+    return l ? `${l.ip} (DHCP)` : 'dhcp (no lease)';
+  }
+  return n.ip || '—';
+}
 function hostAddr(dev) {
-  if (dev.ip === 'dhcp') { const l = _dhcpLeases.get(dev.id); return l ? `${l.ip} (DHCP)` : 'dhcp (no lease)'; }
-  return dev.ip || '—';
+  const nics = hostNics(dev);
+  if (nics.length > 1) return nics.map(n => nicAddr(dev, n.port)).join(' / ');
+  return nics.length ? nicAddr(dev, nics[0].port) : (dev.ip || '—');
 }
 // The gateway a DHCP client was told to use (option 3) — a leased host has no
 // business inventing one, and a wrong option 3 is a real and common fault.
-function dhcpGateway(dev) {
-  const l = _dhcpLeases.get(dev.id);
+function dhcpGateway(dev, port) {
+  const l = _dhcpLeases.get(leaseKey(dev.id, port === undefined ? hostPort(dev) : port));
   return l && l.options ? l.options[DHCP_OPT.router] || null : null;
 }
 
@@ -4007,8 +4035,9 @@ function deviceInterfaces(dev) {
 // The gateway serving a host: a router reachable at L2 that actually holds an
 // address inside the host's subnet. Returns { id, iface } or a reason it fails,
 // so the verdict can name the real problem instead of "no route".
-function gatewayForHost(host, walk, hostIpParsed) {
-  const vlan = hostVlan(host);
+function gatewayForHost(host, walk, hostIpParsed, port) {
+  const nicPort = port === undefined ? hostPort(host) : port;
+  const vlan = hostVlan(host, nicPort);
   const candidates = [];
   for (const rid of walk.routers.keys()) {
     const r = deviceById(rid);
@@ -4020,8 +4049,9 @@ function gatewayForHost(host, walk, hostIpParsed) {
   // or stale gateway address is one of the most common real faults. For a DHCP
   // client the gateway is whatever option 3 said, not a guess: if the scope
   // hands out the wrong router, the client really is broken and must say so.
-  const viaDhcp = host.ip === 'dhcp' ? dhcpGateway(host) : null;
-  const declared = viaDhcp || host.gateway;
+  const nic = hostNics(host).find(n => n.port === nicPort) || {};
+  const viaDhcp = nic.ip === 'dhcp' ? dhcpGateway(host, nicPort) : null;
+  const declared = viaDhcp || nic.gateway || host.gateway;
   if (declared) {
     const src = viaDhcp ? `DHCP option 3` : `default gateway`;
     const want = parseIp(declared);
@@ -4061,6 +4091,55 @@ function hostPort(dev) {
   }
   return 1;
 }
+
+// ---- Host NICs ----
+// A host is not one address on one port. A server has a data NIC and a
+// management NIC; a workstation may be on wired and wireless at once; a
+// firewall host has an inside and an outside leg. Each NIC has its own port,
+// address, gateway and MAC, and lands in whatever VLAN its switch port is in.
+//
+// `dev.ip` remains the primary NIC's address so every existing map still loads
+// and every single-homed device keeps working untouched.
+function hostNics(dev) {
+  const def = DEVICE_TYPES[dev.type] || {};
+  const cfg = dev.nics || {};
+  const primary = hostPort(dev);
+  const out = [];
+  for (let p = 1; p <= (def.ports || 1); p++) {
+    if (portRole(def, p) === 'PWR') continue;
+    if (cfg[p]) {
+      out.push({ port: p, ip: cfg[p].ip, gateway: cfg[p].gateway,
+        label: cfg[p].label || `NIC${out.length + 1}`, primary: p === primary });
+    } else if (p === primary && dev.ip) {
+      out.push({ port: p, ip: dev.ip, gateway: dev.gateway, label: 'NIC1', primary: true });
+    }
+  }
+  return out;
+}
+// Each NIC has its own MAC. The primary keeps the device MAC so bridge IDs,
+// existing DHCP bindings and MAC tables are unchanged.
+function nicMac(dev, port) {
+  if (port === undefined || port === hostPort(dev)) return deviceMac(dev);
+  const id = dev.id >>> 0;
+  return [0x02, port & 0xff, (id >>> 24) & 0xff, (id >>> 16) & 0xff, (id >>> 8) & 0xff, id & 0xff]
+    .map(v => v.toString(16).padStart(2, '0').toUpperCase()).join(':');
+}
+// The NIC a host sends from, chosen the way a host routing table chooses:
+// a NIC whose own subnet contains the destination wins (connected route),
+// otherwise the first NIC with a default gateway.
+function hostEgressNic(dev, dstInt) {
+  const nics = hostNics(dev);
+  if (!nics.length) return null;
+  for (const n of nics) {
+    const ip = nicIp(dev, n.port);
+    if (ip && dstInt !== undefined && ipInSubnet(dstInt, ip)) return n;
+  }
+  for (const n of nics) {
+    const gw = n.gateway || (n.ip === 'dhcp' ? dhcpGateway(dev, n.port) : null);
+    if (gw && nicIp(dev, n.port)) return n;
+  }
+  return nics.find(n => nicIp(dev, n.port)) || nics[0];
+}
 // The VLAN an untagged host on this port lands in — its access VLAN, or the
 // trunk's native VLAN if someone plugged a host into a trunk port.
 function accessVlanOf(dev, port) { return nativeVlanOf(dev, port); }
@@ -4090,9 +4169,10 @@ function hopThroughPatches(dev, port, side) {
 }
 
 // The VLAN a host lives in = the access VLAN of the switch/router port it lands on.
-function hostVlan(dev) {
-  const n = hopThroughPatches(dev, hostPort(dev), FRONT);
-  return n ? accessVlanOf(n.dev, n.port) : accessVlanOf(dev, hostPort(dev));
+function hostVlan(dev, port) {
+  const p = port === undefined ? hostPort(dev) : port;
+  const n = hopThroughPatches(dev, p, FRONT);
+  return n ? accessVlanOf(n.dev, n.port) : accessVlanOf(dev, p);
 }
 
 // Breadth-first walk of the layer-2 domain from a host's data jack. Honors VLAN
@@ -5125,16 +5205,16 @@ function stpVlans() {
 }
 
 // Layer-2 reachable? Plus the reason it isn't, discovered by relaxing rules.
-function l2Reachable(a, b) {
-  const v = hostVlan(a);
-  const strict = l2Walk(a, { vlan: v });
+function l2Reachable(a, b, srcPort, dstPort) {
+  const v = hostVlan(a, srcPort);
+  const strict = l2Walk(a, { vlan: v, startPort: srcPort });
   if (strict.hosts.has(b.id)) return { ok: true, routers: strict.routers };
   // relax length: a too-long copper run is the only thing stopping it?
-  if (l2Walk(a, { vlan: v, ignoreLength: true }).hosts.has(b.id))
+  if (l2Walk(a, { vlan: v, startPort: srcPort, ignoreLength: true }).hosts.has(b.id))
     return { ok: false, reason: `a cable on the path exceeds the ${COPPER_LIMIT_FT} ft copper limit`, routers: strict.routers };
   // relax VLAN: physically connected but on a different VLAN / trunk gap
-  if (l2Walk(a, { ignoreVlan: true, ignoreLength: true }).hosts.has(b.id))
-    return { ok: false, reason: `VLAN mismatch — ${a.name} is on VLAN ${v}, ${b.name} is on VLAN ${hostVlan(b)} (or a trunk between them doesn't carry it)`, routers: strict.routers };
+  if (l2Walk(a, { startPort: srcPort, ignoreVlan: true, ignoreLength: true }).hosts.has(b.id))
+    return { ok: false, reason: `VLAN mismatch — ${a.name} is on VLAN ${v}, ${b.name} is on VLAN ${hostVlan(b, dstPort)} (or a trunk between them doesn't carry it)`, routers: strict.routers };
   return { ok: false, reason: 'no physical cable path between them', routers: strict.routers };
 }
 
@@ -5144,7 +5224,8 @@ function l2Reachable(a, b) {
 // exhausted scope and a dead relay are all different faults with different
 // fixes, and the engine already knows which one happened.
 function noAddressReason(d) {
-  if (d.ip !== 'dhcp') return `${d.name} has no valid IP`;
+  const nics = hostNics(d);
+  if (!nics.some(n => n.ip === 'dhcp')) return `${d.name} has no valid IP`;
   for (const b of _dhcpBindings.values()) {
     if (b.hostId === d.id && b.state === 'EXPIRED') {
       return `${d.name}'s DHCP lease expired and could not be renewed — it has stopped using ${b.ip}`;
@@ -5152,7 +5233,7 @@ function noAddressReason(d) {
   }
   const logged = _dhcpLog.find(l => l.host && l.host.id === d.id && !l.ok);
   if (logged) return `${d.name} has no DHCP lease — ${logged.reason}`;
-  const r = dhcpExchange(d);
+  const r = dhcpExchange(d, { port: hostPort(d) });
   return r.ok ? `${d.name} has no valid IP` : `${d.name} has no DHCP lease — ${r.reason}`;
 }
 
@@ -5160,16 +5241,43 @@ function noAddressReason(d) {
 // path is identical — only the packet the ACLs see changes, which is exactly
 // the difference between "can these two reach each other" and "can this host
 // reach that server on 443".
-function pingHosts(aId, bId, pkt) {
+function pingHosts(aId, bId, pkt, opts = {}) {
   const a = deviceById(aId), b = deviceById(bId);
   if (!a || !b) return { ok: false, reason: 'device not found' };
   if (a.id === b.id) return { ok: true, mode: 'self', hops: [a.id], detail: 'loopback' };
-  const ipA = hostIp(a), ipB = hostIp(b);
-  if (!ipA) return { ok: false, reason: noAddressReason(a) };
+  // A multi-homed host has several addresses and several ways out. Try each
+  // destination NIC, choosing the source NIC the way a host routing table
+  // would, and report success if any pair works — which is what actually
+  // happens when you ping a dual-homed server by either of its names.
+  let bNics = hostNics(b).filter(n => nicIp(b, n.port));
+  if (!opts.nicPair && bNics.length > 1) {
+    // Try the destination NIC a real ping would land on first: one sharing a
+    // subnet with any of the source's own NICs. Plain port order made an admin
+    // on the management VLAN reach a dual-homed server by routing all the way
+    // round to its data NIC, when the two are sitting on the same wire.
+    const srcIps = hostNics(a).map(n => nicIp(a, n.port)).filter(Boolean);
+    bNics = bNics.slice().sort((x, y) => {
+      const near = n => srcIps.some(si => sameSubnet(si, nicIp(b, n.port))) ? 0 : 1;
+      return near(x) - near(y);
+    });
+    let first = null;
+    for (const nb of bNics) {
+      const r = pingHosts(aId, bId, pkt, { nicPair: { dst: nb.port } });
+      if (r.ok) return r;
+      if (!first) first = r;
+    }
+    return first || { ok: false, reason: noAddressReason(b) };
+  }
+  const dstPort = opts.nicPair ? opts.nicPair.dst : (bNics[0] ? bNics[0].port : hostPort(b));
+  const ipB = nicIp(b, dstPort);
   if (!ipB) return { ok: false, reason: noAddressReason(b) };
+  const srcNic = hostEgressNic(a, ipB.int) || { port: hostPort(a) };
+  const srcPort = srcNic.port;
+  const ipA = nicIp(a, srcPort);
+  if (!ipA) return { ok: false, reason: noAddressReason(a) };
 
   if (sameSubnet(ipA, ipB)) {
-    const l2 = l2Reachable(a, b);
+    const l2 = l2Reachable(a, b, srcPort, dstPort);
     return l2.ok
       ? { ok: true, mode: 'l2', subnet: subnetLabel(ipA), hops: [a.id, b.id], detail: `same subnet ${subnetLabel(ipA)} — ARP resolves directly` }
       : { ok: false, mode: 'l2', reason: `same subnet, but ${l2.reason}` };
@@ -5179,11 +5287,11 @@ function pingHosts(aId, bId, pkt) {
   // an address in that host's subnet, and the two gateways must be able to
   // reach each other. A router merely sitting on the segment is not a gateway.
   const mkPkt = (s, d) => pkt ? { ...icmpEchoPacket(s, d), ...pkt, srcInt: s, dstInt: d } : icmpEchoPacket(s, d);
-  const l2A = l2Walk(a, { vlan: hostVlan(a) });
-  const l2B = l2Walk(b, { vlan: hostVlan(b) });
-  const gwA = gatewayForHost(a, l2A, ipA);
+  const l2A = l2Walk(a, { vlan: hostVlan(a, srcPort), startPort: srcPort });
+  const l2B = l2Walk(b, { vlan: hostVlan(b, dstPort), startPort: dstPort });
+  const gwA = gatewayForHost(a, l2A, ipA, srcPort);
   if (gwA.error) return { ok: false, mode: 'l3', reason: gwA.error };
-  const gwB = gatewayForHost(b, l2B, ipB);
+  const gwB = gatewayForHost(b, l2B, ipB, dstPort);
   if (gwB.error) return { ok: false, mode: 'l3', reason: gwB.error };
 
   const ifOf = (walk, rid) => { const j = walk.routers.get(rid); return j ? j.port : null; };
@@ -6772,6 +6880,74 @@ function wireNatProps(dev) {
   };
 }
 
+// Multi-NIC editor. A single-homed device shows the plain IP field it always
+// had; adding a NIC switches to the per-port list, because that is the moment
+// "the device's address" stops being a meaningful idea.
+function nicPropsHtml(dev) {
+  if (netClass(dev) !== 'host') return '';
+  const def = DEVICE_TYPES[dev.type] || {};
+  const dataPorts = [];
+  for (let p = 1; p <= (def.ports || 1); p++) if (portRole(def, p) !== 'PWR') dataPorts.push(p);
+  if (dataPorts.length < 2) return '';
+  const nics = hostNics(dev);
+  const rows = nics.map(n =>
+    `<div class="row" data-nic="${n.port}">
+       <input type="text" class="nc-label" style="width:64px" value="${esc(n.label || '')}" placeholder="label">
+       <select class="nc-port" style="width:52px">${dataPorts.map(p =>
+         `<option value="${p}" ${p === n.port ? 'selected' : ''}>p${p}</option>`).join('')}</select>
+       <input type="text" class="nc-ip" style="width:104px" value="${esc(n.ip || '')}" placeholder="ip or dhcp">
+       <input type="text" class="nc-gw" style="width:96px" value="${esc(n.gateway || '')}" placeholder="gateway">
+       <button class="nc-del" title="Remove NIC">\u00d7</button></div>
+     <p class="cbl-edit-hint" style="margin:0 0 4px">${esc(nicAddr(dev, n.port))} \u00b7 VLAN ${hostVlan(dev, n.port)} \u00b7 ${nicMac(dev, n.port)}</p>`).join('');
+  return `
+    <div class="row" style="margin-top:10px"><span class="k">NICs</span></div>${rows}
+    <button id="nc-add" style="font-size:11px">+ NIC</button>`;
+}
+function wireNicProps(dev) {
+  const root = propsBody;
+  const save = () => {
+    const nics = {};
+    for (const el of root.querySelectorAll('[data-nic]')) {
+      const v = c => (el.querySelector('.' + c) || {}).value;
+      const port = +v('nc-port');
+      if (!port) continue;
+      nics[port] = { ip: (v('nc-ip') || '').trim(), gateway: (v('nc-gw') || '').trim(), label: (v('nc-label') || '').trim() };
+    }
+    dev.nics = nics;
+    // dev.ip stays the primary NIC's address so saves and single-homed code paths
+    // keep working unchanged.
+    const primary = nics[hostPort(dev)];
+    if (primary) { dev.ip = primary.ip; dev.gateway = primary.gateway; }
+    flushL2Tables(); dhcpClearBindings(); resolveDhcp();
+    showDeviceProps(dev.id);
+  };
+  for (const el of root.querySelectorAll('.nc-ip,.nc-gw,.nc-label,.nc-port')) el.onchange = save;
+  const add = document.getElementById('nc-add');
+  if (add) add.onclick = () => {
+    const def = DEVICE_TYPES[dev.type] || {};
+    const used = new Set(hostNics(dev).map(n => n.port));
+    let free = null;
+    for (let p = 1; p <= (def.ports || 1); p++) {
+      if (portRole(def, p) !== 'PWR' && !used.has(p)) { free = p; break; }
+    }
+    if (free === null) return;
+    const cur = {};
+    for (const n of hostNics(dev)) cur[n.port] = { ip: n.ip, gateway: n.gateway, label: n.label };
+    cur[free] = { ip: '', gateway: '', label: `NIC${Object.keys(cur).length + 1}` };
+    dev.nics = cur;
+    showDeviceProps(dev.id);
+  };
+  for (const b of root.querySelectorAll('.nc-del')) b.onclick = e => {
+    const port = +e.target.closest('[data-nic]').dataset.nic;
+    const cur = {};
+    for (const n of hostNics(dev)) if (n.port !== port) cur[n.port] = { ip: n.ip, gateway: n.gateway, label: n.label };
+    dev.nics = cur;
+    dhcpRelease(dev.id, port);
+    flushL2Tables(); resolveDhcp();
+    showDeviceProps(dev.id);
+  };
+}
+
 function wireAclProps(dev) {
   const ta = document.getElementById('dev-acl');
   if (!ta) return;
@@ -7016,6 +7192,7 @@ function showDeviceProps(id) {
     <input type="text" id="dev-notes" placeholder="VLAN, location, model…" value="${dev.notes || ''}">
     ${dhcpPropsHtml(dev)}
     ${circuitPropsHtml(dev)}
+    ${nicPropsHtml(dev)}
     ${routePropsHtml(dev)}
     ${natPropsHtml(dev)}
     ${aclPropsHtml(dev)}
@@ -7032,6 +7209,7 @@ function showDeviceProps(id) {
   document.getElementById('dev-notes').onchange = e => { dev.notes = e.target.value.trim(); };
   wireDhcpProps(dev);
   wireCircuitProps(dev);
+  wireNicProps(dev);
   wireRouteProps(dev);
   wireNatProps(dev);
   wireAclProps(dev);
