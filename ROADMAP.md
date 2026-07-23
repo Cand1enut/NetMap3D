@@ -507,13 +507,15 @@ Owner, repeatedly and emphatically: the Packet Tracer functionality must be 1:1.
 Everything in the UX/pricing/export/cloud sections above SERVES this; none of it
 outranks it. If a session has to choose, protocol fidelity wins.
 
-**STATUS: the PDU engine landed in v0.31.0.** A real frame now walks the network
-hop by hop with layered headers read from device state, every device decision
-recorded with the table entry that drove it, and step forward/back through the
-trace. Still to do for full parity: realtime mode alongside step mode, a
-protocol filter, PDU animation along the 3D cables, and return-path/reply
-simulation. Original gap statement kept below because it is what the work was
-measured against.
+**STATUS: the PDU engine landed in v0.31.0 and completed in v0.32.0.** A real
+frame walks the network hop by hop with layered headers read from device state;
+every device decision is recorded with the table entry that drove it; the trace
+steps forward and back or plays in realtime; a marker follows the packet through
+the 3D scene; a protocol filter narrows the view; and a ping is a genuine
+request AND reply, so a blocked or unroutable return path fails the ping and
+says exactly where. Remaining for parity: DNS, HTTP, the TCP three-way handshake
+and teardown, EtherChannel/LACP, IPv6, VTP. Original gap statement kept below
+because it is what the work was measured against.
 
 **The honest gap, stated plainly: NetMap3D has a verdict engine, not a packet
 engine.** `pingHosts()` answers "can A reach B, and if not, why" by walking the

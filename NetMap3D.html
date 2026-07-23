@@ -14974,60 +14974,135 @@ function runAcl() {
 document.getElementById('sim-acl').onclick = runAcl;
 
 
+
+// A ping is a request AND a reply. Simulating only the outbound leg is exactly
+// the asymmetry bug that pingHosts had before v0.26.0 — an ACL or a missing
+// return route can let the request through and strand the answer, and that is
+// one of the most common real faults there is. So a ping is two PDU walks, and
+// the reply is sent from whichever NIC received the request.
+function pduPing(srcDev, dstDev, spec = {}) {
+  const dstNic = hostNics(dstDev).find(n => nicIp(dstDev, n.port));
+  if (!dstNic) return { request: null, reply: null, ok: false, why: noAddressReason(dstDev) };
+  const dstIp = nicIp(dstDev, dstNic.port);
+  const request = pduSend(srcDev, dstIp.int, { ...spec, label: 'echo request' });
+  if (!request.delivered) {
+    return { request, reply: null, ok: false, why: request.dropped ? request.dropped.why : 'request never arrived' };
+  }
+  // The reply's source is the address the request was sent to, and it goes back
+  // to the request's source address — not necessarily by the same path.
+  const srcNic = hostEgressNic(srcDev, dstIp.int);
+  const backTo = nicIp(srcDev, srcNic.port);
+  const reply = pduSend(dstDev, backTo.int, {
+    ...spec, icmpType: spec.proto && spec.proto !== 'icmp' ? null : 'echo-reply',
+    flags: spec.proto === 'tcp' ? 'SYN,ACK' : undefined, label: 'echo reply' });
+  return { request, reply, ok: !!reply.delivered,
+    why: reply.delivered ? null
+      : `the request arrived but the reply could not get back — ${reply.dropped ? reply.dropped.why : 'unknown'}` };
+}
+
+// ---- PDU animation in 3D ----
+// The trace is a list of device decisions; this turns it into a marker that
+// travels the actual cables between those devices, so watching it and reading
+// the trace are the same thing.
+let _pduMarker = null, _pduAnim = null;
+function pduClearMarker() {
+  if (_pduMarker) { scene.remove(_pduMarker); _pduMarker.geometry.dispose(); _pduMarker.material.dispose(); _pduMarker = null; }
+  _pduAnim = null;
+}
+function pduShowAt(trace, idx) {
+  if (!trace || !trace.length) return;
+  const t = trace[Math.max(0, Math.min(trace.length - 1, idx))];
+  const g = deviceGroups.get(t.devId);
+  if (!g) return;
+  g.updateMatrixWorld(true);
+  const pos = g.getWorldPosition(new THREE.Vector3());
+  if (!_pduMarker) {
+    _pduMarker = new THREE.Mesh(new THREE.SphereGeometry(1.6, 16, 16),
+      new THREE.MeshBasicMaterial({ color: 0xffd23e, transparent: true, opacity: 0.9 }));
+    _pduMarker.renderOrder = 999;
+    scene.add(_pduMarker);
+  }
+  const col = t.action === 'drop' ? 0xff453a : (t.action === 'deliver' ? 0x30d158 : 0xffd23e);
+  _pduMarker.material.color.setHex(col);
+  _pduMarker.position.copy(pos).add(new THREE.Vector3(0, 3, 0));
+}
+// Realtime mode: play the trace at a watchable pace instead of stepping it.
+function pduPlay(trace, onStep) {
+  pduStop();
+  let i = 0;
+  _pduAnim = setInterval(() => {
+    i++;
+    if (i > trace.length) { pduStop(); return; }
+    pduShowAt(trace, i - 1);
+    if (onStep) onStep(i);
+  }, 700);
+}
+function pduStop() { if (_pduAnim) { clearInterval(_pduAnim); _pduAnim = null; } }
+
 // The Packet panel: send one PDU and step through every device decision it
 // causes. This is the observable half of the simulation — everything else
 // answers "does it work", this answers "what exactly happened".
-let _pduCur = null, _pduAt = 0;
+let _pduCur = null, _pduAt = 0, _pduLeg = 'request', _pduFilter = 'all';
 function runPdu() {
   const hosts = state.devices.filter(d => isPlaced(d) && netClass(d) === 'host' && hostNics(d).length);
   if (hosts.length < 2) { aiPrint('<p>Place at least two addressed hosts to send a packet between.</p>'); return; }
   const opts = hosts.map(h => `<option value="${h.id}">${esc(h.name)}</option>`).join('');
-  const sel = (id, def) => `<select id="${id}" style="width:104px">${opts}</select>`;
-  let html = `<div class="row" style="gap:4px;flex-wrap:wrap">
-      ${sel('pdu-a')}<span class="sim-arrow">→</span>${sel('pdu-b')}
-      <select id="pdu-proto" style="width:60px">
+  aiPrint(`<div class="row" style="gap:4px;flex-wrap:wrap">
+      <select id="pdu-a" style="width:100px">${opts}</select><span class="sim-arrow">→</span>
+      <select id="pdu-b" style="width:100px">${opts}</select>
+      <select id="pdu-proto" style="width:58px">
         <option value="icmp">icmp</option><option value="tcp">tcp</option><option value="udp">udp</option></select>
-      <input type="text" id="pdu-port" style="width:64px" placeholder="port">
+      <input type="text" id="pdu-port" style="width:60px" placeholder="port">
       <button id="pdu-send">Send</button></div>
-    <div id="pdu-out"></div>`;
-  aiPrint(html);
+    <div id="pdu-out"></div>`);
   const a = document.getElementById('pdu-a'), b = document.getElementById('pdu-b');
   a.value = hosts[0].id; b.value = hosts[1].id;
   document.getElementById('pdu-send').onclick = () => {
-    flushL2Tables();
+    flushL2Tables(); pduStop();
     const src = deviceById(+a.value), dst = deviceById(+b.value);
     const proto = document.getElementById('pdu-proto').value;
     const raw = (document.getElementById('pdu-port').value || '').trim();
-    const dstNic = hostNics(dst).find(n => nicIp(dst, n.port));
-    if (!dstNic) { document.getElementById('pdu-out').innerHTML = `<p class="ai-bad">${esc(dst.name)} has no address.</p>`; return; }
     const spec = proto === 'icmp' ? { proto: 'icmp', icmpType: 'echo' }
-      : { proto, srcPort: 49152, dstPort: raw ? (aclPortNum(raw, proto) || +raw || 80) : 80, flags: proto === 'tcp' ? 'SYN' : null };
-    _pduCur = pduSend(src, nicIp(dst, dstNic.port).int, spec);
-    _pduAt = _pduCur.trace.length;
+      : { proto, srcPort: 49152, dstPort: raw ? (aclPortNum(raw, proto) || +raw || 80) : 80,
+          flags: proto === 'tcp' ? 'SYN' : null };
+    _pduCur = pduPing(src, dst, spec);
+    _pduLeg = 'request';
+    _pduAt = _pduCur.request ? _pduCur.request.trace.length : 0;
     drawPduTrace();
   };
+}
+function pduLegSim() {
+  if (!_pduCur) return null;
+  return _pduLeg === 'reply' ? _pduCur.reply : _pduCur.request;
 }
 function drawPduTrace() {
   const out = document.getElementById('pdu-out');
   if (!out || !_pduCur) return;
-  const sim = _pduCur;
-  const shown = sim.trace.slice(0, _pduAt);
-  const icon = { arp: 'ARP', send: 'TX', switch: 'SW', route: 'RT', deliver: 'OK', drop: 'X' };
-  let html = `<div class="row" style="gap:6px;margin:8px 0;flex-wrap:wrap">
-      <button id="pdu-back">← Step back</button>
-      <button id="pdu-fwd">Step →</button>
-      <button id="pdu-all">Play all</button>
-      <span class="ai-meta">${_pduAt} / ${sim.trace.length}</span></div>`;
+  const sim = pduLegSim();
+  if (!sim) { out.innerHTML = `<p class="ai-bad">${esc(_pduCur.why || 'no packet')}</p>`; return; }
+  const full = sim.trace;
+  const shown = full.slice(0, _pduAt);
+  const visible = _pduFilter === 'all' ? shown : shown.filter(t => t.pdu && t.pdu.proto === _pduFilter);
+  let html = `<div class="row" style="gap:4px;margin:8px 0;flex-wrap:wrap">
+      <button id="pdu-leg-req" class="${_pduLeg === 'request' ? 'active' : ''}">Request</button>
+      <button id="pdu-leg-rep" class="${_pduLeg === 'reply' ? 'active' : ''}" ${_pduCur.reply ? '' : 'disabled'}>Reply</button>
+      <select id="pdu-filter" style="width:74px">
+        ${['all', 'arp', 'icmp', 'tcp', 'udp'].map(f => `<option value="${f}" ${_pduFilter === f ? 'selected' : ''}>${f}</option>`).join('')}
+      </select></div>
+    <div class="row" style="gap:4px;margin-bottom:6px;flex-wrap:wrap">
+      <button id="pdu-back">← Back</button><button id="pdu-fwd">Step →</button>
+      <button id="pdu-play">Play</button><button id="pdu-stop">Stop</button>
+      <button id="pdu-all">End</button>
+      <span class="ai-meta">${_pduAt} / ${full.length}</span></div>`;
   html += `<table class="sim-table"><tr><th>#</th><th>Device</th><th>If</th><th>Action</th><th>What happened</th></tr>`;
-  shown.forEach((t, i) => {
+  visible.forEach((t) => {
     const d = deviceById(t.devId);
     const cls = t.action === 'drop' ? 'ai-bad' : (t.action === 'deliver' ? 'ai-good' : '');
-    html += `<tr><td>${i + 1}</td><td>${esc(d ? d.name : '?')}</td><td>${t.egress ? `${t.iface}→${t.egress}` : t.iface}</td>` +
+    html += `<tr><td>${full.indexOf(t) + 1}</td><td>${esc(d ? d.name : '?')}</td>` +
+      `<td>${t.egress ? `${t.iface}→${t.egress}` : t.iface}</td>` +
       `<td class="${cls}">${t.action}</td><td>${esc(t.why)}</td></tr>`;
   });
   html += '</table>';
-  // The headers of the PDU as it stood at the current step — this is the
-  // "open the packet" view, and every field is read from the model.
   const cur = shown[shown.length - 1];
   if (cur) {
     const p = cur.pdu;
@@ -15042,19 +15117,35 @@ function drawPduTrace() {
       `<br>target ${p.arp.targetMac} ${ipStr(p.arp.targetIp)}</td></tr>`;
     html += '</table>';
   }
-  if (_pduAt === sim.trace.length) {
+  if (_pduAt === full.length) {
     html += sim.delivered
-      ? `<p class="ai-good">Delivered in ${sim.trace.length} step${sim.trace.length === 1 ? '' : 's'}.</p>`
+      ? `<p class="ai-good">${_pduLeg === 'reply' ? 'Reply' : 'Request'} delivered in ${full.length} steps.</p>`
       : `<p class="ai-bad">Dropped — ${esc(sim.dropped ? sim.dropped.why : 'unknown')}</p>`;
+    // The round trip is the real verdict: a request that arrives and a reply
+    // that cannot get home is a failed ping, and says so.
+    if (_pduLeg === 'request' && _pduCur.request && _pduCur.request.delivered) {
+      html += _pduCur.ok
+        ? `<p class="ai-good">Round trip complete — switch to Reply to watch the answer come back.</p>`
+        : `<p class="ai-bad">${esc(_pduCur.why || 'the reply did not get back')}</p>`;
+    }
   }
   out.innerHTML = html;
   const bind = (id, fn) => { const el = document.getElementById(id); if (el) el.onclick = () => { fn(); drawPduTrace(); }; };
-  bind('pdu-back', () => { _pduAt = Math.max(1, _pduAt - 1); });
-  bind('pdu-fwd', () => { _pduAt = Math.min(sim.trace.length, _pduAt + 1); });
-  bind('pdu-all', () => { _pduAt = sim.trace.length; });
-  // Light the path in 3D so the trace and the model agree visually.
-  const ids = shown.map(t => t.devId);
-  if (typeof showPingPath === 'function') { try { showPingPath(ids); } catch (e) {} }
+  bind('pdu-back', () => { pduStop(); _pduAt = Math.max(1, _pduAt - 1); });
+  bind('pdu-fwd', () => { pduStop(); _pduAt = Math.min(full.length, _pduAt + 1); });
+  bind('pdu-all', () => { pduStop(); _pduAt = full.length; });
+  bind('pdu-stop', () => pduStop());
+  bind('pdu-leg-req', () => { pduStop(); _pduLeg = 'request'; _pduAt = _pduCur.request.trace.length; });
+  bind('pdu-leg-rep', () => { pduStop(); if (_pduCur.reply) { _pduLeg = 'reply'; _pduAt = _pduCur.reply.trace.length; } });
+  const f = document.getElementById('pdu-filter');
+  if (f) f.onchange = () => { _pduFilter = f.value; drawPduTrace(); };
+  const play = document.getElementById('pdu-play');
+  if (play) play.onclick = () => {
+    _pduAt = 0;
+    pduPlay(full, (i) => { _pduAt = i; drawPduTrace(); });
+  };
+  pduShowAt(full, _pduAt - 1);
+  showPingPath(shown.map(t => t.devId));
 }
 const pduBtn = document.getElementById('sim-pdu');
 if (pduBtn) pduBtn.onclick = runPdu;
