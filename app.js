@@ -7867,7 +7867,7 @@ function showDeviceProps(id) {
     ${aclPropsHtml(dev)}
     ${l2TablesHtml(dev)}
     ${!isPlaced(dev) ? '<button id="dev-place">Place in 3D map</button>' : ''}
-    ${(netClass(dev) === 'switch' || netClass(dev) === 'router') ? `<button id="dev-console">${isUnifiController(dev) ? 'Open UniFi Network' : (/UniFi/.test((DEVICE_TYPES[dev.type]||{}).cat||'') ? 'Manage in UniFi' : 'Open console (CLI)')}</button>` : ''}
+    ${(netClass(dev) === 'switch' || netClass(dev) === 'router') ? `<button id="dev-console">${isMerakiDevice(dev) ? 'Open Meraki Dashboard' : isUnifiController(dev) ? 'Open UniFi Network' : (/UniFi/.test((DEVICE_TYPES[dev.type]||{}).cat||'') ? 'Manage in UniFi' : 'Open console (CLI)')}</button>` : ''}
     ${netClass(dev) === 'host' ? `<div class="row" style="margin-top:8px"><span class="k">OS</span>
       <select id="dev-os"><option value="windows" ${hostOs(dev)==='windows'?'selected':''}>Windows</option>
         <option value="macos" ${hostOs(dev)==='macos'?'selected':''}>macOS</option>
@@ -7907,7 +7907,10 @@ function showDeviceProps(id) {
     // Cloud-managed gear opens its GUI; everything else opens the CLI. A UniFi
     // switch or AP has no CLI of its own — it is managed from the controller, so
     // it opens the controller's console rather than a fake terminal.
-    if (/UniFi/.test((DEVICE_TYPES[dev.type] || {}).cat || '')) {
+    // Meraki is cloud-managed via the Dashboard; UniFi via its controller; a
+    // Cisco/generic box has its own IOS CLI. Route to the right one.
+    if (isMerakiDevice(dev)) openMeraki(dev);
+    else if (/UniFi/.test((DEVICE_TYPES[dev.type] || {}).cat || '')) {
       const ctrl = isUnifiController(dev) ? dev : (unifiDevices().find(isUnifiController) || dev);
       openUnifi(ctrl);
     } else openConsole(dev);
@@ -8468,6 +8471,277 @@ function updatePulses(dt) {
 }
 
 
+
+
+//////////////////// Meraki Dashboard console ////////////////////
+// Meraki is cloud-managed through the Dashboard, organised by product line
+// (Security & SD-WAN for MX, Switch for MS, Wireless for MR), not a CLI. This is
+// that Dashboard, and — like the UniFi console and the IOS terminal — every
+// control writes the same model the 3D view and the simulation read. Addressing
+// & VLANs on the MX writes the gateway's VLAN database, SVIs and DHCP; the
+// Switch ports page writes an MS switch's port config; SSIDs map to VLANs.
+function isMerakiDevice(dev) {
+  const def = DEVICE_TYPES[dev.type] || {};
+  return /Meraki/i.test(def.label || '');
+}
+function merakiDevices() { return state.devices.filter(d => isPlaced(d) && isMerakiDevice(d)); }
+function merakiRole(dev) {
+  const l = (DEVICE_TYPES[dev.type] || {}).label || '';
+  if (/MX/.test(l)) return 'appliance';       // security appliance = L3 gateway
+  if (/MS/.test(l)) return 'switch';
+  if (/MR|CW/.test(l)) return 'wireless';
+  if (/MV/.test(l)) return 'camera';
+  return 'other';
+}
+// The MX is the org's L3 anchor (VLANs/DHCP live there), the way the UniFi
+// gateway is. Fall back to the console device if there is no MX.
+function merakiAppliance() {
+  return merakiDevices().find(d => merakiRole(d) === 'appliance') || (_mk && _mk.dev);
+}
+
+let _mk = null;
+function openMeraki(dev) {
+  _mk = { dev, page: null };
+  document.getElementById('meraki').classList.remove('hidden');
+  mkRender();
+}
+function mkClose() { const b = document.getElementById('meraki'); if (b) b.classList.add('hidden'); _mk = null; }
+
+// Nav is built from which product lines are actually present — Meraki hides a
+// section when you have no device of that type, and so does this.
+function mkNav() {
+  const devs = merakiDevices();
+  const nav = [{ sec: 'NETWORK-WIDE' },
+    { id: 'clients', label: 'Clients' },
+    { id: 'topology', label: 'Topology' }];
+  if (devs.some(d => merakiRole(d) === 'appliance')) {
+    nav.push({ sec: 'SECURITY & SD-WAN' },
+      { id: 'appliance', label: 'Appliance status' },
+      { id: 'addressing', label: 'Addressing & VLANs' },
+      { id: 'firewall', label: 'Firewall' });
+  }
+  if (devs.some(d => merakiRole(d) === 'switch')) {
+    nav.push({ sec: 'SWITCH' }, { id: 'switches', label: 'Switches' }, { id: 'swports', label: 'Switch ports' });
+  }
+  if (devs.some(d => merakiRole(d) === 'wireless')) {
+    nav.push({ sec: 'WIRELESS' }, { id: 'aps', label: 'Access points' }, { id: 'ssids', label: 'SSIDs' });
+  }
+  return nav;
+}
+
+function mkRender() {
+  if (!_mk) return;
+  const nav = mkNav();
+  if (!_mk.page) _mk.page = (nav.find(n => n.id) || {}).id;
+  const navEl = document.getElementById('mk-nav');
+  navEl.innerHTML = nav.map(n => n.sec
+    ? `<div class="mk-sec">${n.sec}</div>`
+    : `<div class="mk-item ${_mk.page === n.id ? 'active' : ''}" data-mk="${n.id}">${n.label}</div>`).join('');
+  for (const el of navEl.querySelectorAll('[data-mk]')) el.onclick = () => { _mk.page = el.dataset.mk; mkRender(); };
+  document.getElementById('mk-netname').textContent = 'NetMap3D Network';
+  document.getElementById('mk-top').textContent = (nav.find(n => n.id === _mk.page) || {}).label || 'Dashboard';
+  const page = document.getElementById('mk-page');
+  const R = { clients: mkClients, topology: mkTopology, appliance: mkApplianceStatus,
+    addressing: mkAddressing, firewall: mkFirewall, switches: mkSwitches, swports: mkSwPorts,
+    aps: mkAps, ssids: mkSsids }[_mk.page] || mkClients;
+  page.innerHTML = R();
+  mkWire(page);
+}
+
+function mkClients() {
+  resolveDhcp();
+  const hosts = state.devices.filter(d => isHostDev(d));
+  return `<div class="mk-tiles">
+    <div class="mk-tile"><div class="lbl">Clients</div><div class="big">${hosts.length}</div><div class="sub">active</div></div>
+    <div class="mk-tile"><div class="lbl">Meraki devices</div><div class="big">${merakiDevices().length}</div><div class="sub">online</div></div>
+    </div>
+    <table class="mk-table"><tr><th>Description</th><th>IP address</th><th>VLAN</th><th>Connected to</th><th>MAC</th></tr>
+    ${hosts.map(h => { const c = hopThroughPatches(h, hostPort(h), FRONT);
+      return `<tr><td>${esc(h.name)}</td><td>${hostAddr(h)}</td><td>${hostVlan(h)}</td>
+        <td>${c ? esc(c.dev.name) + ' port ' + c.port : '—'}</td>
+        <td style="font-family:monospace;font-size:11px">${nicMac(h, hostPort(h))}</td></tr>`; }).join('')}</table>`;
+}
+
+function mkTopology() {
+  return `<table class="mk-table"><tr><th>Device</th><th>Model</th><th>Role</th><th>IP</th><th>Status</th></tr>
+    ${merakiDevices().map(d => { const ip = deviceInterfaces(d)[0];
+      return `<tr><td>${esc(d.name)}</td><td>${esc(DEVICE_TYPES[d.type].label)}</td>
+        <td>${merakiRole(d)}</td><td>${ip ? ipStr(ip.ip.int) : (d.ip && d.ip !== 'dhcp' ? esc(d.ip) : '—')}</td>
+        <td><span class="mk-dot up"></span>Online</td></tr>`; }).join('')}</table>`;
+}
+
+function mkApplianceStatus() {
+  const mx = merakiAppliance();
+  const up = wanUplink ? wanUplink(mx) : { ok: false };
+  return `<div class="mk-tiles">
+    <div class="mk-tile"><div class="lbl">Appliance</div><div class="big">${esc(DEVICE_TYPES[mx.type].label)}</div>
+      <div class="sub">${esc(mx.name)}</div></div>
+    <div class="mk-tile"><div class="lbl">WAN</div><div class="big">${up.ok ? 'Active' : 'Down'}</div>
+      <div class="sub">${up.ok ? esc((up.circuit && up.circuit.provider) || 'ISP') : 'no circuit'}</div></div>
+    <div class="mk-tile"><div class="lbl">VLANs</div><div class="big">${[...vlanDb(mx).values()].length}</div><div class="sub">configured</div></div>
+    </div>
+    <table class="mk-table"><tr><th>Interface</th><th>Address</th><th>Status</th></tr>
+    ${deviceInterfaces(mx).map(i => `<tr><td>${i.kind === 'svi' ? 'VLAN ' + i.vlan : 'Port ' + i.port}</td>
+      <td>${ipStr(i.ip.int)}/${i.ip.cidr}</td><td><span class="mk-dot up"></span>Up</td></tr>`).join('')}</table>`;
+}
+
+// Addressing & VLANs — the MX's L3 config. Writes the gateway's VLAN database,
+// SVI and DHCP scope, which are the exact fields the simulation reads.
+function mkAddressing() {
+  const mx = merakiAppliance();
+  const db = [...vlanDb(mx).values()];
+  const pools = dhcpPools(mx);
+  return db.map(v => {
+    const svi = (mx.svi || {})[v.id];
+    const ip = svi ? parseIp(svi) : null;
+    const pool = pools.find(p => ip && sameSubnet(p.net, ip));
+    return `<div class="mk-row" data-vlan="${v.id}">
+      <h4><span class="mk-dot up"></span>${esc(v.name)} <span style="color:#8593a3;font-weight:400">· VLAN ${v.id}</span></h4>
+      <div class="mk-f"><label>Name</label><input class="mk-v-name" value="${esc(v.name)}" ${v.builtin ? 'disabled' : ''}></div>
+      <div class="mk-f"><label>VLAN ID</label><input class="mk-v-id" value="${v.id}" ${v.builtin ? 'disabled' : ''} style="width:80px"></div>
+      <div class="mk-f"><label>MX IP / Subnet</label><input class="mk-v-subnet" value="${svi ? esc(svi) : ''}" placeholder="10.0.${v.id}.1/24"></div>
+      <div class="mk-f"><label>DHCP handled by MX</label><div class="mk-sw ${pool ? 'on' : ''}" data-dhcp="${v.id}"></div></div>
+      ${pool ? `<div class="mk-f"><label>DHCP range</label>
+        <input class="mk-v-start" value="${esc(pool.poolStart || ipStr(pool.start))}" style="width:120px">–
+        <input class="mk-v-end" value="${esc(pool.poolEnd || ipStr(pool.end))}" style="width:120px"></div>
+        <div class="mk-f"><label>DNS nameservers</label><input class="mk-v-dns" value="${esc([].concat(pool.dns||[]).join(', '))}" placeholder="upstream_dns"></div>` : ''}
+      <div style="margin-top:10px"><button class="mk-btn mk-v-save">Save</button>
+        ${v.builtin ? '' : '<button class="mk-btn ghost mk-v-del">Delete</button>'}</div></div>`;
+  }).join('') + `<button class="mk-btn" id="mk-vlan-add">Add VLAN</button>`;
+}
+
+function mkFirewall() {
+  const mx = merakiAppliance();
+  const acls = mx.acls || [];
+  return `<p style="color:#8593a3;font-size:13px;margin-bottom:12px">Layer 3 outbound rules on ${esc(mx.name)}. Edit rules in the device's ACL panel; this reflects them.</p>`
+    + (acls.length
+      ? `<table class="mk-table"><tr><th>Policy</th><th>Protocol</th><th>Source</th><th>Destination</th></tr>`
+        + acls.flatMap(a => (a.rules || []).filter(r => r.remark === undefined).map(r =>
+          `<tr><td>${r.action === 'permit' ? 'Allow' : '<b style="color:#d0473f">Deny</b>'}</td>
+           <td>${r.proto || 'Any'}</td><td>${r.src ? (r.src.any ? 'Any' : (r.src.addr || '')) : 'Any'}</td>
+           <td>${r.dst ? (r.dst.any ? 'Any' : (r.dst.addr || '')) : 'Any'}${r.dstPort ? ' :' + r.dstPort.ports.join(',') : ''}</td></tr>`)).join('')
+        + `</table>`
+      : `<p>No firewall rules — default allow.</p>`);
+}
+
+function mkSwitches() {
+  return `<table class="mk-table"><tr><th>Switch</th><th>Model</th><th>Ports</th><th>IP</th><th>Status</th></tr>
+    ${merakiDevices().filter(d => merakiRole(d) === 'switch').map(d => {
+      const def = DEVICE_TYPES[d.type];
+      const used = state.cables.filter(c => c.a.deviceId === d.id || c.b.deviceId === d.id).length;
+      const ip = deviceInterfaces(d)[0];
+      return `<tr><td>${esc(d.name)}</td><td>${esc(def.label)}</td><td>${used}/${def.ports}</td>
+        <td>${ip ? ipStr(ip.ip.int) : '—'}</td><td><span class="mk-dot up"></span>Online</td></tr>`;
+    }).join('')}</table>`;
+}
+
+// Switch ports — writes the MS switch's port config, the same edit as a CLI
+// switchport access vlan.
+function mkSwPorts() {
+  const switches = merakiDevices().filter(d => merakiRole(d) === 'switch');
+  if (!switches.length) return '<p>No Meraki switches.</p>';
+  const mx = merakiAppliance();
+  const nets = [...vlanDb(mx).values()];
+  return switches.map(sw => {
+    const def = DEVICE_TYPES[sw.type];
+    let rows = '';
+    for (let p = 1; p <= (def.ports || 0); p++) {
+      if (portRole(def, p) === 'PWR') continue;
+      const link = linkFor(sw.id, p);
+      const trunk = portMode(sw, p) === 'trunk';
+      rows += `<tr><td>Port ${p}</td>
+        <td><span class="mk-dot ${link && link.up ? 'up' : 'down'}"></span>${link && link.up ? fmtSpeed(link.speed) : 'disconnected'}</td>
+        <td>${trunk ? 'trunk' : 'access'}</td>
+        <td>${trunk ? '<b>native ' + nativeVlanOf(sw, p) + '</b>' :
+          `<select class="mk-portvlan" data-swp="${sw.id}:${p}">${nets.map(n =>
+            `<option value="${n.id}" ${nativeVlanOf(sw, p) === n.id ? 'selected' : ''}>${esc(n.name)} (${n.id})</option>`).join('')}</select>`}</td></tr>`;
+    }
+    return `<h4 style="margin:6px 0 8px;font-size:15px">${esc(sw.name)}</h4>
+      <table class="mk-table"><tr><th>Port</th><th>Link</th><th>Type</th><th>VLAN</th></tr>${rows}</table><div style="height:18px"></div>`;
+  }).join('');
+}
+
+function mkAps() {
+  return `<table class="mk-table"><tr><th>Access point</th><th>Model</th><th>IP</th><th>Clients</th><th>Status</th></tr>
+    ${merakiDevices().filter(d => merakiRole(d) === 'wireless').map(d =>
+      `<tr><td>${esc(d.name)}</td><td>${esc(DEVICE_TYPES[d.type].label)}</td>
+        <td>${d.ip && d.ip !== 'dhcp' ? esc(d.ip) : (hostAddr(d) || '—')}</td><td>0</td>
+        <td><span class="mk-dot up"></span>Online</td></tr>`).join('')}</table>`;
+}
+
+function mkSsids() {
+  const mx = merakiAppliance();
+  const ssids = mx.ssids || [];
+  const nets = [...vlanDb(mx).values()];
+  return ssids.map((s, i) => `<div class="mk-row" data-ssid="${i}">
+    <h4>${esc(s.name || 'SSID')}</h4>
+    <div class="mk-f"><label>Name</label><input class="mk-s-name" value="${esc(s.name || '')}"></div>
+    <div class="mk-f"><label>VLAN</label><select class="mk-s-net">
+      ${nets.map(n => `<option value="${n.id}" ${s.vlan === n.id ? 'selected' : ''}>${esc(n.name)} (${n.id})</option>`).join('')}</select></div>
+    <div class="mk-f"><label>Security</label><select class="mk-s-sec">
+      ${['WPA2', 'WPA3', 'Open'].map(x => `<option ${s.security === x ? 'selected' : ''}>${x}</option>`).join('')}</select></div>
+    <div style="margin-top:10px"><button class="mk-btn mk-s-save">Save</button>
+      <button class="mk-btn ghost mk-s-del">Delete</button></div></div>`).join('')
+    + `<button class="mk-btn" id="mk-ssid-add">Add SSID</button>`;
+}
+
+function mkWire(page) {
+  const mx = merakiAppliance();
+  const commit = () => { flushL2Tables(); dhcpClearBindings(); resolveDhcp(); refreshAfterCli(mx); };
+
+  for (const sel of page.querySelectorAll('.mk-portvlan')) sel.onchange = () => {
+    const [sid, p] = sel.dataset.swp.split(':'); const sw = deviceById(+sid);
+    sw.portCfg = sw.portCfg || {}; sw.portCfg[+p] = sw.portCfg[+p] || {};
+    sw.portCfg[+p].vlan = sel.value; sw.portCfg[+p].mode = 'access'; commit();
+  };
+  for (const t of page.querySelectorAll('[data-dhcp]')) t.onclick = () => {
+    const vid = +t.dataset.dhcp; const svi = (mx.svi || {})[vid]; const ip = svi ? parseIp(svi) : null;
+    if (!ip) { alert('Set the MX IP / subnet first.'); return; }
+    mx.dhcp = mx.dhcp || { enabled: true, pools: [], excluded: [] }; mx.dhcp.enabled = true; mx.dhcp.pools = mx.dhcp.pools || [];
+    const has = mx.dhcp.pools.find(pp => { const pn = parseIp(pp.network); return pn && sameSubnet(pn, ip); });
+    if (has) mx.dhcp.pools = mx.dhcp.pools.filter(pp => pp !== has);
+    else mx.dhcp.pools.push({ name: (vlanDb(mx).get(vid) || {}).name || `VLAN${vid}`, network: subnetLabel(ip),
+      poolStart: ipStr((ip.network + 100) >>> 0), poolEnd: ipStr((ip.network + 200) >>> 0),
+      lease: { days: 1 }, defaultRouter: ipStr(ip.int), dns: [], reservations: [] });
+    commit(); mkRender();
+  };
+  for (const b of page.querySelectorAll('.mk-v-save')) b.onclick = () => {
+    const card = b.closest('.mk-row'); const vid = +card.dataset.vlan;
+    const g = c => (card.querySelector('.' + c) || {}).value;
+    const db = vlanDb(mx).get(vid);
+    if (db && !db.builtin) { mx.vlans = mx.vlans || [];
+      const v = mx.vlans.find(x => +x.id === vid);
+      if (v) { v.name = (g('mk-v-name') || '').trim(); v.id = +g('mk-v-id') || vid; } }
+    const sub = (g('mk-v-subnet') || '').trim();
+    mx.svi = mx.svi || {}; if (sub) mx.svi[vid] = sub; else delete mx.svi[vid];
+    const ip = sub ? parseIp(sub) : null;
+    if (ip && mx.dhcp && mx.dhcp.pools) {
+      const pool = mx.dhcp.pools.find(pp => { const pn = parseIp(pp.network); return pn && sameSubnet(pn, ip); });
+      if (pool) { pool.network = subnetLabel(ip); if (g('mk-v-start')) pool.poolStart = g('mk-v-start').trim();
+        if (g('mk-v-end')) pool.poolEnd = g('mk-v-end').trim(); pool.defaultRouter = ipStr(ip.int);
+        const dns = (g('mk-v-dns') || '').split(',').map(x => x.trim()).filter(Boolean); if (dns.length) pool.dns = dns; } }
+    commit(); mkRender();
+  };
+  for (const b of page.querySelectorAll('.mk-v-del')) b.onclick = () => {
+    const vid = +b.closest('.mk-row').dataset.vlan;
+    mx.vlans = (mx.vlans || []).filter(v => +v.id !== vid); if (mx.svi) delete mx.svi[vid]; commit(); mkRender();
+  };
+  const vadd = page.querySelector('#mk-vlan-add');
+  if (vadd) vadd.onclick = () => { const used = new Set([...vlanDb(mx).keys()]); let id = 10; while (used.has(id)) id += 10;
+    mx.vlans = mx.vlans || []; mx.vlans.push({ id, name: `VLAN ${id}` }); mx.svi = mx.svi || {}; mx.svi[id] = `10.0.${id}.1/24`; commit(); mkRender(); };
+  for (const b of page.querySelectorAll('.mk-s-save')) b.onclick = () => {
+    const card = b.closest('.mk-row'); const i = +card.dataset.ssid; mx.ssids = mx.ssids || [];
+    mx.ssids[i] = { name: (card.querySelector('.mk-s-name').value || '').trim(),
+      vlan: +card.querySelector('.mk-s-net').value, security: card.querySelector('.mk-s-sec').value }; commit(); mkRender();
+  };
+  for (const b of page.querySelectorAll('.mk-s-del')) b.onclick = () => {
+    const i = +b.closest('.mk-row').dataset.ssid; mx.ssids = (mx.ssids || []).filter((_, j) => j !== i); commit(); mkRender();
+  };
+  const sadd = page.querySelector('#mk-ssid-add');
+  if (sadd) sadd.onclick = () => { mx.ssids = mx.ssids || []; const nets = [...vlanDb(mx).values()];
+    mx.ssids.push({ name: 'New SSID', vlan: nets[0] ? nets[0].id : 1, security: 'WPA2' }); mkRender(); };
+}
+(function initMeraki() { const c = document.getElementById('mk-close'); if (c) c.onclick = mkClose; })();
 
 //////////////////// UniFi Network console ////////////////////
 // UniFi gear is configured through a web console, not a CLI, so faking it as a

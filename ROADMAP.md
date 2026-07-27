@@ -369,8 +369,15 @@ models (a camera's stream/retention, a reader's schedule/credentials) specced
 before building. Meraki, Omada and SonicOS are separate vendor consoles after
 UniFi.
 
-Priority order: UniFi Network first (most of the catalog), then UniFi
-Protect/Access, then Meraki, then Omada, then SonicOS. Same rule as the CLI: one
+**Meraki Dashboard landed in v0.39.0** — the real product-line Dashboard
+(Network-wide, Security & SD-WAN, Switch, Wireless), nav built from which Meraki
+devices are actually present, every control bound to the model: Addressing &
+VLANs writes the MX's VLAN DB / SVIs / DHCP, Switch ports writes an MS switch's
+port config, SSIDs map to VLANs. Verified bidirectional (a Dashboard rename
+shows in the MX's show running-config) and save/load stable.
+
+Priority order: UniFi Network (done) and Meraki (done); then UniFi
+Protect/Access, then Omada, then SonicOS. Same rule as the CLI: one
 console completely before the next, and never a skin over a stored string.
 
 **6. Cost of the build — a real bill of materials, with order links.**
