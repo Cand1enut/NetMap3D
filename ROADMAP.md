@@ -339,6 +339,30 @@ and is the part most likely to be faked. Per the standing rule: a Cisco switch
 gets IOS, a UniFi device gets UniFi OS, and each is a working environment, not
 a skin. Do one vendor completely before starting a second.
 
+**Vendor GUIs (owner, this session): cloud-managed gear needs its real GUI, not
+a CLI.** UniFiOS, Meraki Dashboard, Omada, SonicWall (SonicOS) are configured
+through a web console, and faking that as a terminal would be as wrong as giving
+a Cisco switch a GUI. So each cloud vendor gets a console panel that LOOKS and
+OPERATES like the real product — the same left-nav, the same pages (UniFi:
+Dashboard, Devices, Client list, Settings → Networks/WiFi/Internet; Meraki:
+Network-wide, Switch, Security appliance; Omada; SonicOS) — and every control is
+bound to the same model the 3D view and the simulation read, exactly as the IOS
+terminal is. A toggle in the UniFi Networks page must change the VLAN the
+engine uses, and a `show`-equivalent view must render live engine state.
+UniFiOS is a shell that hosts several apps, and the owner wants the ones that
+match real gear: **UniFi Network** (switching/routing/WiFi — maps to what the
+engine already simulates), **UniFi Protect** (cameras/NVR), **UniFi Access**
+(door readers/locks), plus Talk. Build the console as that shell with an app
+switcher, and implement Network first because it is what the simulation drives;
+Protect and Access are device-management surfaces that need their own device
+models (a camera's stream/retention, a reader's schedule/credentials) specced
+before building. Meraki, Omada and SonicOS are separate vendor consoles after
+UniFi.
+
+Priority order: UniFi Network first (most of the catalog), then UniFi
+Protect/Access, then Meraki, then Omada, then SonicOS. Same rule as the CLI: one
+console completely before the next, and never a skin over a stored string.
+
 **6. Cost of the build — a real bill of materials, with order links.**
 Track what the design costs, priced at the cheapest reputable seller, with a
 per-item custom price override and links to actually order the gear.

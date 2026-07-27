@@ -7853,7 +7853,7 @@ function showDeviceProps(id) {
     ${aclPropsHtml(dev)}
     ${l2TablesHtml(dev)}
     ${!isPlaced(dev) ? '<button id="dev-place">Place in 3D map</button>' : ''}
-    ${(netClass(dev) === 'switch' || netClass(dev) === 'router') ? '<button id="dev-console">Open console (CLI)</button>' : ''}
+    ${(netClass(dev) === 'switch' || netClass(dev) === 'router') ? `<button id="dev-console">${isUnifiController(dev) ? 'Open UniFi Network' : (/UniFi/.test((DEVICE_TYPES[dev.type]||{}).cat||'') ? 'Manage in UniFi' : 'Open console (CLI)')}</button>` : ''}
     <button id="dev-del" class="danger">Delete device</button>`;
   propsEl.classList.remove('hidden');
   selected = { kind: 'device', id };
@@ -7880,7 +7880,15 @@ function showDeviceProps(id) {
     setStatus(`Placing ${dev.name} — click a ${DEVICE_TYPES[dev.type].field ? 'floor or wall spot' : 'rack slot'}.`);
   };
   const consoleBtn = document.getElementById('dev-console');
-  if (consoleBtn) consoleBtn.onclick = () => openConsole(dev);
+  if (consoleBtn) consoleBtn.onclick = () => {
+    // Cloud-managed gear opens its GUI; everything else opens the CLI. A UniFi
+    // switch or AP has no CLI of its own — it is managed from the controller, so
+    // it opens the controller's console rather than a fake terminal.
+    if (/UniFi/.test((DEVICE_TYPES[dev.type] || {}).cat || '')) {
+      const ctrl = isUnifiController(dev) ? dev : (unifiDevices().find(isUnifiController) || dev);
+      openUnifi(ctrl);
+    } else openConsole(dev);
+  };
   document.getElementById('dev-del').onclick = () => { undoPush(); deleteDevice(id); hideProps(); };
 }
 
@@ -8436,6 +8444,311 @@ function updatePulses(dt) {
   }
 }
 
+
+
+//////////////////// UniFi Network console ////////////////////
+// UniFi gear is configured through a web console, not a CLI, so faking it as a
+// terminal would be exactly as wrong as giving a Cisco switch a GUI. This is the
+// real UniFi Network layout — left nav, Dashboard, Devices, Clients, Settings →
+// Networks/WiFi/Internet — and, like the IOS terminal, every control is bound to
+// the same model the 3D view and the simulation read. Toggle a network's DHCP
+// here and the engine's DHCP changes; rename a VLAN here and `show vlan` on a
+// Cisco switch two racks away sees it, because there is one model.
+//
+// The console runs on a UniFi gateway/console (the controller), and manages
+// every UniFi device that shares the topology — that is what "adoption" is.
+function isUnifiController(dev) {
+  const def = DEVICE_TYPES[dev.type] || {};
+  return /UniFi/.test(def.cat || '') && (def.role === 'router' || /Gateway|Dream|Console|Cloud Key/i.test(def.label || ''));
+}
+function unifiDevices() {
+  return state.devices.filter(d => isPlaced(d) && /UniFi/.test((DEVICE_TYPES[d.type] || {}).cat || ''));
+}
+function unifiRole(dev) {
+  const def = DEVICE_TYPES[dev.type] || {};
+  if (def.role === 'router' || /Gateway|Dream/i.test(def.label || '')) return 'Gateway';
+  if (netClass(dev) === 'switch') return 'Switch';
+  if (/AP|Access Point|U6|U7|nanoHD|FlexHD/i.test(def.label || '')) return 'Access Point';
+  if (/Camera|G4|G5/i.test(def.label || '')) return 'Protect Camera';
+  return def.label || 'Device';
+}
+
+let _uf = null;   // { dev, app, page }
+function openUnifi(dev) {
+  _uf = { dev, app: 'Network', page: 'dashboard' };
+  const box = document.getElementById('unifi');
+  document.getElementById('uf-appname').textContent = 'Network';
+  box.classList.remove('hidden');
+  ufRender();
+}
+function ufClose() { const b = document.getElementById('unifi'); if (b) b.classList.add('hidden'); _uf = null; }
+
+const UF_NAV = [
+  { sep: 'MONITOR' },
+  { id: 'dashboard', ico: '▤', label: 'Dashboard' },
+  { id: 'devices', ico: '☰', label: 'UniFi Devices' },
+  { id: 'clients', ico: '◍', label: 'Client Devices' },
+  { id: 'ports', ico: '⊞', label: 'Port Manager' },
+  { sep: 'SETTINGS' },
+  { id: 'networks', ico: '⧉', label: 'Networks' },
+  { id: 'wifi', ico: '≈', label: 'WiFi' },
+  { id: 'internet', ico: '🌐', label: 'Internet' }
+];
+
+function ufRender() {
+  if (!_uf) return;
+  const nav = document.getElementById('uf-nav');
+  nav.innerHTML = UF_NAV.map(n => n.sep
+    ? `<div class="uf-navsep">${n.sep}</div>`
+    : `<div class="uf-navitem ${_uf.page === n.id ? 'active' : ''}" data-uf="${n.id}"><span class="ico">${n.ico}</span>${n.label}</div>`).join('');
+  for (const el of nav.querySelectorAll('[data-uf]')) el.onclick = () => { _uf.page = el.dataset.uf; ufRender(); };
+  const page = document.getElementById('uf-page');
+  const top = document.getElementById('uf-topbar');
+  const R = { dashboard: ufDashboard, devices: ufDeviceList, clients: ufClients,
+    ports: ufPorts, networks: ufNetworks, wifi: ufWifi, internet: ufInternet }[_uf.page] || ufDashboard;
+  top.textContent = (UF_NAV.find(n => n.id === _uf.page) || {}).label || 'Dashboard';
+  page.innerHTML = R();
+  ufWire(page);
+}
+
+function ufDashboard() {
+  resolveDhcp();
+  const devs = unifiDevices();
+  const up = devs.filter(d => unifiRole(d) !== 'Gateway' ? true : true).length;
+  const clients = state.devices.filter(d => isHostDev(d)).length;
+  const gw = _uf.dev;
+  const wan = circuitOf ? null : null;
+  const up2 = wanUplink ? wanUplink(gw) : { ok: false };
+  const card = (lbl, big, sub) => `<div class="uf-card"><div class="lbl">${lbl}</div><div class="big">${big}</div>${sub ? `<div class="sub">${sub}</div>` : ''}</div>`;
+  return `<div class="uf-cards">
+    ${card('Devices', devs.length, `${devs.length} adopted`)}
+    ${card('Clients', clients, 'active')}
+    ${card('WAN', up2.ok ? 'Connected' : 'Down', up2.ok ? (up2.circuit && up2.circuit.provider || 'ISP') : 'no circuit')}
+    ${card('Networks', [...vlanDb(gw).values()].length, 'configured')}
+  </div>
+  <h4 style="margin:10px 0 8px;font-size:14px">Device Health</h4>
+  <table class="uf-table"><tr><th>Name</th><th>Type</th><th>IP</th><th>Status</th></tr>
+  ${devs.map(d => {
+    const ip = deviceInterfaces(d)[0];
+    return `<tr><td>${esc(d.name)}</td><td>${unifiRole(d)}</td>
+      <td>${ip ? ipStr(ip.ip.int) : (d.ip && d.ip !== 'dhcp' ? esc(d.ip) : '—')}</td>
+      <td><span class="uf-dot up"></span>Connected</td></tr>`;
+  }).join('')}</table>`;
+}
+
+function ufDeviceList() {
+  return `<table class="uf-table"><tr><th>Name</th><th>Model</th><th>Role</th><th>IP</th><th>Ports</th><th>Uplink</th></tr>
+  ${unifiDevices().map(d => {
+    const def = DEVICE_TYPES[d.type];
+    const ip = deviceInterfaces(d)[0];
+    const used = state.cables.filter(c => c.a.deviceId === d.id || c.b.deviceId === d.id).length;
+    return `<tr><td>${esc(d.name)}</td><td>${esc(def.label)}</td><td>${unifiRole(d)}</td>
+      <td>${ip ? ipStr(ip.ip.int) : '—'}</td><td>${used}/${def.ports || 0}</td>
+      <td><span class="uf-dot up"></span>${(def.speedLabel) || '1 Gbps'}</td></tr>`;
+  }).join('')}</table>`;
+}
+
+function ufClients() {
+  resolveDhcp();
+  const hosts = state.devices.filter(d => isHostDev(d));
+  return `<table class="uf-table"><tr><th>Name</th><th>IP</th><th>VLAN</th><th>Connection</th><th>MAC</th></tr>
+  ${hosts.map(h => {
+    const conn = hopThroughPatches(h, hostPort(h), FRONT);
+    return `<tr><td>${esc(h.name)}</td><td>${hostAddr(h)}</td><td>${hostVlan(h)}</td>
+      <td>${conn ? esc(conn.dev.name) + ' · port ' + conn.port : 'not connected'}</td>
+      <td style="font-family:monospace;font-size:11px">${nicMac(h, hostPort(h))}</td></tr>`;
+  }).join('')}</table>`;
+}
+
+// Port Manager — the UniFi switch-port page. Editing a port's network here is
+// the same edit as `switchport access vlan N` on the Cisco side.
+function ufPorts() {
+  const switches = unifiDevices().filter(d => netClass(d) === 'switch');
+  if (!switches.length) return '<p>No UniFi switches adopted.</p>';
+  const gw = _uf.dev;
+  const nets = [...vlanDb(gw).values()];
+  return switches.map(sw => {
+    const def = DEVICE_TYPES[sw.type];
+    let rows = '';
+    for (let p = 1; p <= (def.ports || 0); p++) {
+      if (portRole(def, p) === 'PWR') continue;
+      const cfg = portCfgOf(sw, p);
+      const link = linkFor(sw.id, p);
+      const isTrunk = portMode(sw, p) === 'trunk';
+      rows += `<tr data-swp="${sw.id}:${p}"><td>Port ${p}</td>
+        <td><span class="uf-dot ${link && link.up ? 'up' : 'down'}"></span>${link && link.up ? fmtSpeed(link.speed) : 'down'}</td>
+        <td>${isTrunk ? '<b>All / Trunk</b>' : `<select class="uf-portvlan" data-swp="${sw.id}:${p}">
+          ${nets.map(n => `<option value="${n.id}" ${nativeVlanOf(sw, p) === n.id ? 'selected' : ''}>${esc(n.name)} (${n.id})</option>`).join('')}
+        </select>`}</td></tr>`;
+    }
+    return `<h4 style="margin:6px 0 8px;font-size:14px">${esc(sw.name)}</h4>
+      <table class="uf-table"><tr><th>Port</th><th>Link</th><th>Network</th></tr>${rows}</table><div style="height:16px"></div>`;
+  }).join('');
+}
+
+// Networks — UniFi's word for an L3 network = a VLAN + subnet + DHCP. This page
+// writes the gateway's VLAN database, its SVI (the network's gateway address)
+// and its DHCP scope, which are the exact fields the simulation reads.
+function ufNetworks() {
+  const gw = _uf.dev;
+  const db = [...vlanDb(gw).values()];
+  const pools = dhcpPools(gw);
+  const body = db.map(v => {
+    const svi = (gw.svi || {})[v.id];
+    const ip = svi ? parseIp(svi) : null;
+    const pool = pools.find(p => ip && sameSubnet(p.net, ip));
+    const dhcpOn = !!pool;
+    return `<div class="uf-net" data-net="${v.id}">
+      <h4><span class="uf-dot up"></span>${esc(v.name)} <span style="color:#8a9099;font-weight:400">· VLAN ${v.id}</span></h4>
+      <div class="uf-field"><label>Name</label><input class="uf-n-name" value="${esc(v.name)}" ${v.builtin ? 'disabled' : ''}></div>
+      <div class="uf-field"><label>VLAN ID</label><input class="uf-n-vlan" value="${v.id}" ${v.builtin ? 'disabled' : ''} style="width:80px"></div>
+      <div class="uf-field"><label>Gateway/Subnet</label><input class="uf-n-subnet" value="${svi ? esc(svi) : ''}" placeholder="10.0.${v.id}.1/24"></div>
+      <div class="uf-field"><label>DHCP Server</label>
+        <div class="uf-toggle ${dhcpOn ? 'on' : ''}" data-dhcp="${v.id}"></div></div>
+      ${dhcpOn ? `<div class="uf-field"><label>DHCP Range</label>
+        <input class="uf-n-start" value="${esc(pool.poolStart || ipStr(pool.start))}" style="width:120px">–
+        <input class="uf-n-end" value="${esc(pool.poolEnd || ipStr(pool.end))}" style="width:120px"></div>
+        <div class="uf-field"><label>DNS Server</label><input class="uf-n-dns" value="${esc([].concat(pool.dns||[]).join(', '))}" placeholder="10.0.10.5"></div>` : ''}
+      <div style="margin-top:10px"><button class="uf-btn uf-n-save">Apply Changes</button>
+        ${v.builtin ? '' : `<button class="uf-btn ghost uf-n-del">Remove</button>`}</div>
+    </div>`;
+  }).join('');
+  return body + `<button class="uf-btn" id="uf-net-add">+ Create New Network</button>`;
+}
+
+function ufWifi() {
+  const gw = _uf.dev;
+  const aps = unifiDevices().filter(d => /Access Point/.test(unifiRole(d)));
+  const ssids = gw.ssids || [];
+  const nets = [...vlanDb(gw).values()];
+  const rows = ssids.map((s, i) => `<div class="uf-net" data-ssid="${i}">
+    <h4>${esc(s.name || 'SSID')}</h4>
+    <div class="uf-field"><label>Name (SSID)</label><input class="uf-w-name" value="${esc(s.name || '')}"></div>
+    <div class="uf-field"><label>Network</label><select class="uf-w-net">
+      ${nets.map(n => `<option value="${n.id}" ${s.vlan === n.id ? 'selected' : ''}>${esc(n.name)} (${n.id})</option>`).join('')}</select></div>
+    <div class="uf-field"><label>Security</label><select class="uf-w-sec">
+      ${['WPA2', 'WPA3', 'WPA2/3', 'Open'].map(x => `<option ${s.security === x ? 'selected' : ''}>${x}</option>`).join('')}</select></div>
+    <div style="margin-top:10px"><button class="uf-btn uf-w-save">Apply</button>
+      <button class="uf-btn ghost uf-w-del">Remove</button></div></div>`).join('');
+  return `<p style="color:#8a9099;font-size:13px;margin-bottom:12px">${aps.length} access point${aps.length === 1 ? '' : 's'} broadcasting.</p>`
+    + rows + `<button class="uf-btn" id="uf-wifi-add">+ Create New WiFi</button>`;
+}
+
+function ufInternet() {
+  const gw = _uf.dev;
+  const up = wanUplink ? wanUplink(gw) : { ok: false };
+  return `<div class="uf-net">
+    <h4><span class="uf-dot ${up.ok ? 'up' : 'down'}"></span>WAN</h4>
+    <div class="uf-field"><label>Status</label><span>${up.ok ? 'Connected' : (up.reason || 'No circuit')}</span></div>
+    ${up.ok ? `<div class="uf-field"><label>Provider</label><span>${esc((up.circuit && up.circuit.provider) || 'ISP')}</span></div>
+    <div class="uf-field"><label>WAN IP</label><span>${esc((up.circuit && up.circuit.wanIp) || 'from ISP')}</span></div>
+    <div class="uf-field"><label>Terminated by</label><span>${esc(up.term ? up.term.name : '—')}</span></div>` : `<p style="color:#8a9099;font-size:13px;margin-top:8px">Cable a WAN port to an ONT or modem, then a demarc and the Internet node, to bring the circuit up.</p>`}
+  </div>`;
+}
+
+// Wire whatever page is showing. Every handler ends by writing the model and
+// re-resolving, so the change is live the instant it is made.
+function ufWire(page) {
+  const gw = _uf.dev;
+  const commit = () => { flushL2Tables(); dhcpClearBindings(); resolveDhcp(); refreshAfterCli(gw); };
+
+  for (const sel of page.querySelectorAll('.uf-portvlan')) sel.onchange = () => {
+    const [sid, p] = sel.dataset.swp.split(':');
+    const sw = deviceById(+sid);
+    sw.portCfg = sw.portCfg || {}; sw.portCfg[+p] = sw.portCfg[+p] || {};
+    sw.portCfg[+p].vlan = sel.value; sw.portCfg[+p].mode = 'access';
+    commit();
+  };
+
+  for (const t of page.querySelectorAll('[data-dhcp]')) t.onclick = () => {
+    const vid = +t.dataset.dhcp;
+    const svi = (gw.svi || {})[vid];
+    const ip = svi ? parseIp(svi) : null;
+    if (!ip) { alert('Set a gateway/subnet first, then enable DHCP.'); return; }
+    gw.dhcp = gw.dhcp || { enabled: true, pools: [], excluded: [] };
+    gw.dhcp.enabled = true; gw.dhcp.pools = gw.dhcp.pools || [];
+    const has = gw.dhcp.pools.find(pp => { const pn = parseIp(pp.network); return pn && sameSubnet(pn, ip); });
+    if (has) gw.dhcp.pools = gw.dhcp.pools.filter(pp => pp !== has);
+    else gw.dhcp.pools.push({ name: (vlanDb(gw).get(vid) || {}).name || `VLAN${vid}`,
+      network: subnetLabel(ip), poolStart: ipStr((ip.network + 100) >>> 0), poolEnd: ipStr((ip.network + 200) >>> 0),
+      lease: { days: 1 }, defaultRouter: ipStr(ip.int), dns: [], reservations: [] });
+    commit(); ufRender();
+  };
+
+  for (const b of page.querySelectorAll('.uf-n-save')) b.onclick = () => {
+    const card = b.closest('.uf-net');
+    const vid = +card.dataset.net;
+    const g = c => (card.querySelector('.' + c) || {}).value;
+    const db = vlanDb(gw).get(vid);
+    // name / vlan id
+    if (db && !db.builtin) {
+      gw.vlans = gw.vlans || [];
+      let v = gw.vlans.find(x => +x.id === vid);
+      const newName = (g('uf-n-name') || '').trim();
+      const newId = +g('uf-n-vlan') || vid;
+      if (v) { v.name = newName; v.id = newId; }
+    }
+    // subnet → SVI
+    const sub = (g('uf-n-subnet') || '').trim();
+    gw.svi = gw.svi || {};
+    if (sub) gw.svi[vid] = sub; else delete gw.svi[vid];
+    // dhcp range
+    const ip = sub ? parseIp(sub) : null;
+    if (ip && gw.dhcp && gw.dhcp.pools) {
+      const pool = gw.dhcp.pools.find(pp => { const pn = parseIp(pp.network); return pn && sameSubnet(pn, ip); });
+      if (pool) {
+        pool.network = subnetLabel(ip);
+        if (g('uf-n-start')) pool.poolStart = g('uf-n-start').trim();
+        if (g('uf-n-end')) pool.poolEnd = g('uf-n-end').trim();
+        pool.defaultRouter = ipStr(ip.int);
+        const dns = (g('uf-n-dns') || '').split(',').map(x => x.trim()).filter(Boolean);
+        if (dns.length) pool.dns = dns;
+      }
+    }
+    commit(); ufRender();
+  };
+
+  for (const b of page.querySelectorAll('.uf-n-del')) b.onclick = () => {
+    const vid = +b.closest('.uf-net').dataset.net;
+    gw.vlans = (gw.vlans || []).filter(v => +v.id !== vid);
+    if (gw.svi) delete gw.svi[vid];
+    commit(); ufRender();
+  };
+
+  const add = page.querySelector('#uf-net-add');
+  if (add) add.onclick = () => {
+    const used = new Set([...vlanDb(gw).keys()]);
+    let id = 10; while (used.has(id)) id += 10;
+    gw.vlans = gw.vlans || [];
+    gw.vlans.push({ id, name: `Network ${id}` });
+    gw.svi = gw.svi || {}; gw.svi[id] = `10.0.${id}.1/24`;
+    commit(); ufRender();
+  };
+
+  // WiFi
+  for (const b of page.querySelectorAll('.uf-w-save')) b.onclick = () => {
+    const card = b.closest('.uf-net'); const i = +card.dataset.ssid;
+    gw.ssids = gw.ssids || [];
+    gw.ssids[i] = { name: (card.querySelector('.uf-w-name').value || '').trim(),
+      vlan: +card.querySelector('.uf-w-net').value, security: card.querySelector('.uf-w-sec').value };
+    commit(); ufRender();
+  };
+  for (const b of page.querySelectorAll('.uf-w-del')) b.onclick = () => {
+    const i = +b.closest('.uf-net').dataset.ssid;
+    gw.ssids = (gw.ssids || []).filter((_, j) => j !== i); commit(); ufRender();
+  };
+  const wadd = page.querySelector('#uf-wifi-add');
+  if (wadd) wadd.onclick = () => {
+    gw.ssids = gw.ssids || [];
+    const nets = [...vlanDb(gw).values()];
+    gw.ssids.push({ name: 'New WiFi', vlan: nets[0] ? nets[0].id : 1, security: 'WPA2/3' });
+    ufRender();
+  };
+}
+(function initUnifi() {
+  const c = document.getElementById('uf-close');
+  if (c) c.onclick = ufClose;
+})();
 
 //////////////////// Cisco IOS CLI ////////////////////
 // A working terminal, not a print-out. Two rules make the difference:
