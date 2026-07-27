@@ -9198,7 +9198,7 @@ function iosApply(sess, line) {
       }
       return { err: 'invalid', idx: 1 };
     }
-    if (match(head, 'speed')) { ensureCfg().speed = t[1] === 'auto' ? '' : (+t[1] >= 1000 ? +t[1] / 1000 : +t[1] / 1000); commit(); return {}; }
+    if (match(head, 'speed')) { ensureCfg().speed = t[1] === 'auto' ? '' : (+t[1] || 1000) / 1000; commit(); return {}; }
     if (match(head, 'duplex')) { ensureCfg().duplex = t[1] === 'auto' ? '' : t[1]; commit(); return {}; }
     if (head === 'spanning-tree' && match((t[1] || '').toLowerCase(), 'portfast')) { ensureCfg().portfast = !no; commit(); return {}; }
     if (match(head, 'description')) { ensureCfg().description = t.slice(1).join(' '); return {}; }
@@ -9284,6 +9284,7 @@ function iosExec(sess, raw) {
     if (match(head, 'enable') || head === 'en') { sess.mode = 'priv'; return { out: '' }; }
     if (match(head, 'exit') || match(head, 'logout')) return { out: '', close: true };
     if (match(head, 'ping')) return { out: iosPing(dev, toks[1]) };
+    if (head === 'traceroute' || head === 'trace') return { out: iosTraceroute(dev, toks[1]) };
     if (match(head, 'show')) { sess.mode = 'priv'; const r = iosShow(dev, toks.slice(1)); sess.mode = 'user'; return iosResult(r, line); }
     return { out: iosInvalid(line, 0) };
   }
@@ -9293,6 +9294,7 @@ function iosExec(sess, raw) {
     if (match(head, 'configure') || head === 'conf') { sess.mode = 'config'; return { out: 'Enter configuration commands, one per line.  End with CNTL/Z.' }; }
     if (match(head, 'show') || head === 'sh') return iosResult(iosShow(dev, toks.slice(1)), line);
     if (match(head, 'ping')) return { out: iosPing(dev, toks[1]) };
+    if (head === 'traceroute' || head === 'trace') return { out: iosTraceroute(dev, toks[1]) };
     if (match(head, 'write') || (head === 'copy')) return { out: 'Building configuration...\n[OK]' };
     if (head === 'clear') {
       if (toks.includes('arp')) { arpCaches.clear(); return { out: '' }; }
@@ -9318,6 +9320,31 @@ function iosResult(r, line) {
   if (r.err === 'invalid') return { out: iosInvalid(line, r.idx || 0) };
   return { out: r.out || '' };
 }
+// Traceroute from the device's CLI, rendered from the same hop-by-hop
+// forwarding the PDU engine and pingHosts use — so it reports the real path and
+// stops at the real failure, not a guessed one.
+function iosTraceroute(dev, target) {
+  const ip = parseIp(target);
+  if (!ip) return '% Unrecognized host or address.';
+  const local = deviceInterfaces(dev).find(i => sameSubnet(i.ip, ip));
+  const out = [`Type escape sequence to abort.`, `Tracing the route to ${target}`, ''];
+  if (local) { out.push(`  1 ${target} 0 msec 0 msec 0 msec`); return out.join('\n'); }
+  const fwd = forwardPath(dev.id, ip.int);
+  let n = 1;
+  for (const leg of fwd.legs) {
+    // The originating router is the source, not a hop. Every other router is
+    // listed by the interface the probe arrived on — which is what real
+    // traceroute prints, and why hop 1 is the next router, not this one.
+    if (leg.id === dev.id) continue;
+    const r = deviceById(leg.id);
+    const iface = deviceInterfaces(r).find(i => ifKey(i) === leg.inIf);
+    out.push(`  ${n++} ${iface ? ipStr(iface.ip.int) : r.name} 0 msec 0 msec 0 msec`);
+  }
+  if (fwd.egress) out.push(`  ${n} ${target} 0 msec 0 msec 0 msec`);
+  else if (fwd.error) out.push(`  ${n} * * *  ${fwd.error}`);
+  return out.join('\n');
+}
+
 // A ping from the device's own CLI, rendered the way IOS prints it.
 function iosPing(dev, target) {
   const ip = parseIp(target);
