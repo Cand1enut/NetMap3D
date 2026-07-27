@@ -319,6 +319,15 @@ panels and a print-only output pane. It needs to look and read like a network
 tool: legible tables, obvious state, configuration that is quick to change and
 hard to get wrong.
 
+**Cisco IOS terminal landed in v0.35.0.** A real console: user/priv/config/if/
+vlan/ospf/dhcp/acl modes, IOS prefix abbreviation (sh ru, int gi0/1, sw acc
+vlan 20), the exact "% Invalid input detected at '^' marker." caret error,
+`show running-config` rendered from the live model, and config commands that
+mutate that same model — typing `switchport access vlan 20` really does break
+reachability, `shutdown` really does drop a DHCP lease, and a full OSPF
+adjacency can be built by CLI. Verified bidirectional and stable across
+save/load. Remaining terminal work below is now the vendor GUIs.
+
 And the CLI stops being a print-out. A managed switch needs an actual terminal:
 a prompt, real mode transitions (user → enable → config → interface), command
 parsing with IOS abbreviation (`sh ru`, `int gi1/0/1`), `?` completion, error

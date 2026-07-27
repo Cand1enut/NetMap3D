@@ -401,6 +401,27 @@ select:focus, input:focus { border-color: var(--accent); }
 
 .hidden { display: none !important; }
 
+
+/* ---------- device console (IOS/vendor terminal) ---------- */
+#term { position: fixed; right: 18px; bottom: 18px; width: 620px; max-width: calc(100vw - 36px);
+  height: 460px; max-height: calc(100vh - 90px); background: #0b0e13; border: 1px solid var(--line);
+  border-radius: 10px; box-shadow: 0 24px 64px rgba(0,0,0,.55); display: flex; flex-direction: column;
+  z-index: 80; font-family: "SF Mono", ui-monospace, Menlo, Consolas, monospace; }
+#term.hidden { display: none; }
+#term-bar { display: flex; align-items: center; gap: 8px; padding: 8px 12px; border-bottom: 1px solid var(--line);
+  background: #11151c; border-radius: 10px 10px 0 0; }
+#term-title { color: var(--muted); font-size: 12px; flex: 1; }
+#term-close { background: none; border: none; color: var(--faint); font-size: 18px; cursor: pointer; line-height: 1; }
+#term-close:hover { color: var(--text); }
+#term-out { flex: 1; overflow-y: auto; padding: 10px 12px; font-size: 12.5px; line-height: 1.5;
+  color: #d5dbe4; white-space: pre-wrap; word-break: break-word; }
+#term-out .cmd { color: #eef2f6; }
+#term-out .err { color: #ff6b6b; }
+#term-inrow { display: flex; align-items: center; gap: 6px; padding: 8px 12px; border-top: 1px solid var(--line); }
+#term-prompt { color: #6ee7b7; font-size: 12.5px; white-space: pre; }
+#term-in { flex: 1; background: none; border: none; outline: none; color: #eef2f6;
+  font-family: inherit; font-size: 12.5px; }
+
 </style>
 </head>
 <body>
@@ -540,6 +561,12 @@ select:focus, input:focus { border-color: var(--accent); }
       <button id="ai-ask">Ask local AI</button>
     </div>
     <div id="ai-out"><p>Analyze finds real problems (cable length limits, VLAN blocks, coverage gaps). Auto-design builds a working starter network from your walls — fully placed and cabled.</p></div>
+  </div>
+
+  <div id="term" class="hidden">
+    <div id="term-bar"><span id="term-title">Console</span><button id="term-close">×</button></div>
+    <div id="term-out"></div>
+    <div id="term-inrow"><span id="term-prompt"></span><input id="term-in" spellcheck="false" autocomplete="off"></div>
   </div>
 
   <div id="tooltip" class="hidden"></div>
@@ -13476,6 +13503,7 @@ function showDeviceProps(id) {
     ${aclPropsHtml(dev)}
     ${l2TablesHtml(dev)}
     ${!isPlaced(dev) ? '<button id="dev-place">Place in 3D map</button>' : ''}
+    ${(netClass(dev) === 'switch' || netClass(dev) === 'router') ? '<button id="dev-console">Open console (CLI)</button>' : ''}
     <button id="dev-del" class="danger">Delete device</button>`;
   propsEl.classList.remove('hidden');
   selected = { kind: 'device', id };
@@ -13501,6 +13529,8 @@ function showDeviceProps(id) {
     placeExistingId = id;
     setStatus(`Placing ${dev.name} — click a ${DEVICE_TYPES[dev.type].field ? 'floor or wall spot' : 'rack slot'}.`);
   };
+  const consoleBtn = document.getElementById('dev-console');
+  if (consoleBtn) consoleBtn.onclick = () => openConsole(dev);
   document.getElementById('dev-del').onclick = () => { undoPush(); deleteDevice(id); hideProps(); };
 }
 
@@ -14054,6 +14084,565 @@ function updatePulses(dt) {
     }
     p.mesh.instanceMatrix.needsUpdate = true;
   }
+}
+
+
+//////////////////// Cisco IOS CLI ////////////////////
+// A working terminal, not a print-out. Two rules make the difference:
+//   1. `show` output is RENDERED FROM THE LIVE MODEL, never from a stored
+//      string. If the 3D view disagrees with `show running-config`, one of them
+//      is a bug — they cannot drift, because there is only one source.
+//   2. Config commands MUTATE that same model. Type `switchport access vlan 20`
+//      and the simulation, the cable colours and the reachability matrix all
+//      change, because the CLI writes the field the engine reads.
+// That bidirectionality is the whole point; a terminal that only prints is a
+// mockup with a monospace font.
+
+function iosVendor(dev) {
+  const def = DEVICE_TYPES[dev.type] || {};
+  if (def.cat && /Cisco|Meraki/.test(def.cat)) return 'cisco';
+  if (def.cat && /UniFi/.test(def.cat)) return 'unifi';
+  return 'cisco';                    // generic gear speaks IOS here
+}
+function iosHostname(dev) { return (dev.hostname || dev.name || 'Router').replace(/\s+/g, '-'); }
+function iosPrompt(sess) {
+  const h = iosHostname(sess.dev);
+  switch (sess.mode) {
+    case 'user': return `${h}>`;
+    case 'priv': return `${h}#`;
+    case 'config': return `${h}(config)#`;
+    case 'if': return `${h}(config-if)#`;
+    case 'vlan': return `${h}(config-vlan)#`;
+    case 'ospf': return `${h}(config-router)#`;
+    case 'dhcp': return `${h}(config-dhcp)#`;
+    case 'acl': return `${h}(config-ext-nacl)#`;
+    default: return `${h}#`;
+  }
+}
+// IOS accepts any unambiguous prefix. Returns the full word, or an error.
+function iosExpand(word, choices) {
+  if (!word) return { err: 'incomplete' };
+  const exact = choices.find(c => c === word);
+  if (exact) return { word: exact };
+  const hits = choices.filter(c => c.startsWith(word));
+  if (hits.length === 1) return { word: hits[0] };
+  if (hits.length === 0) return { err: 'invalid' };
+  return { err: 'ambiguous', hits };
+}
+function iosInvalid(line, badIdx) {
+  // IOS points a caret at the first token it could not parse.
+  const toks = line.split(/\s+/);
+  let col = 0;
+  for (let i = 0; i < badIdx && i < toks.length; i++) col += toks[i].length + 1;
+  return `${' '.repeat(col)}^\n% Invalid input detected at '^' marker.`;
+}
+
+// Interface names. IOS calls them GigabitEthernet0/1 and Vlan20; both the long
+// and short forms must work because nobody types the long one.
+function iosIfName(dev, iface) {
+  if (iface && iface.kind === 'svi') return `Vlan${iface.vlan}`;
+  const p = iface && iface.port !== undefined ? iface.port : iface;
+  return `GigabitEthernet0/${p}`;
+}
+function iosParseIf(dev, tokens) {
+  const joined = tokens.join(' ');
+  let m = joined.match(/^(?:vlan|vl)\s*(\d+)$/i);
+  if (m) return { kind: 'svi', vlan: +m[1], name: `Vlan${m[1]}` };
+  m = joined.match(/^(?:g|gi|gig|gigabitethernet|f|fa|fastethernet|e|eth|ethernet|te|tengigabitethernet)\s*(?:\d+\/)?(\d+)$/i);
+  if (m) return { kind: 'routed', port: +m[1], name: iosIfName(dev, +m[1]) };
+  m = joined.match(/^(\d+)$/);
+  if (m) return { kind: 'routed', port: +m[1], name: iosIfName(dev, +m[1]) };
+  return null;
+}
+
+// `show running-config`, generated from the model every time it is asked for.
+function iosRunningConfig(dev) {
+  const def = DEVICE_TYPES[dev.type] || {};
+  const L = ['Building configuration...', '', `version 15.2`, 'service timestamps debug datetime msec',
+    '!', `hostname ${iosHostname(dev)}`, '!'];
+  // VLAN database
+  const db = vlanDb(dev);
+  const named = [...db.values()].filter(v => !v.builtin);
+  if (named.length) {
+    for (const v of named) { L.push(`vlan ${v.id}`, ` name ${v.name}`); }
+    L.push('!');
+  }
+  // DHCP
+  if (dev.dhcp && dev.dhcp.enabled) {
+    for (const r of dev.dhcp.excluded || []) {
+      L.push(`ip dhcp excluded-address ${r.from}${r.to && r.to !== r.from ? ' ' + r.to : ''}`);
+    }
+    for (const p of dhcpPools(dev)) {
+      L.push(`ip dhcp pool ${p.name}`, ` network ${ipStr(p.net.network)} ${ipStr(p.net.mask)}`);
+      if (p.defaultRouter) L.push(` default-router ${p.defaultRouter}`);
+      if ((p.dns || []).length) L.push(` dns-server ${[].concat(p.dns).join(' ')}`);
+      if (p.domain) L.push(` domain-name ${p.domain}`);
+      if (p.tftp) L.push(` option 150 ip ${p.tftp}`);
+      const l = p.lease === 'infinite' ? ' lease infinite'
+        : ` lease ${(p.lease && p.lease.days) || 0} ${(p.lease && p.lease.hours) || 0} ${(p.lease && p.lease.minutes) || 0}`;
+      L.push(l);
+      for (const r of p.reservations || []) L.push(` ! reservation ${r.mac} ${r.ip}`);
+    }
+    L.push('!');
+  }
+  // Interfaces — physical then SVIs, the order IOS prints them.
+  const svis = Object.keys(dev.svi || {}).map(Number).sort((a, b) => a - b);
+  for (let p = 1; p <= (def.ports || 0); p++) {
+    if (portRole(def, p) === 'PWR') continue;
+    const cfg = portCfgOf(dev, p);
+    const body = [];
+    if (cfg.description) body.push(` description ${cfg.description}`);
+    if (cfg.ip) { const ip = parseIp(cfg.ip); if (ip) body.push(` ip address ${ipStr(ip.int)} ${ipStr(ip.mask)}`); }
+    else if (netClass(dev) === 'switch' || cfg.mode || cfg.vlan) {
+      if (portMode(dev, p) === 'trunk') {
+        body.push(' switchport mode trunk');
+        const nat = nativeVlanOf(dev, p);
+        if (nat !== DEFAULT_VLAN) body.push(` switchport trunk native vlan ${nat}`);
+        const al = allowedVlans(dev, p);
+        if (al.size) body.push(` switchport trunk allowed vlan ${[...al].sort((a, b) => a - b).join(',')}`);
+      } else if (cfg.vlan) {
+        body.push(' switchport mode access', ` switchport access vlan ${nativeVlanOf(dev, p)}`);
+      }
+    }
+    if (cfg.speed) body.push(` speed ${cfg.speed < 1 ? Math.round(cfg.speed * 1000) : cfg.speed * 1000}`);
+    if (cfg.duplex) body.push(` duplex ${cfg.duplex}`);
+    if (cfg.portfast) body.push(' spanning-tree portfast');
+    const ap = (dev.aclApply || {})[p];
+    if (ap) for (const [dir, id] of Object.entries(ap)) body.push(` ip access-group ${id} ${dir}`);
+    const hp = (dev.helpers || {})[`Port ${p}`];
+    if (hp) for (const h of [].concat(hp)) body.push(` ip helper-address ${h}`);
+    if (cfg.shutdown) body.push(' shutdown');
+    if (!body.length) continue;
+    L.push(`interface ${iosIfName(dev, p)}`, ...body, '!');
+  }
+  for (const v of svis) {
+    const ip = parseIp(dev.svi[v]);
+    const body = [];
+    if (ip) body.push(` ip address ${ipStr(ip.int)} ${ipStr(ip.mask)}`);
+    const ap = (dev.aclApply || {})[`Vlan${v}`];
+    if (ap) for (const [dir, id] of Object.entries(ap)) body.push(` ip access-group ${id} ${dir}`);
+    const hp = (dev.helpers || {})[`Vlan${v}`];
+    if (hp) for (const h of [].concat(hp)) body.push(` ip helper-address ${h}`);
+    L.push(`interface Vlan${v}`, ...body, '!');
+  }
+  // Routing
+  if (ospfEnabled(dev)) {
+    L.push(`router ospf 1`);
+    if (dev.ospf.routerId) L.push(` router-id ${dev.ospf.routerId}`);
+    if (dev.ospf.refBw && dev.ospf.refBw !== OSPF_REF_BW_MBPS) L.push(` auto-cost reference-bandwidth ${dev.ospf.refBw}`);
+    for (const i of deviceInterfaces(dev)) {
+      L.push(` network ${ipStr(i.ip.network)} ${ipStr(~i.ip.mask >>> 0)} area ${ospfAreaOf(dev, i)}`);
+      if (ospfPassive(dev, i)) L.push(` passive-interface ${ifName(i)}`);
+    }
+    L.push('!');
+  }
+  for (const r of dev.routes || []) {
+    const d = parseIp(r.prefix);
+    if (!d) continue;
+    L.push(`ip route ${ipStr(d.network)} ${ipStr(d.mask)} ${r.via}${r.ad !== undefined ? ' ' + r.ad : ''}`);
+  }
+  // NAT
+  if (dev.nat && dev.nat.enabled) {
+    for (const st of dev.nat.statics || []) {
+      L.push(st.proto
+        ? `ip nat inside source static ${st.proto} ${st.local} ${st.localPort || ''} ${st.global} ${st.globalPort || ''}`.replace(/\s+/g, ' ')
+        : `ip nat inside source static ${st.local} ${st.global}`);
+    }
+    if (dev.nat.insideGlobal) {
+      L.push(`ip nat inside source list ${dev.nat.aclId || 1} interface <outside>${dev.nat.overload ? ' overload' : ''}`);
+    }
+  }
+  // ACLs
+  const acl = aclToText(dev.acls);
+  if (acl) L.push(acl, '!');
+  L.push('end');
+  return L.join('\n');
+}
+
+// ---- show command dispatch ----
+function iosShow(dev, args) {
+  const j = args.join(' ');
+  const has = (...pats) => pats.some(p => j.startsWith(p));
+  if (!args.length) return { err: 'incomplete' };
+  if (has('running-config', 'run', 'ru')) return { out: iosRunningConfig(dev) };
+  if (has('startup-config', 'start')) return { out: iosRunningConfig(dev) };
+  if (has('version', 'ver')) return { out: iosShowVersion(dev) };
+  if (has('ip route', 'ip ro')) return { out: showIpRoute(dev) };
+  if (has('ip interface brief', 'ip int b', 'ip int brief', 'ip interface b')) return { out: iosShowIpIntBrief(dev) };
+  if (has('interfaces status', 'int status', 'interface status')) return { out: showInterfacesStatus(dev) };
+  if (has('interfaces', 'int')) return { out: showInterfacesStatus(dev) };
+  if (has('vlan brief', 'vlan')) return { out: iosShowVlan(dev) };
+  if (has('mac address-table', 'mac-address-table', 'mac')) return { out: iosShowMac(dev) };
+  if (has('spanning-tree', 'span')) return { out: iosShowSpanningTree(dev) };
+  if (has('ip ospf neighbor', 'ip ospf nei')) return { out: showIpOspfNeighbor(dev) };
+  if (has('ip ospf')) return { out: showIpOspfNeighbor(dev) };
+  if (has('ip nat translations', 'ip nat')) return { out: showIpNat(dev) };
+  if (has('access-lists', 'access-list', 'acc')) return { out: aclShow(dev) || 'No access lists configured' };
+  if (has('ip dhcp binding')) return { out: iosShowDhcpBinding(dev) };
+  if (has('ip dhcp pool', 'ip dhcp')) return { out: iosShowDhcpPool(dev) };
+  if (has('arp')) return { out: iosShowArp(dev) };
+  if (has('ip')) return { err: 'incomplete' };
+  return { err: 'invalid', idx: 1 };
+}
+function iosShowVersion(dev) {
+  const def = DEVICE_TYPES[dev.type] || {};
+  return [`Cisco IOS Software, Version 15.2(7)E, RELEASE SOFTWARE`,
+    `${iosHostname(dev)} uptime is ${fmtDur(simNow() - (dev._boot || (dev._boot = simNow())))}`,
+    ``, `Model: ${def.label || dev.type}`,
+    `Base ethernet MAC Address       : ${deviceMac(dev)}`,
+    `Number of interfaces            : ${def.ports || 0}`].join('\n');
+}
+function iosShowIpIntBrief(dev) {
+  const def = DEVICE_TYPES[dev.type] || {};
+  const rows = ['Interface              IP-Address      OK? Method Status                Protocol'];
+  const line = (name, ip, up) =>
+    `${name.padEnd(22)} ${(ip || 'unassigned').padEnd(15)} YES manual ${(up ? 'up' : 'administratively down').padEnd(21)} ${up ? 'up' : 'down'}`;
+  for (let p = 1; p <= (def.ports || 0); p++) {
+    if (portRole(def, p) === 'PWR') continue;
+    const cfg = portCfgOf(dev, p);
+    const l = linkFor(dev.id, p);
+    rows.push(line(iosIfName(dev, p), cfg.ip ? parseIp(cfg.ip) && ipStr(parseIp(cfg.ip).int) : null,
+      !!(l && l.up)));
+  }
+  for (const [v, a] of Object.entries(dev.svi || {})) {
+    const ip = parseIp(a);
+    rows.push(line(`Vlan${v}`, ip ? ipStr(ip.int) : null, true));
+  }
+  return rows.join('\n');
+}
+function iosShowVlan(dev) {
+  const db = vlanDb(dev);
+  const def = DEVICE_TYPES[dev.type] || {};
+  const rows = ['VLAN Name                             Status    Ports',
+    '---- -------------------------------- --------- -------------------------------'];
+  for (const v of [...db.values()].sort((a, b) => a.id - b.id)) {
+    const ports = [];
+    for (let p = 1; p <= (def.ports || 0); p++) {
+      if (portRole(def, p) === 'PWR') continue;
+      if (portMode(dev, p) === 'access' && nativeVlanOf(dev, p) === v.id) ports.push(`Gi0/${p}`);
+    }
+    rows.push(`${String(v.id).padEnd(4)} ${v.name.padEnd(32)} active    ${ports.join(', ')}`);
+  }
+  return rows.join('\n');
+}
+function iosShowMac(dev) {
+  const e = macEntries(dev.id);
+  if (!e.length) return `${iosHostname(dev)}: MAC address table is empty — run a ping to populate it`;
+  const rows = ['          Mac Address Table', '-------------------------------------------', '',
+    'Vlan    Mac Address       Type        Ports', '----    -----------       --------    -----'];
+  for (const [mac, v] of e) rows.push(`${String(v.vlan).padEnd(7)} ${mac.toLowerCase().padEnd(17)} DYNAMIC     Gi0/${v.port}`);
+  rows.push(`Total Mac Addresses for this criterion: ${e.length}`);
+  return rows.join('\n');
+}
+function iosShowSpanningTree(dev) {
+  const out = [];
+  for (const v of [undefined, ...stpVlans()]) {
+    const st = stpState(v);
+    if (!st.links || !st.links.length) continue;
+    const root = deviceById(st.rootId);
+    if (!root) continue;
+    out.push(v === undefined ? 'VLAN0001' : `VLAN${String(v).padStart(4, '0')}`);
+    out.push(`  Spanning tree enabled protocol ${stpMode(dev) === 'rapid-pvst' ? 'rstp' : 'ieee'}`);
+    out.push(`  Root ID    Priority    ${bridgePriority(root, v)}`);
+    out.push(`             Address     ${deviceMac(root).toLowerCase()}`);
+    out.push(`             Cost        ${st.cost.get(dev.id) ?? 0}`);
+    out.push(`  Bridge ID  Priority    ${bridgePriority(dev, v)}`);
+    out.push(`             Address     ${deviceMac(dev).toLowerCase()}`);
+    out.push('');
+    out.push('Interface           Role Sts Cost      Prio.Nbr Type');
+    out.push('------------------- ---- --- --------- -------- ----');
+    for (const [k, role] of st.roles) {
+      if (!k.startsWith(dev.id + ':')) continue;
+      const port = k.split(':')[1];
+      const ps = stpPortState(dev.id, port, v);
+      const sts = ps.state === 'forwarding' ? 'FWD' : ps.state === 'blocking' || ps.state === 'discarding' ? 'BLK' :
+        ps.state === 'learning' ? 'LRN' : 'LIS';
+      out.push(`${('Gi0/' + port).padEnd(19)} ${role.slice(0, 4).padEnd(4)} ${sts} ${String(stpCost(linkSpeed({ a: { deviceId: dev.id, port: +port }, b: { deviceId: dev.id, port: +port } }) || 1).toString()).padEnd(9)} 128.${port}    P2p`);
+    }
+    out.push('');
+  }
+  return out.length ? out.join('\n') : 'No spanning tree instances — this device has no switch-to-switch links';
+}
+function iosShowDhcpBinding(dev) {
+  const b = [...(_dhcpBindings ? _dhcpBindings.values() : [])].filter(x => x.serverId === dev.id);
+  if (!b.length) return 'No DHCP bindings';
+  const rows = ['IP address       Client-ID/              Lease expiration        Type',
+    '                 Hardware address'];
+  for (const x of b) rows.push(`${x.ip.padEnd(16)} ${x.clientId.padEnd(23)} ${fmtDur(x.expiresAt - simNow()).padEnd(23)} ${x.type}`);
+  return rows.join('\n');
+}
+function iosShowDhcpPool(dev) {
+  const pools = dhcpPools(dev);
+  if (!pools.length) return 'No DHCP pools configured';
+  return pools.map(p => {
+    const leased = [...(_dhcpBindings ? _dhcpBindings.values() : [])].filter(x => x.serverId === dev.id && x.poolName === p.name).length;
+    return [`Pool ${p.name} :`, ` Utilization mark (high/low)    : 100 / 0`,
+      ` Subnet size (first/next)       : 0 / 0`,
+      ` Total addresses                : ${p.end - p.start + 1}`,
+      ` Leased addresses               : ${leased}`,
+      ` Range                          : ${ipStr(p.start)} - ${ipStr(p.end)}`].join('\n');
+  }).join('\n');
+}
+function iosShowArp(dev) {
+  const c = arpCaches.get(dev.id);
+  if (!c || !c.size) return 'ARP cache is empty';
+  const rows = ['Protocol  Address          Age (min)  Hardware Addr   Type   Interface'];
+  for (const [ip, mac] of c) rows.push(`Internet  ${ip.padEnd(16)} 0          ${mac.toLowerCase()}  ARPA`);
+  return rows.join('\n');
+}
+
+
+// ---- config-mode command handlers, each MUTATES the model ----
+// Every one of these writes a field the engine reads, then flushes the caches
+// so the change takes effect on the next show/ping. That flush is what makes the
+// terminal and the 3D view the same object rather than two views that drift.
+function iosApply(sess, line) {
+  const dev = sess.dev;
+  const toks = line.trim().split(/\s+/);
+  const no = toks[0] === 'no';
+  const t = no ? toks.slice(1) : toks;
+  const head = (t[0] || '').toLowerCase();
+  const commit = () => { flushL2Tables(); dhcpClearBindings(); resolveDhcp(); refreshAfterCli(dev); };
+
+  // --- global config mode ---
+  if (sess.mode === 'config') {
+    if (match(head, 'hostname')) { dev.hostname = t[1] || dev.hostname; updateDeviceFaceplate(dev.id); return {}; }
+    if (match(head, 'interface')) {
+      const iface = iosParseIf(dev, t.slice(1));
+      if (!iface) return { err: 'invalid', idx: 1 };
+      sess.mode = 'if'; sess.iface = iface; return {};
+    }
+    if (match(head, 'vlan')) {
+      const id = +t[1];
+      if (!id || id < 1 || id > 4094) return { err: 'invalid', idx: 1 };
+      dev.vlans = dev.vlans || [];
+      if (no) { dev.vlans = dev.vlans.filter(v => +v.id !== id); commit(); return {}; }
+      if (!dev.vlans.some(v => +v.id === id)) dev.vlans.push({ id, name: `VLAN${id}` });
+      sess.mode = 'vlan'; sess.vlan = id; commit(); return {};
+    }
+    if (head === 'ip' && match((t[1] || '').toLowerCase(), 'route')) {
+      const net = parseIp(t[2]), mask = t[3], via = t[4];
+      if (!net || !mask || !via) return { err: 'incomplete' };
+      const cidr = maskToCidr(mask);
+      dev.routes = dev.routes || [];
+      const prefix = `${ipStr(net.network)}/${cidr}`;
+      dev.routes = dev.routes.filter(r => r.prefix !== prefix || (t[5] && +r.ad !== +t[5]));
+      if (!no) dev.routes.push({ prefix, via, ...(t[5] ? { ad: +t[5] } : {}) });
+      commit(); return {};
+    }
+    if (head === 'ip' && match((t[1] || '').toLowerCase(), 'access-list')) {
+      const kind = (t[2] || '').toLowerCase();
+      if (kind !== 'standard' && kind !== 'extended') return { err: 'invalid', idx: 2 };
+      sess.mode = 'acl'; sess.aclName = t[3]; sess.aclKind = kind;
+      dev.acls = dev.acls || [];
+      if (!dev.acls.some(a => String(a.id) === t[3])) dev.acls.push({ id: t[3], kind, named: true, rules: [] });
+      return {};
+    }
+    if (head === 'access-list') {
+      const res = parseAclText(line);
+      if (res.errors.length) return { err: 'invalid', idx: 1 };
+      dev.acls = mergeAcls(dev.acls || [], res.acls); commit(); return {};
+    }
+    if (match(head, 'router')) {
+      if (match((t[1] || '').toLowerCase(), 'ospf')) { dev.ospf = dev.ospf || { enabled: true, area: 0 }; dev.ospf.enabled = true; sess.mode = 'ospf'; commit(); return {}; }
+      return { err: 'invalid', idx: 1 };
+    }
+    if (head === 'ip' && match((t[1] || '').toLowerCase(), 'dhcp')) {
+      if (match((t[2] || '').toLowerCase(), 'pool')) {
+        dev.dhcp = dev.dhcp || { enabled: true, pools: [], excluded: [] };
+        dev.dhcp.enabled = true; dev.dhcp.pools = dev.dhcp.pools || [];
+        let pool = dev.dhcp.pools.find(p => p.name === t[3]);
+        if (!pool) { pool = { name: t[3], network: '', reservations: [] }; dev.dhcp.pools.push(pool); }
+        sess.mode = 'dhcp'; sess.pool = pool; commit(); return {};
+      }
+      if (match((t[2] || '').toLowerCase(), 'excluded-address')) {
+        dev.dhcp = dev.dhcp || { enabled: true, pools: [], excluded: [] };
+        dev.dhcp.excluded = dev.dhcp.excluded || [];
+        if (no) dev.dhcp.excluded = dev.dhcp.excluded.filter(e => e.from !== t[3]);
+        else dev.dhcp.excluded.push({ from: t[3], to: t[4] || t[3] });
+        commit(); return {};
+      }
+    }
+    if (match(head, 'end')) { sess.mode = 'priv'; return {}; }
+    if (match(head, 'exit')) { sess.mode = 'priv'; return {}; }
+    return { err: 'invalid', idx: 0 };
+  }
+
+  // --- interface config mode ---
+  if (sess.mode === 'if') {
+    const port = sess.iface.port, isSvi = sess.iface.kind === 'svi';
+    const ensureCfg = () => { dev.portCfg = dev.portCfg || {}; dev.portCfg[port] = dev.portCfg[port] || {}; return dev.portCfg[port]; };
+    if (match(head, 'exit')) { sess.mode = 'config'; return {}; }
+    if (match(head, 'shutdown')) {
+      if (isSvi) return { err: 'invalid', idx: 0 };
+      ensureCfg().shutdown = !no; commit(); return {};
+    }
+    if (head === 'ip' && match((t[1] || '').toLowerCase(), 'address')) {
+      const ip = parseIp(t[2]), mask = t[3];
+      if (!ip || !mask) return { err: 'incomplete' };
+      const addr = `${ipStr(ip.int)}/${maskToCidr(mask)}`;
+      if (isSvi) { dev.svi = dev.svi || {}; if (no) delete dev.svi[sess.iface.vlan]; else dev.svi[sess.iface.vlan] = addr; }
+      else { const c = ensureCfg(); if (no) delete c.ip; else c.ip = addr; }
+      commit(); return {};
+    }
+    if (head === 'ip' && match((t[1] || '').toLowerCase(), 'helper-address')) {
+      dev.helpers = dev.helpers || {};
+      const key = isSvi ? `Vlan${sess.iface.vlan}` : `Port ${port}`;
+      const list = [].concat(dev.helpers[key] || []);
+      if (no) dev.helpers[key] = list.filter(h => h !== t[2]);
+      else { list.push(t[2]); dev.helpers[key] = list; }
+      commit(); return {};
+    }
+    if (head === 'ip' && match((t[1] || '').toLowerCase(), 'access-group')) {
+      dev.aclApply = dev.aclApply || {};
+      const key = isSvi ? `Vlan${sess.iface.vlan}` : port;
+      dev.aclApply[key] = dev.aclApply[key] || {};
+      const dir = (t[3] || '').toLowerCase();
+      if (no) delete dev.aclApply[key][dir]; else dev.aclApply[key][dir] = t[2];
+      commit(); return {};
+    }
+    if (match(head, 'switchport')) {
+      const c = ensureCfg();
+      const sub = (t[1] || '').toLowerCase();
+      if (match(sub, 'mode')) { c.mode = (t[2] || '').toLowerCase(); if (c.mode === 'access') c.tagged = ''; commit(); return {}; }
+      if (match(sub, 'access') && match((t[2] || '').toLowerCase(), 'vlan')) { c.vlan = t[3]; c.mode = 'access'; commit(); return {}; }
+      if (match(sub, 'trunk')) {
+        const w = (t[2] || '').toLowerCase();
+        if (match(w, 'native')) { c.native = t[4]; c.mode = 'trunk'; commit(); return {}; }
+        if (match(w, 'allowed')) {
+          c.mode = 'trunk';
+          const vlans = t.slice(t.indexOf(t.find(x => /^\d/.test(x))) ).join('').replace(/[^\d,]/g, '');
+          const list = (t[t.length - 1] || '').replace(/[^\d,]/g, '');
+          if (t.includes('add')) c.tagged = [...new Set([...(c.tagged || '').split(',').filter(Boolean), ...list.split(',')])].join(',');
+          else c.tagged = list;
+          commit(); return {};
+        }
+      }
+      return { err: 'invalid', idx: 1 };
+    }
+    if (match(head, 'speed')) { ensureCfg().speed = t[1] === 'auto' ? '' : (+t[1] >= 1000 ? +t[1] / 1000 : +t[1] / 1000); commit(); return {}; }
+    if (match(head, 'duplex')) { ensureCfg().duplex = t[1] === 'auto' ? '' : t[1]; commit(); return {}; }
+    if (head === 'spanning-tree' && match((t[1] || '').toLowerCase(), 'portfast')) { ensureCfg().portfast = !no; commit(); return {}; }
+    if (match(head, 'description')) { ensureCfg().description = t.slice(1).join(' '); return {}; }
+    return { err: 'invalid', idx: 0 };
+  }
+
+  // --- vlan / ospf / dhcp / acl sub-modes ---
+  if (sess.mode === 'vlan') {
+    if (match(head, 'name')) { const v = (dev.vlans || []).find(x => +x.id === sess.vlan); if (v) v.name = t[1]; commit(); return {}; }
+    if (match(head, 'exit')) { sess.mode = 'config'; return {}; }
+    return { err: 'invalid', idx: 0 };
+  }
+  if (sess.mode === 'ospf') {
+    if (match(head, 'network')) {
+      // network A.B.C.D wildcard area N — the area is per interface in our model
+      const net = parseIp(t[1]); const area = +t[t.length - 1];
+      if (net) { dev.ospf.areas = dev.ospf.areas || {};
+        for (const i of deviceInterfaces(dev)) if (ipInSubnet(i.ip.int, { ...net, mask: ~(parseIp(t[2]) || { int: 0 }).int >>> 0, network: net.int & (~(parseIp(t[2]) || { int: 0 }).int >>> 0) })) dev.ospf.areas[ifKey(i)] = area; }
+      commit(); return {};
+    }
+    if (match(head, 'router-id')) { dev.ospf.routerId = t[1]; commit(); return {}; }
+    if (head === 'auto-cost') { dev.ospf.refBw = +t[t.length - 1] || OSPF_REF_BW_MBPS; commit(); return {}; }
+    if (match(head, 'passive-interface')) {
+      const iface = iosParseIf(dev, t.slice(1));
+      dev.ospf.passive = dev.ospf.passive || [];
+      if (iface) { const k = iface.kind === 'svi' ? `Vlan${iface.vlan}` : iface.port;
+        if (no) dev.ospf.passive = dev.ospf.passive.filter(x => x !== k); else dev.ospf.passive.push(k); }
+      commit(); return {};
+    }
+    if (match(head, 'exit')) { sess.mode = 'config'; return {}; }
+    return { err: 'invalid', idx: 0 };
+  }
+  if (sess.mode === 'dhcp') {
+    const p = sess.pool;
+    if (match(head, 'network')) { const net = parseIp(t[1]); if (net) p.network = `${ipStr(net.int)}/${t[2] ? maskToCidr(t[2]) : net.cidr}`; commit(); return {}; }
+    if (match(head, 'default-router')) { p.defaultRouter = t[1]; commit(); return {}; }
+    if (match(head, 'dns-server')) { p.dns = t.slice(1); commit(); return {}; }
+    if (match(head, 'domain-name')) { p.domain = t[1]; commit(); return {}; }
+    if (match(head, 'lease')) { p.lease = t[1] === 'infinite' ? 'infinite' : { days: +t[1] || 0, hours: +t[2] || 0, minutes: +t[3] || 0 }; commit(); return {}; }
+    if (match(head, 'exit')) { sess.mode = 'config'; return {}; }
+    return { err: 'invalid', idx: 0 };
+  }
+  if (sess.mode === 'acl') {
+    if (match(head, 'exit')) { sess.mode = 'config'; return {}; }
+    // reuse the ACL text parser for a single named-list body line
+    const full = `ip access-list ${sess.aclKind} ${sess.aclName}\n ${line.trim()}`;
+    const res = parseAclText(full);
+    if (res.errors.length) return { err: 'invalid', idx: 0 };
+    dev.acls = mergeAcls(dev.acls || [], res.acls); commit(); return {};
+  }
+  return { err: 'invalid', idx: 0 };
+}
+function match(word, full) { return word && full.startsWith(word); }
+function maskToCidr(mask) { const p = parseIp(mask + '/32'); if (!p) return 24; let m = p.int, c = 0; while (m & 0x80000000) { c++; m = (m << 1) >>> 0; } return c; }
+function mergeAcls(existing, incoming) {
+  const byId = new Map(existing.map(a => [String(a.id), a]));
+  for (const a of incoming) {
+    const cur = byId.get(String(a.id));
+    if (cur) { cur.rules = [...cur.rules, ...a.rules]; cur.named = cur.named || a.named; cur.kind = cur.kind || a.kind; }
+    else byId.set(String(a.id), a);
+  }
+  return [...byId.values()];
+}
+// After a CLI edit, rebuild whatever the change could have moved in 3D.
+function refreshAfterCli(dev) {
+  try { if (typeof rebuildDevice === 'function') rebuildDevice(dev.id);
+    for (const c of state.cables) rebuildCable && rebuildCable(c.id);
+    if (typeof refreshSimPickers === 'function') refreshSimPickers();
+  } catch (e) {}
+}
+
+// ---- the session: one line in, output + new prompt out ----
+function iosNewSession(dev) { return { dev, mode: 'user', iface: null }; }
+function iosExec(sess, raw) {
+  const line = raw.replace(/\s+$/, '');
+  const dev = sess.dev;
+  if (!line.trim()) return { out: '' };
+  const toks = line.trim().split(/\s+/);
+  const head = toks[0].toLowerCase();
+
+  // navigation available in exec modes
+  if (sess.mode === 'user') {
+    if (match(head, 'enable') || head === 'en') { sess.mode = 'priv'; return { out: '' }; }
+    if (match(head, 'exit') || match(head, 'logout')) return { out: '', close: true };
+    if (match(head, 'ping')) return { out: iosPing(dev, toks[1]) };
+    if (match(head, 'show')) { sess.mode = 'priv'; const r = iosShow(dev, toks.slice(1)); sess.mode = 'user'; return iosResult(r, line); }
+    return { out: iosInvalid(line, 0) };
+  }
+  if (sess.mode === 'priv') {
+    if (match(head, 'disable')) { sess.mode = 'user'; return { out: '' }; }
+    if (match(head, 'exit') || match(head, 'logout')) return { out: '', close: true };
+    if (match(head, 'configure') || head === 'conf') { sess.mode = 'config'; return { out: 'Enter configuration commands, one per line.  End with CNTL/Z.' }; }
+    if (match(head, 'show') || head === 'sh') return iosResult(iosShow(dev, toks.slice(1)), line);
+    if (match(head, 'ping')) return { out: iosPing(dev, toks[1]) };
+    if (match(head, 'write') || (head === 'copy')) return { out: 'Building configuration...\n[OK]' };
+    if (head === 'clear') {
+      if (toks.includes('arp')) { arpCaches.clear(); return { out: '' }; }
+      if (toks.join(' ').includes('mac')) { macTables.clear(); return { out: '' }; }
+      if (toks.join(' ').includes('nat')) { natClear(dev.id); return { out: '' }; }
+    }
+    return { out: iosInvalid(line, 0) };
+  }
+  // config modes
+  const r = iosApply(sess, line);
+  return iosResult(r, line);
+}
+function iosResult(r, line) {
+  if (r.err === 'incomplete') return { out: '% Incomplete command.' };
+  if (r.err === 'ambiguous') return { out: '% Ambiguous command:  "' + line + '"' };
+  if (r.err === 'invalid') return { out: iosInvalid(line, r.idx || 0) };
+  return { out: r.out || '' };
+}
+// A ping from the device's own CLI, rendered the way IOS prints it.
+function iosPing(dev, target) {
+  const ip = parseIp(target);
+  if (!ip) return `% Unrecognized host or address, or protocol not running.`;
+  const owner = deviceHoldingAddr(ip.int);
+  // A router pings from itself: reachable if it has a route and the target answers.
+  const route = lookupRoute(dev, ip.int) || deviceInterfaces(dev).find(i => sameSubnet(i.ip, ip));
+  const ok = !!owner && !!route;
+  return `Type escape sequence to abort.\nSending 5, 100-byte ICMP Echos to ${target}, timeout is 2 seconds:\n` +
+    (ok ? '!!!!!\nSuccess rate is 100 percent (5/5)' : '.....\nSuccess rate is 0 percent (0/5)');
 }
 
 //////////////////// Cable physics (verlet ropes) ////////////////////
@@ -15587,6 +16176,68 @@ function drawPduTrace(target) {
   pduShowAt(full, _pduAt - 1);
   showPingPath(shown.map(t => t.devId));
 }
+
+// ---- terminal wiring ----
+// A live console for a device. Lines go into iosExec, output comes back, and any
+// config command has already mutated the model by the time the prompt returns —
+// so closing the console and looking at the 3D view or running a ping shows the
+// change immediately.
+let _termSess = null, _termHist = [], _termHistAt = 0;
+function openConsole(dev) {
+  const box = document.getElementById('term');
+  const out = document.getElementById('term-out');
+  const inp = document.getElementById('term-in');
+  const title = document.getElementById('term-title');
+  if (!box) return;
+  _termSess = iosNewSession(dev);
+  _termHist = []; _termHistAt = 0;
+  title.textContent = `${iosHostname(dev)} — ${iosVendor(dev) === 'cisco' ? 'Cisco IOS' : 'console'}`;
+  out.innerHTML = '';
+  termPrint(out, `${iosHostname(dev)} console — type "enable", then "configure terminal". "?" is not a full help system yet; abbreviations work (sh ru, int gi0/1).`, 'sys');
+  syncTermPrompt();
+  box.classList.remove('hidden');
+  setTimeout(() => inp.focus(), 30);
+}
+function syncTermPrompt() {
+  const pr = document.getElementById('term-prompt');
+  if (pr && _termSess) pr.textContent = iosPrompt(_termSess) + ' ';
+}
+function termPrint(out, text, cls) {
+  const div = document.createElement('div');
+  if (cls) div.className = cls;
+  div.textContent = text;
+  out.appendChild(div);
+  out.scrollTop = out.scrollHeight;
+}
+(function initTerm() {
+  const box = document.getElementById('term');
+  if (!box) return;
+  const out = document.getElementById('term-out');
+  const inp = document.getElementById('term-in');
+  document.getElementById('term-close').onclick = () => { box.classList.add('hidden'); _termSess = null; };
+  inp.addEventListener('keydown', e => {
+    if (e.key === 'Enter') {
+      const line = inp.value;
+      inp.value = '';
+      if (!_termSess) return;
+      termPrint(out, iosPrompt(_termSess) + ' ' + line, 'cmd');
+      if (line.trim()) { _termHist.push(line); _termHistAt = _termHist.length; }
+      const res = iosExec(_termSess, line);
+      if (res.close) { box.classList.add('hidden'); _termSess = null; return; }
+      if (res.out) termPrint(out, res.out, /Invalid|Incomplete|Ambiguous|Unrecognized/.test(res.out) ? 'err' : '');
+      syncTermPrompt();
+    } else if (e.key === 'ArrowUp') {
+      if (_termHistAt > 0) { _termHistAt--; inp.value = _termHist[_termHistAt] || ''; }
+      e.preventDefault();
+    } else if (e.key === 'ArrowDown') {
+      if (_termHistAt < _termHist.length) { _termHistAt++; inp.value = _termHist[_termHistAt] || ''; }
+      e.preventDefault();
+    }
+  });
+  // clicking anywhere in the console focuses the input, like a real terminal
+  box.addEventListener('click', () => inp.focus());
+})();
+
 const pduBtn = document.getElementById('sim-pdu');
 if (pduBtn) pduBtn.onclick = runPdu;
 
