@@ -857,12 +857,11 @@ this order — the first one is foundational and several others depend on it.
     patch-cord allowance. Fixing it exposed that the first hop was never
     length-checked at all.
 
-14. **Soft shadows are silently disabled.** three.js r185 logs
-    "PCFSoftShadowMap has been deprecated. Using PCFShadowMap instead" on every
-    load — the renderer is quietly downgrading shadow filtering, so shadow edges
-    are harder than intended. `THREE.Clock` is deprecated in favour of
-    `THREE.Timer` on the same load. Both are one-line fixes; noticed while
-    testing DHCP, recorded rather than fixed mid-mechanism.
+14. ~~**Soft shadows silently disabled; THREE.Clock deprecated**~~ — FIXED
+    v0.37.0. r185 removed PCFSoftShadowMap from WebGLShadowMap (it downgraded to
+    hard PCF), so shadows now use VSMShadowMap — real variance soft shadows that
+    honour the light's radius/blurSamples, with VSM-appropriate bias. Frame
+    timing moved from the deprecated THREE.Clock to THREE.Timer.
 
 Rule going forward: when a mechanism is modelled, model the whole mechanism. If
 it cannot be finished now, it does not ship as a partial — it stays out and

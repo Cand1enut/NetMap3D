@@ -519,7 +519,11 @@ renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
 renderer.toneMapping = THREE.AgXToneMapping;
 renderer.toneMappingExposure = 1.0;
 renderer.shadowMap.enabled = true;
-renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+// r185 deprecated PCFSoftShadowMap in WebGLShadowMap — setting it silently
+// downgrades to hard PCF, which is why shadow edges looked harder than intended.
+// VSM (variance shadow maps) is the modern soft path and honours the light's
+// shadow.radius / blurSamples we already set, so the softness is real now.
+renderer.shadowMap.type = THREE.VSMShadowMap;
 document.body.appendChild(renderer.domElement);
 
 // Image-based lighting: gives metals/plastics realistic reflections. In r185 the
@@ -581,9 +585,14 @@ sun.castShadow = true;
 // plane: ~0.07 in of shadow texel at room scale, which is what makes a rack leg
 // meet the floor instead of hovering over a smear.
 sun.shadow.mapSize.set(4096, 4096);
-sun.shadow.bias = -0.00022;
-sun.shadow.normalBias = 0.035;
-sun.shadow.radius = 1.6;
+// VSM tuning is different from PCF: it stores depth+depth² and blurs the map, so
+// softness comes from radius/blurSamples, and the peter-panning that PCF fixes
+// with a negative bias is instead handled by a tiny positive bias plus normal
+// bias. A negative bias on VSM reintroduces the smear it is meant to remove.
+sun.shadow.bias = 0.0004;
+sun.shadow.normalBias = 0.04;
+sun.shadow.radius = 4;
+sun.shadow.blurSamples = 16;
 const rim = new THREE.DirectionalLight(0x5b7cff, 0.3);
 rim.position.set(-100, 60, -120);
 scene.add(rim);
@@ -8809,12 +8818,18 @@ function iosIfName(dev, iface) {
 }
 function iosParseIf(dev, tokens) {
   const joined = tokens.join(' ');
+  const def = DEVICE_TYPES[dev.type] || {};
+  // An SVI can be any valid VLAN; a physical port cannot exceed what the box
+  // actually has. Real IOS rejects `interface gi0/49` on a 48-port switch, and
+  // letting it through here created a phantom port that then showed up in the
+  // config and the simulation as if it were real hardware.
   let m = joined.match(/^(?:vlan|vl)\s*(\d+)$/i);
-  if (m) return { kind: 'svi', vlan: +m[1], name: `Vlan${m[1]}` };
+  if (m) { const v = +m[1]; return (v >= 1 && v <= 4094) ? { kind: 'svi', vlan: v, name: `Vlan${v}` } : null; }
+  const inRange = p => p >= 1 && p <= (def.ports || 0);
   m = joined.match(/^(?:g|gi|gig|gigabitethernet|f|fa|fastethernet|e|eth|ethernet|te|tengigabitethernet)\s*(?:\d+\/)?(\d+)$/i);
-  if (m) return { kind: 'routed', port: +m[1], name: iosIfName(dev, +m[1]) };
+  if (m) { const p = +m[1]; return inRange(p) ? { kind: 'routed', port: p, name: iosIfName(dev, p) } : null; }
   m = joined.match(/^(\d+)$/);
-  if (m) return { kind: 'routed', port: +m[1], name: iosIfName(dev, +m[1]) };
+  if (m) { const p = +m[1]; return inRange(p) ? { kind: 'routed', port: p, name: iosIfName(dev, p) } : null; }
   return null;
 }
 
@@ -9285,6 +9300,13 @@ function iosExec(sess, raw) {
       if (toks.join(' ').includes('nat')) { natClear(dev.id); return { out: '' }; }
     }
     return { out: iosInvalid(line, 0) };
+  }
+  // "do <cmd>" runs an exec command from config mode without leaving it — real
+  // IOS, and the natural way to check `do show ip route` mid-configuration.
+  if (/^do\s+/i.test(line.trim())) {
+    const saved = sess.mode; sess.mode = 'priv';
+    const r = iosExec(sess, line.trim().replace(/^do\s+/i, ''));
+    sess.mode = saved; r.close = false; return r;
   }
   // config modes
   const r = iosApply(sess, line);
@@ -11688,10 +11710,13 @@ window.addEventListener('resize', () => {
   }
 });
 
-const clock = new THREE.Clock();
+// r185 deprecated THREE.Clock in favour of THREE.Timer. Timer needs update()
+// once per frame, then getDelta() returns seconds since the last update.
+const frameTimer = new THREE.Timer();
 (function animate() {
   requestAnimationFrame(animate);
-  const dt = Math.min(clock.getDelta(), 0.1);
+  frameTimer.update();
+  const dt = Math.min(frameTimer.getDelta(), 0.1);
   if (walkActive) {
     const speed = (walkKeys['ShiftLeft'] || walkKeys['ShiftRight']) ? 190 : 68;
     const fwd = new THREE.Vector3(-Math.sin(walkYaw), 0, -Math.cos(walkYaw));
