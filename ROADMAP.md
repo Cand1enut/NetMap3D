@@ -319,6 +319,16 @@ panels and a print-only output pane. It needs to look and read like a network
 tool: legible tables, obvious state, configuration that is quick to change and
 hard to get wrong.
 
+**Host OS terminals landed in v0.38.0.** A workstation or server opens a real
+Windows / macOS / Linux shell (picked per host, defaulting server→Linux,
+desktop→Windows). ipconfig / ifconfig / ip addr, ping, tracert / traceroute,
+nslookup, arp -a, route print / netstat -rn / ip route, getmac, hostname — all
+rendered from the live model per OS, with OS-accurate formatting (Windows dotted
+vs macOS hex netmask, lo vs lo0, `ip` absent on macOS) and OS-accurate errors.
+ipconfig shows the DHCP lease and option-3 gateway; ping runs the real
+forwarding path; nslookup does a real DNS exchange; arp -a shows the cache the
+ping populated, and only on-subnet neighbours, as a real host does.
+
 **Cisco IOS terminal landed in v0.35.0.** A real console: user/priv/config/if/
 vlan/ospf/dhcp/acl modes, IOS prefix abbreviation (sh ru, int gi0/1, sw acc
 vlan 20), the exact "% Invalid input detected at '^' marker." caret error,

@@ -4571,7 +4571,12 @@ function pduHost(sim, dev, ev, dstInt) {
     return;
   }
   if (myIp && pdu.l3 && pdu.l3.dst === myIp.int) {
-    arpLearn(dev.id, ipStr(pdu.l3.src), pdu.l2.srcMac);
+    // ARP maps IP→MAC only for on-subnet neighbours. Learning the L3 source of
+    // every delivered packet would pair an off-subnet sender's IP with the
+    // gateway's MAC (the frame's real L2 source), which is not an entry any
+    // real host holds — a host reaches an off-subnet peer via the gateway MAC
+    // keyed to the GATEWAY's IP, never the peer's.
+    if (ipInSubnet(pdu.l3.src, myIp)) arpLearn(dev.id, ipStr(pdu.l3.src), pdu.l2.srcMac);
     sim.trace.push({ kind: 'deliver', devId: dev.id, iface: ev.iface, pdu: clonePdu(pdu), action: 'deliver',
       why: `${ipStr(pdu.l3.dst)} is this NIC's address — delivered up the stack` });
     sim.done = true; sim.delivered = true;
@@ -7863,6 +7868,11 @@ function showDeviceProps(id) {
     ${l2TablesHtml(dev)}
     ${!isPlaced(dev) ? '<button id="dev-place">Place in 3D map</button>' : ''}
     ${(netClass(dev) === 'switch' || netClass(dev) === 'router') ? `<button id="dev-console">${isUnifiController(dev) ? 'Open UniFi Network' : (/UniFi/.test((DEVICE_TYPES[dev.type]||{}).cat||'') ? 'Manage in UniFi' : 'Open console (CLI)')}</button>` : ''}
+    ${netClass(dev) === 'host' ? `<div class="row" style="margin-top:8px"><span class="k">OS</span>
+      <select id="dev-os"><option value="windows" ${hostOs(dev)==='windows'?'selected':''}>Windows</option>
+        <option value="macos" ${hostOs(dev)==='macos'?'selected':''}>macOS</option>
+        <option value="linux" ${hostOs(dev)==='linux'?'selected':''}>Linux</option></select></div>
+      <button id="dev-terminal">Open terminal</button>` : ''}
     <button id="dev-del" class="danger">Delete device</button>`;
   propsEl.classList.remove('hidden');
   selected = { kind: 'device', id };
@@ -7888,6 +7898,10 @@ function showDeviceProps(id) {
     placeExistingId = id;
     setStatus(`Placing ${dev.name} — click a ${DEVICE_TYPES[dev.type].field ? 'floor or wall spot' : 'rack slot'}.`);
   };
+  const osSel = document.getElementById('dev-os');
+  if (osSel) osSel.onchange = () => { dev.os = osSel.value; };
+  const termBtn = document.getElementById('dev-terminal');
+  if (termBtn) termBtn.onclick = () => openHostTerminal(dev);
   const consoleBtn = document.getElementById('dev-console');
   if (consoleBtn) consoleBtn.onclick = () => {
     // Cloud-managed gear opens its GUI; everything else opens the CLI. A UniFi
@@ -8758,6 +8772,320 @@ function ufWire(page) {
   const c = document.getElementById('uf-close');
   if (c) c.onclick = ufClose;
 })();
+
+
+//////////////////// Host OS terminal (Windows / macOS / Linux) ////////////////////
+// A workstation or server is a real computer, so it gets a real OS shell driven
+// by the same model everything else reads: ipconfig prints the NIC's leased
+// address and the gateway option 6 handed out, ping runs the actual forwarding
+// path, nslookup does a real DNS exchange. Same rule as the switch CLI — nothing
+// printed here is a stored string; it is the model, formatted per OS.
+//
+// The OS is a property of the host. Servers default to Linux, desktops to
+// Windows; the user can change it. Command syntax and output follow the real OS.
+function hostOs(dev) {
+  if (dev.os) return dev.os;
+  const def = DEVICE_TYPES[dev.type] || {};
+  if (/server/i.test(dev.type) || /server/i.test(def.label || '')) return 'linux';
+  return 'windows';
+}
+function osIsWindows(dev) { return hostOs(dev) === 'windows'; }
+function osFamily(dev) { return hostOs(dev) === 'windows' ? 'windows' : 'unix'; }
+function osPromptStr(sess) {
+  const d = sess.dev;
+  const name = (d.hostname || d.name || 'host').replace(/\s+/g, '-');
+  if (hostOs(d) === 'windows') return `C:\\Users\\${(d.user || 'user')}>`;
+  const u = d.user || (hostOs(d) === 'macos' ? 'admin' : 'user');
+  return `${u}@${name}:~$ `;
+}
+
+// Resolve a ping/trace target: a literal IP, or a name via the host's DNS.
+function osResolveTarget(host, target) {
+  const ip = parseIp(target);
+  if (ip) return { int: ip.int, shown: target };
+  const r = dnsResolve(host, target);
+  if (r.ok) { const a = parseIp(r.address); return a ? { int: a.int, shown: target, resolved: r.address, server: r.server } : { err: `Ping request could not find host ${target}.` }; }
+  return { err: hostOs(host) === 'windows'
+    ? `Ping request could not find host ${target}. Please check the name and try again.`
+    : `ping: cannot resolve ${target}: Unknown host` };
+}
+
+// One reachability probe from a host to an address, using the real forwarding
+// path both directions — the same engine as the sim, so the terminal never
+// disagrees with the reachability matrix.
+function osReach(host, dstInt) {
+  const owner = deviceHoldingAddr(dstInt);
+  if (owner && owner.dev.id === host.id) return { ok: true, self: true };
+  const srcNic = hostEgressNic(host, dstInt);
+  if (!srcNic || !nicIp(host, srcNic.port)) return { ok: false, why: 'no route / interface' };
+  if (owner && netClass(owner.dev) === 'host') {
+    const r = pduPing(host, owner.dev, { proto: 'icmp', icmpType: 'echo' });
+    return { ok: r.ok, why: r.why, ttl: 128 };
+  }
+  // A router interface or gateway: reachable if the host can put a frame on it.
+  const srcIp = nicIp(host, srcNic.port);
+  if (ipInSubnet(dstInt, srcIp)) {
+    const nb = hopThroughPatches(host, srcNic.port, FRONT);
+    return { ok: !!nb && !!owner, why: owner ? null : 'no host at that address', ttl: 255 };
+  }
+  // Off-subnet, non-host target (e.g. a remote router / the internet): use the
+  // gateway path.
+  const gwStr = srcNic.gateway || (srcNic.ip === 'dhcp' ? dhcpGateway(host, srcNic.port) : null);
+  if (!gwStr) return { ok: false, why: 'no default gateway' };
+  if (owner) {
+    // route to the owning router's interface
+    const anyHost = state.devices.find(d => isHostDev(d) && d.id !== host.id);
+    const f = forwardPath(gatewayDeviceId(host, srcNic.port), dstInt);
+    return { ok: !!f.egress, why: f.error, ttl: 254 };
+  }
+  return { ok: false, why: 'destination unreachable' };
+}
+function gatewayDeviceId(host, port) {
+  const gwStr = (hostNics(host).find(n => n.port === port) || {}).gateway
+    || dhcpGateway(host, port);
+  const gw = gwStr && parseIp(gwStr);
+  const owner = gw && deviceHoldingAddr(gw.int);
+  return owner ? owner.dev.id : host.id;
+}
+
+function osExec(sess, raw) {
+  const dev = sess.dev;
+  const line = raw.trim();
+  if (!line) return { out: '' };
+  const win = hostOs(dev) === 'windows';
+  const toks = line.split(/\s+/);
+  const cmd = toks[0].toLowerCase();
+  const arg = toks.slice(1).filter(t => !t.startsWith('-') && !t.startsWith('/'));
+  const flags = toks.slice(1).filter(t => t.startsWith('-') || t.startsWith('/')).map(f => f.toLowerCase());
+
+  if (cmd === 'exit' || cmd === 'logout') return { out: '', close: true };
+  if (cmd === 'cls' || cmd === 'clear') return { out: '', clear: true };
+  if (cmd === 'hostname') return { out: (dev.hostname || dev.name || 'host').replace(/\s+/g, '-') };
+  if (cmd === 'whoami') return { out: dev.user || (win ? (dev.name || 'user') + '\\user' : 'user') };
+
+  if (win && cmd === 'ipconfig') return { out: winIpconfig(dev, flags.includes('/all')) };
+  if (cmd === 'ip' && hostOs(dev) === 'macos') return { out: `ip: command not found` };
+  if (!win && (cmd === 'ifconfig' || (cmd === 'ip' && /^a/.test(toks[1] || '')))) return { out: unixIfconfig(dev, cmd === 'ip') };
+
+  if (cmd === 'ping') {
+    if (!arg[0]) return { out: win ? 'Usage: ping target_name' : 'usage: ping destination' };
+    return { out: osPing(dev, arg[0], win) };
+  }
+  if ((win && cmd === 'tracert') || (!win && cmd === 'traceroute')) {
+    if (!arg[0]) return { out: 'usage: ' + cmd + ' target' };
+    return { out: osTracert(dev, arg[0], win) };
+  }
+  if (cmd === 'nslookup') {
+    if (!arg[0]) return { out: 'usage: nslookup name' };
+    return { out: osNslookup(dev, arg[0]) };
+  }
+  if (cmd === 'arp' && (flags.includes('-a') || win)) return { out: osArp(dev) };
+  if (win && cmd === 'getmac') return { out: hostNics(dev).map(n => nicMac(dev, n.port).replace(/:/g, '-')).join('\n') };
+  if ((win && cmd === 'route' && (toks[1] || '').toLowerCase() === 'print') ||
+      (!win && (cmd === 'netstat' && flags.some(f => /r/.test(f)) || (cmd === 'ip' && hostOs(dev)==='linux' && /^r/.test(toks[1] || ''))))) {
+    return { out: osRouteTable(dev, win) };
+  }
+  if (win && cmd === 'netstat' && flags.some(f => /r/.test(f))) return { out: osRouteTable(dev, true) };
+
+  // help
+  if (cmd === 'help' || cmd === '?' || (win && cmd === 'help')) {
+    return { out: win
+      ? 'Supported: ipconfig [/all], ping, tracert, nslookup, arp -a, getmac, route print, hostname, cls, exit'
+      : 'Supported: ifconfig / ip addr, ping, traceroute, nslookup, arp -a, netstat -rn / ip route, hostname, clear, exit' };
+  }
+  return { out: win
+    ? `'${toks[0]}' is not recognized as an internal or external command,\noperable program or batch file.`
+    : `${toks[0]}: command not found` };
+}
+
+function winIpconfig(dev, all) {
+  const nics = hostNics(dev);
+  const out = ['', 'Windows IP Configuration', ''];
+  if (all) {
+    out.push(`   Host Name . . . . . . . . . . . . : ${(dev.hostname || dev.name || 'host').replace(/\s+/g, '-')}`);
+    out.push(`   Node Type . . . . . . . . . . . . : Hybrid`);
+    out.push('');
+  }
+  if (!nics.length) { out.push('   Media disconnected'); return out.join('\n'); }
+  nics.forEach((n, i) => {
+    const ip = nicIp(dev, n.port);
+    const gw = n.gateway || (n.ip === 'dhcp' ? dhcpGateway(dev, n.port) : '');
+    out.push(`Ethernet adapter ${n.label || 'Ethernet' + (i ? ' ' + (i + 1) : '')}:`, '');
+    if (!ip) { out.push('   Media State . . . . . . . . . . . : Media disconnected', ''); return; }
+    if (all) {
+      out.push(`   Description . . . . . . . . . . . : Intel(R) Ethernet Connection`);
+      out.push(`   Physical Address. . . . . . . . . : ${nicMac(dev, n.port).replace(/:/g, '-')}`);
+      out.push(`   DHCP Enabled. . . . . . . . . . . : ${n.ip === 'dhcp' ? 'Yes' : 'No'}`);
+    }
+    out.push(`   IPv4 Address. . . . . . . . . . . : ${ipStr(ip.int)}(Preferred)`);
+    out.push(`   Subnet Mask . . . . . . . . . . . : ${ipStr(ip.mask)}`);
+    out.push(`   Default Gateway . . . . . . . . . : ${gw || ''}`);
+    if (all) {
+      const dns = dnsServersFor(dev, n.port);
+      if (n.ip === 'dhcp') {
+        const l = _dhcpLeases.get(leaseKey(dev.id, n.port));
+        if (l) out.push(`   DHCP Server . . . . . . . . . . . : ${ipStr(l.serverId ? (deviceInterfaces(deviceById(l.serverId))[0] || {ip:{int:0}}).ip.int : 0)}`);
+      }
+      out.push(`   DNS Servers . . . . . . . . . . . : ${(dns[0] || '')}`);
+      for (let k = 1; k < dns.length; k++) out.push(`                                       ${dns[k]}`);
+    }
+    out.push('');
+  });
+  return out.join('\n');
+}
+
+function unixIfconfig(dev, iproute) {
+  const nics = hostNics(dev);
+  const mac_os = hostOs(dev) === 'macos';
+  const out = [];
+  // Loopback first. macOS calls it lo0 with a hex netmask; Linux calls it lo
+  // with a dotted netmask — the two really do differ and a network person
+  // notices immediately.
+  if (iproute) out.push('1: lo: <LOOPBACK,UP,LOWER_UP> mtu 65536', '    inet 127.0.0.1/8 scope host lo');
+  else if (mac_os) out.push('lo0: flags=8049<UP,LOOPBACK,RUNNING,MULTICAST> mtu 16384', '        inet 127.0.0.1 netmask 0xff000000');
+  else out.push('lo: flags=73<UP,LOOPBACK,RUNNING> mtu 65536', '        inet 127.0.0.1 netmask 255.0.0.0');
+  nics.forEach((n, i) => {
+    const ip = nicIp(dev, n.port);
+    const dname = mac_os ? `en${i}` : `eth${i}`;
+    const mac = nicMac(dev, n.port).toLowerCase();
+    if (iproute) {
+      out.push(`${i + 2}: ${dname}: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500`);
+      out.push(`    link/ether ${mac}`);
+      if (ip) out.push(`    inet ${ipStr(ip.int)}/${ip.cidr} brd ${ipStr(broadcastOf(ip))} scope global ${dname}`);
+    } else if (mac_os) {
+      out.push(`${dname}: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500`);
+      out.push(`        ether ${mac}`);
+      if (ip) out.push(`        inet ${ipStr(ip.int)} netmask 0x${(ip.mask >>> 0).toString(16)} broadcast ${ipStr(broadcastOf(ip))}`);
+    } else {
+      out.push(`${dname}: flags=4163<UP,BROADCAST,RUNNING,MULTICAST> mtu 1500`);
+      if (ip) out.push(`        inet ${ipStr(ip.int)}  netmask ${ipStr(ip.mask)}  broadcast ${ipStr(broadcastOf(ip))}`);
+      out.push(`        ether ${mac}  txqueuelen 1000  (Ethernet)`);
+    }
+  });
+  return out.join('\n');
+}
+
+function osPing(dev, target, win) {
+  const t = osResolveTarget(dev, target);
+  if (t.err) return t.err;
+  const dstIp = ipStr(t.int);
+  const r = osReach(dev, t.int);
+  const nameLine = t.resolved ? `${target} [${dstIp}]` : dstIp;
+  if (win) {
+    const out = [`Pinging ${nameLine} with 32 bytes of data:`];
+    if (r.ok) {
+      for (let i = 0; i < 4; i++) out.push(`Reply from ${dstIp}: bytes=32 time<1ms TTL=${r.ttl || 128}`);
+      out.push('', `Ping statistics for ${dstIp}:`,
+        `    Packets: Sent = 4, Received = 4, Lost = 0 (0% loss),`,
+        `Approximate round trip times in milli-seconds:`,
+        `    Minimum = 0ms, Maximum = 0ms, Average = 0ms`);
+    } else {
+      for (let i = 0; i < 4; i++) out.push(`Request timed out.`);
+      out.push('', `Ping statistics for ${dstIp}:`,
+        `    Packets: Sent = 4, Received = 0, Lost = 4 (100% loss),`);
+      if (r.why) out.push(`  (${r.why})`);
+    }
+    return out.join('\n');
+  }
+  const out = [`PING ${nameLine}: 56 data bytes`];
+  if (r.ok) {
+    for (let i = 0; i < 4; i++) out.push(`64 bytes from ${dstIp}: icmp_seq=${i} ttl=${r.ttl || 64} time=0.4 ms`);
+    out.push('', `--- ${target} ping statistics ---`, `4 packets transmitted, 4 packets received, 0.0% packet loss`);
+  } else {
+    out.push('', `--- ${target} ping statistics ---`, `4 packets transmitted, 0 packets received, 100.0% packet loss`);
+    if (r.why) out.push(`ping: ${r.why}`);
+  }
+  return out.join('\n');
+}
+
+function osTracert(dev, target, win) {
+  const t = osResolveTarget(dev, target);
+  if (t.err) return t.err;
+  const dstIp = ipStr(t.int);
+  const out = win
+    ? [`Tracing route to ${t.resolved ? target + ' [' + dstIp + ']' : dstIp}`, `over a maximum of 30 hops:`, '']
+    : [`traceroute to ${target} (${dstIp}), 30 hops max`];
+  // originate from the host's gateway if off-subnet, else it's one hop
+  const srcNic = hostEgressNic(dev, t.int);
+  const srcIp = srcNic && nicIp(dev, srcNic.port);
+  if (srcIp && ipInSubnet(t.int, srcIp)) {
+    out.push(win ? `  1    <1 ms    <1 ms    <1 ms  ${dstIp}` : ` 1  ${dstIp}  0.4 ms  0.3 ms  0.3 ms`);
+    if (win) out.push('', 'Trace complete.');
+    return out.join('\n');
+  }
+  const gwId = gatewayDeviceId(dev, srcNic ? srcNic.port : hostPort(dev));
+  const gwStr = (srcNic && srcNic.gateway) || dhcpGateway(dev, srcNic ? srcNic.port : hostPort(dev));
+  let n = 1;
+  if (gwStr) out.push(win ? `  ${n}    <1 ms    <1 ms    <1 ms  ${gwStr}` : ` ${n}  ${gwStr}  0.5 ms  0.4 ms  0.4 ms`);
+  n++;
+  const fwd = forwardPath(gwId, t.int);
+  for (const leg of fwd.legs) {
+    if (leg.id === gwId) continue;
+    const r = deviceById(leg.id);
+    const iface = deviceInterfaces(r).find(i => ifKey(i) === leg.inIf);
+    const addr = iface ? ipStr(iface.ip.int) : r.name;
+    out.push(win ? `  ${n}    <1 ms    <1 ms    <1 ms  ${addr}` : ` ${n}  ${addr}  0.6 ms  0.5 ms  0.5 ms`);
+    n++;
+  }
+  if (fwd.egress || (srcIp && ipInSubnet(t.int, srcIp))) {
+    out.push(win ? `  ${n}    <1 ms    <1 ms    <1 ms  ${dstIp}` : ` ${n}  ${dstIp}  0.7 ms  0.6 ms  0.6 ms`);
+  } else if (fwd.error) {
+    out.push(win ? `  ${n}     *        *        *     Request timed out.` : ` ${n}  * * *`);
+  }
+  if (win) out.push('', 'Trace complete.');
+  return out.join('\n');
+}
+
+function osNslookup(dev, name) {
+  const servers = dnsServersFor(dev, hostPort(dev));
+  const svr = servers[0] || '(none)';
+  const r = dnsResolve(dev, name);
+  const head = [`Server:  ${svr}`, `Address:  ${svr}#53`, ''];
+  if (r.ok) return head.concat([`Name:    ${name}`, `Address: ${r.address}`]).join('\n');
+  if (!servers.length) return `;; connection timed out; no servers could be reached`;
+  return head.concat([`** server can't find ${name}: NXDOMAIN`]).join('\n');
+}
+
+function osArp(dev) {
+  const c = arpCaches.get(dev.id);
+  const win = hostOs(dev) === 'windows';
+  if (!c || !c.size) return win ? 'No ARP Entries Found.\n(run a ping first to populate the cache)' : '(no entries — run a ping first)';
+  if (win) {
+    const out = ['', `Interface: ${ipStr((nicIp(dev, hostPort(dev)) || { int: 0 }).int)} --- 0x2`,
+      '  Internet Address      Physical Address      Type'];
+    for (const [ip, mac] of c) out.push(`  ${ip.padEnd(22)}${mac.replace(/:/g, '-').toLowerCase()}     dynamic`);
+    return out.join('\n');
+  }
+  const out = [];
+  for (const [ip, mac] of c) out.push(`? (${ip}) at ${mac.toLowerCase()} [ether] on eth0`);
+  return out.join('\n');
+}
+
+function osRouteTable(dev, win) {
+  const nics = hostNics(dev);
+  if (win) {
+    const out = ['===========================================================================',
+      'Interface List', '===========================================================================',
+      'IPv4 Route Table', '===========================================================================',
+      'Active Routes:', 'Network Destination        Netmask          Gateway       Interface  Metric'];
+    for (const n of nics) {
+      const ip = nicIp(dev, n.port); if (!ip) continue;
+      const gw = n.gateway || dhcpGateway(dev, n.port);
+      if (gw) out.push(`          0.0.0.0          0.0.0.0    ${(gw + '').padEnd(13)}${ipStr(ip.int).padEnd(11)} 25`);
+      out.push(`   ${ipStr(ip.network).padEnd(15)}  ${ipStr(ip.mask).padEnd(13)}   On-link    ${ipStr(ip.int).padEnd(11)} 25`);
+    }
+    return out.join('\n');
+  }
+  const out = ['Kernel IP routing table',
+    'Destination     Gateway         Genmask         Flags   Iface'];
+  for (const n of nics) {
+    const ip = nicIp(dev, n.port); if (!ip) continue;
+    const gw = n.gateway || dhcpGateway(dev, n.port);
+    if (gw) out.push(`0.0.0.0         ${gw.padEnd(15)} 0.0.0.0         UG      eth0`);
+    out.push(`${ipStr(ip.network).padEnd(15)} 0.0.0.0         ${ipStr(ip.mask).padEnd(15)} U       eth0`);
+  }
+  return out.join('\n');
+}
 
 //////////////////// Cisco IOS CLI ////////////////////
 // A working terminal, not a print-out. Two rules make the difference:
@@ -10912,7 +11240,30 @@ function openConsole(dev) {
 }
 function syncTermPrompt() {
   const pr = document.getElementById('term-prompt');
-  if (pr && _termSess) pr.textContent = iosPrompt(_termSess) + ' ';
+  if (pr && _termSess) pr.textContent = _termSess.osShell ? osPromptStr(_termSess) : iosPrompt(_termSess) + ' ';
+}
+
+// A host's OS shell. Same panel as the switch CLI, different session.
+function openHostTerminal(dev) {
+  const box = document.getElementById('term');
+  const out = document.getElementById('term-out');
+  const inp = document.getElementById('term-in');
+  const title = document.getElementById('term-title');
+  if (!box) return;
+  _termSess = { dev, osShell: true, user: dev.user };
+  _termHist = []; _termHistAt = 0;
+  const osName = { windows: 'Windows', macos: 'macOS', linux: 'Linux' }[hostOs(dev)] || 'Windows';
+  title.textContent = `${(dev.hostname || dev.name)} — ${osName}`;
+  out.innerHTML = '';
+  termPrint(out, hostOs(dev) === 'windows'
+    ? `Microsoft Windows [Version 10.0.19045]\n(c) Microsoft Corporation. All rights reserved.`
+    : `Last login: today on console`, 'sys');
+  termPrint(out, hostOs(dev) === 'windows'
+    ? `Try: ipconfig /all, ping <ip>, tracert <ip>, nslookup <name>, arp -a, route print`
+    : `Try: ifconfig, ip addr, ping <ip>, traceroute <ip>, nslookup <name>, arp -a, ip route`, 'sys');
+  syncTermPrompt();
+  box.classList.remove('hidden');
+  setTimeout(() => inp.focus(), 30);
 }
 function termPrint(out, text, cls) {
   const div = document.createElement('div');
@@ -10932,11 +11283,13 @@ function termPrint(out, text, cls) {
       const line = inp.value;
       inp.value = '';
       if (!_termSess) return;
-      termPrint(out, iosPrompt(_termSess) + ' ' + line, 'cmd');
+      const isOs = _termSess.osShell;
+      termPrint(out, (isOs ? osPromptStr(_termSess) : iosPrompt(_termSess) + ' ') + line, 'cmd');
       if (line.trim()) { _termHist.push(line); _termHistAt = _termHist.length; }
-      const res = iosExec(_termSess, line);
+      const res = isOs ? osExec(_termSess, line) : iosExec(_termSess, line);
       if (res.close) { box.classList.add('hidden'); _termSess = null; return; }
-      if (res.out) termPrint(out, res.out, /Invalid|Incomplete|Ambiguous|Unrecognized/.test(res.out) ? 'err' : '');
+      if (res.clear) { out.innerHTML = ''; syncTermPrompt(); return; }
+      if (res.out) termPrint(out, res.out, /not recognized|command not found|could not find|cannot resolve|Invalid|Incomplete|Ambiguous|Unrecognized/.test(res.out) ? 'err' : '');
       syncTermPrompt();
     } else if (e.key === 'ArrowUp') {
       if (_termHistAt > 0) { _termHistAt--; inp.value = _termHist[_termHistAt] || ''; }
