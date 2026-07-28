@@ -1273,7 +1273,9 @@ function buildRoom(x1, z1, x2, z2, y0) {
   const wallH = L.h;
   const corners = [[x1, z1], [x2, z1], [x2, z2], [x1, z2], [x1, z1]];
   for (let i = 0; i < 4; i++) {
-    const w = { id: uid(), x1: corners[i][0], z1: corners[i][1], x2: corners[i + 1][0], z2: corners[i + 1][1], h: wallH, y0 };
+    // The room's four walls take the finish chosen in the toolbar, so "build a
+    // brick room" is one action.
+    const w = { id: uid(), x1: corners[i][0], z1: corners[i][1], x2: corners[i + 1][0], z2: corners[i + 1][1], h: wallH, y0, material: pendingWallMaterial };
     state.walls.push(w);
     buildWall(w);
   }
