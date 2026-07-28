@@ -10,6 +10,18 @@ install plan a tech follows on site. After the sim is solid: real-time
 multi-user collaboration (Google-Docs style). Owner: Tom (`Cand1enut` on
 GitHub).
 
+## Top priorities (owner, restated Jul 2026)
+
+1. **Realism: 1:1 true-to-life networking — feature complete, easy to use, bug
+   free.** This is the product.
+2. **Graphical beauty.** The models must look real. Reference fidelity: the
+   UniFi gateway product photo (device chassis) and Home Design 3D's Industrial
+   House (buildings). The reference is the QUALITY bar, not a layout to copy —
+   the user must be able to build ANY real building they walk into. Keep
+   graphics a forefront concern in everything designed from here on.
+
+Everything below serves these two.
+
 ## Ground rules (owner-set, do not renegotiate)
 
 1. Push to GitHub for **every version**. Remote is
@@ -697,6 +709,11 @@ thickness), furniture with real detail, device chassis detail, and richer PBR
 materials with actual texture maps. Up to 10 GB budget — real geometry and
 texture data, not procedural stand-ins. "Realistic buildings" is the phrase.
 This is owner-priority right after the "things I just said" list (A/C/D/E).
+
+**G. Functioning doors (owner) — after graphics.** There are no doors yet.
+Need door openings in walls with a frame and a door leaf that can open/close,
+placeable like windows. Part of the buildings/graphics work (framed openings in
+walls) plus interaction (swing).
 
 ## Definition of done — the data centre build
 
