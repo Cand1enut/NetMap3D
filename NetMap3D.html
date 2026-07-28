@@ -12310,6 +12310,25 @@ function updateHover(cx, cy) {
     const def = DEVICE_TYPES[pendingType];
     if (def.field) {
       const mounts = def.mounts || ['ceiling'];
+      // Set-on-surface: point at the TOP of any furniture or device (a desk, a
+      // shelf, a cabinet, even another switch) and the device sits on it. This
+      // was the "big nono" — you could not put a modem on a desk or an AP on a
+      // cabinet. A top face is one whose world normal points mostly up.
+      const surf = firstHit(collectDeviceBodies());
+      if (surf) {
+        const n = surf.face.normal.clone().transformDirection(surf.object.matrixWorld).normalize();
+        const underId = surf.object.userData.deviceId;
+        const under = deviceById(underId);
+        if (n.y > 0.7 && underId !== placeExistingId && under) {
+          const topY = surf.point.y;
+          makeGhost(8, 8, 8, true);
+          ghost.position.set(surf.point.x, topY + 4, surf.point.z);
+          ghost.rotation.y = 0;
+          hoverInfo = { mountKind: 'desk', x: surf.point.x, z: surf.point.z, y0: topY, onId: underId };
+          setStatus(`${def.label} — set on ${DEVICE_TYPES[under.type].label}. Click to place.`);
+          return;
+        }
+      }
       // wall mounting when pointing at a wall (only if this product wall-mounts)
       if (mounts.includes('wall')) {
         const wh = firstHit([...wallMeshes.values()]);

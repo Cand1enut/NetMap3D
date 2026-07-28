@@ -663,12 +663,12 @@ pages (Insights/Topology map, per-device detail with port panel, firewall/traffi
 rules that edit ACLs, client detail, WiFi with band/guest options, per-port PoE),
 and make them feel like the real dashboards. Each page still bound to the model.
 
-**E. Can't place devices on tables/furniture (owner: "big nono").** Field
-devices only mount to floor/wall/ceiling/desk-of-a-specific-desk. The owner
-wants to drop gear onto ANY furniture surface — a switch on a desk, a modem on a
-shelf, an AP on a cabinet top. Needs surface detection (raycast the top face of
-furniture) and snap-to-surface placement, with the device sitting on top and
-moving/deleting with sane behaviour.
+**E. Can't place devices on tables/furniture (owner: "big nono")** — DONE
+v0.43.0. Point at the TOP of any furniture or device (a desk, shelf, cabinet, or
+even another switch) and the field device sits on it — surface detection is a
+raycast against device bodies with a mostly-up face normal, placed at the hit
+height. Verified a modem sits cleanly on a desktop with a contact shadow, and
+the placement persists through save/load.
 
 **F. Graphics: real geometric detail, NOT more shadows/lighting (owner,
 emphatic).** The lighting/shadow pass is done (VSM). What is missing is
