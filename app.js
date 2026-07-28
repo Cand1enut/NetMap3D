@@ -242,29 +242,33 @@ Object.assign(DEVICE_TYPES, BRAND_PACK);
 // and only then hands Ethernet to the customer router's WAN port. Each link in
 // that chain can be missing on a real job, so each is modelled separately.
 const WAN_PACK = {
+  // The ISP / provider network. It is not a single-drop box — one provider POP
+  // serves many circuits, so it has several handoff ports (a campus with
+  // several buildings, or several tenants, each draws its own circuit here).
   internet: {
-    label: 'Internet', short: 'WAN', uh: 0, ports: 1, rows: 1, depth: 0,
+    label: 'Internet (ISP)', short: 'WAN', uh: 0, ports: 8, rows: 1, depth: 0,
     color: 0x2f6fdb, field: true, mounts: ['desk'], shape: 'cloud',
     isInternet: true, cat: 'WAN'
   },
-  // Where the provider's responsibility ends and the customer's begins. The
-  // service drop from the street lands here.
-  demarc: {
-    label: 'Demarc / NID', short: 'Demarc', uh: 0, ports: 2, rows: 1, depth: 0,
-    color: 0x8a9099, field: true, mounts: ['wall'], shape: 'box',
-    isDemarc: true, cat: 'WAN'
-  },
-  // Fibre: the ONT terminates the optical service and outputs Ethernet.
+  // Fibre: the ONT terminates the optical service and outputs Ethernet. The ONT
+  // (or modem) IS the demarcation point in a typical install — the point where
+  // the provider's service ends and the customer's Ethernet begins — so there
+  // is no separate demarc box. Real business ONTs (Calix, Nokia) carry one PON/
+  // fibre uplink plus up to four GE handoffs: port 1 is the fibre/service side,
+  // 2-5 are the Ethernet outs.
   ont: {
-    label: 'Fiber ONT', short: 'ONT', uh: 0, ports: 2, rows: 1, depth: 0,
+    label: 'Fiber ONT (demarc)', short: 'ONT', uh: 0, ports: 5, rows: 1, depth: 0,
     color: 0xe8ebef, field: true, mounts: ['wall', 'desk'], shape: 'box',
-    isCpeTerm: true, service: 'fiber', cat: 'WAN'
+    roleMap: { 1: 'WAN' },   // port 1 = fibre/service in
+    isCpeTerm: true, isDemarc: true, service: 'fiber', cat: 'WAN'
   },
-  // Coax: DOCSIS modem. Same job, different medium.
+  // Coax: DOCSIS modem. Same job, different medium and also the demarc — coax in
+  // on port 1, up to four Ethernet handoffs out.
   modem: {
-    label: 'Cable modem (DOCSIS)', short: 'Modem', uh: 0, ports: 2, rows: 1, depth: 0,
+    label: 'Cable modem (demarc)', short: 'Modem', uh: 0, ports: 5, rows: 1, depth: 0,
     color: 0x22262c, field: true, mounts: ['desk', 'wall'], shape: 'deskbox',
-    isCpeTerm: true, service: 'cable', cat: 'WAN'
+    roleMap: { 1: 'WAN' },   // port 1 = coax/service in
+    isCpeTerm: true, isDemarc: true, service: 'cable', cat: 'WAN'
   }
 };
 Object.assign(DEVICE_TYPES, WAN_PACK);
@@ -4909,12 +4913,10 @@ function wanUplink(router) {
       hops.push(cur);
       if (isInternetNode(cur)) {
         if (!term) {
-          // reached the Internet without passing through provider terminating
-          // equipment — name whichever of the two situations it actually is
-          const viaDemarc = hops.some(isDemarc);
-          return { ok: false, reason: viaDemarc
-            ? `Service reaches the demarc but nothing terminates it — add an ONT or modem between the demarc and ${router.name}`
-            : `${router.name} port ${first.myPort} is cabled straight to the Internet with no demarc or terminating equipment — a WAN port needs a provider handoff, not a direct link` };
+          // Reached the Internet with no ONT/modem in between. The terminating
+          // box IS the demarc, so a WAN port cabled straight to the ISP has no
+          // provider handoff at all.
+          return { ok: false, reason: `${router.name} port ${first.myPort} is cabled straight to the Internet with no ONT or modem — a WAN port needs the provider's terminating box (which is the demarc), not a direct link to the ISP` };
         }
         const circ = circuitOf(term);
         if (!circ) return { ok: false, reason: `${term.name} is installed but has no provisioned circuit — the service was never turned up` };
@@ -4936,7 +4938,6 @@ function wanUplink(router) {
       if (!circ) return { ok: false, reason: `${last.name} has no provisioned circuit — no signal from the ISP` };
       return { ok: false, reason: `${last.name} is provisioned but nothing links it onward to the Internet` };
     }
-    if (last && isDemarc(last)) return { ok: false, reason: `Service reaches ${last.name} but there's no ONT or modem to terminate it` };
   }
   return { ok: false, reason: `${router.name}'s WAN port leads nowhere — no provider equipment on the far end` };
 }
@@ -4945,7 +4946,7 @@ function wanUplink(router) {
 function pingInternet(host) {
   const ip = hostIp(host);
   if (!ip) return { ok: false, reason: `${host.name} has no valid IP` };
-  if (!internetNodes().length) return { ok: false, reason: 'No Internet node placed — add one from the WAN category, plus an ONT or modem and a demarc' };
+  if (!internetNodes().length) return { ok: false, reason: 'No Internet node placed — add one from the WAN category, plus an ONT or modem (which is the demarc) to terminate the service' };
   const walk = l2Walk(host, { vlan: hostVlan(host) });
   if (!walk.routers.size) return { ok: false, reason: `${host.name}'s subnet ${subnetLabel(ip)} has no router / default gateway reachable` };
 
@@ -10625,6 +10626,14 @@ function migrateDhcpScopes(devices) {
   }
 }
 
+// The separate demarc device was removed — the ONT/modem is the demarc. A save
+// written before that carries type 'demarc', which no longer exists in the
+// catalog and would restore as a broken orphan. Convert it to a fibre ONT,
+// which is now the demarcation point, so old maps keep working.
+function migrateDemarc(devices) {
+  for (const d of devices || []) if (d.type === 'demarc') d.type = 'ont';
+}
+
 function restore(json) {
   let data;
   try { data = JSON.parse(json); } catch { setStatus('Could not parse that file.'); return; }
@@ -10637,6 +10646,7 @@ function restore(json) {
   nextId = data.nextId || 1000;
   migrateCableSides(state.cables);
   migrateDhcpScopes(state.devices);
+  migrateDemarc(state.devices);
   // re-register custom devices BEFORE rebuilding anything that uses them
   Object.assign(DEVICE_TYPES, state.customTypes);
   populateLibrary();

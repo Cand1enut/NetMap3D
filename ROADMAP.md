@@ -633,6 +633,35 @@ swatch, so a modelled room looks like the room. Same for gear: a Cisco chassis
 and a UniFi switch have visibly different finishes. This is what lets a build
 look like its real-life counterpart rather than like a diagram.
 
+## Owner review, Jul 2026 (round 2) — polish + depth
+
+Working through these in order, each completed before the next:
+
+**A. Variable-size racks (owner: "big thing").** Racks are hardcoded 42U
+(RACK_UNITS = 42, RACK_H derived globally). Real racks come in many sizes — 4U/
+6U/9U/12U wall-mount, 24U, 42U, 45U, 48U full-height, plus 2-post open frame vs
+4-post enclosed. Rack height (U count) must be per-rack (rack.units), the frame
+geometry/rails/posts/colliders must follow it, device U-placement must validate
+against the actual size, rackDressRoute must use per-rack height, and the save
+format carries it. A size picker when placing/selecting a rack.
+
+**B. WAN gear has too few ports (owner: "they only have one port?!?!?").** The
+internet node has 1 port; a real ISP handoff serves many circuits. ONT/modem
+have a service input plus multiple Ethernet outs. Give the WAN chain realistic
+port counts and clear upstream/downstream so the internet→demarc→ONT/modem→
+router chain is buildable and sensible. — DONE v0.41.0.
+
+**C. Ease of use is clunky (owner, repeatedly).** Still the standing UX verdict.
+Concrete: opening a console/config should be fewer clicks; the sim panel is
+cramped; placing and cabling should feel direct. This is the same brief as the
+"point at the thing" note above. Needs a focused pass, not one fix.
+
+**D. Cloud UIs not fully fleshed out (owner).** UniFi/Meraki/Omada consoles have
+the core pages but are thinner than the real products. Flesh out: more real
+pages (Insights/Topology map, per-device detail with port panel, firewall/traffic
+rules that edit ACLs, client detail, WiFi with band/guest options, per-port PoE),
+and make them feel like the real dashboards. Each page still bound to the model.
+
 ## Definition of done — the data centre build
 
 Owner-set acceptance test for the whole simulation: **build an entire data
