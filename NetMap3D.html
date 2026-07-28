@@ -6872,16 +6872,134 @@ function setXray(on) {
   document.getElementById('btn-xray').classList.toggle('active', on);
 }
 
+// The three.js build here ships without BufferGeometryUtils, so this is a
+// minimal merge: everything is made non-indexed (box geometry is indexed) and
+// its position/normal/uv streams are concatenated. Enough to fuse the wall
+// segments around a window or door into one mesh that still raycasts and
+// textures as a single wall.
+function mergeGeoms(list) {
+  const parts = list.map(g => g.index ? g.toNonIndexed() : g);
+  const total = parts.reduce((n, g) => n + g.attributes.position.count, 0);
+  const pos = new Float32Array(total * 3), nrm = new Float32Array(total * 3), uv = new Float32Array(total * 2);
+  let o3 = 0, o2 = 0;
+  for (const g of parts) {
+    pos.set(g.attributes.position.array, o3);
+    nrm.set(g.attributes.normal.array, o3);
+    uv.set(g.attributes.uv.array, o2);
+    o3 += g.attributes.position.count * 3; o2 += g.attributes.position.count * 2;
+  }
+  const out = new THREE.BufferGeometry();
+  out.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+  out.setAttribute('normal', new THREE.BufferAttribute(nrm, 3));
+  out.setAttribute('uv', new THREE.BufferAttribute(uv, 2));
+  return out;
+}
+// Standard rough openings, in inches.
+const OPENING_SIZES = {
+  window: { w: 36, h: 48, sill: 36 },
+  door:   { w: 36, h: 84, sill: 0 },
+  storefront: { w: 72, h: 84, sill: 0 },   // big shop-front glass, floor to head
+};
+function wallOpenings(w) { return (w.openings || []).filter(o => o && o.kind); }
+
+// The wall body as solid boxes around every opening: full-height piers between
+// openings, a header over each, and a sill under each window. Returns a merged
+// geometry (or a plain box when there are no openings), with UVs planar-projected
+// onto the wall face so brick tiles continuously across piers and headers.
+function wallBodyGeometry(w, len, h) {
+  const ops = wallOpenings(w).map(o => {
+    const std = OPENING_SIZES[o.kind] || OPENING_SIZES.window;
+    const width = o.w || std.w, height = o.h || std.h, sill = o.sill !== undefined ? o.sill : std.sill;
+    const cx = -len / 2 + (o.at !== undefined ? o.at : 0.5) * len;
+    return { x1: Math.max(-len / 2, cx - width / 2), x2: Math.min(len / 2, cx + width / 2),
+      y1: -h / 2 + sill, y2: -h / 2 + sill + height };
+  }).filter(o => o.x2 > o.x1).sort((a, b) => a.x1 - b.x1);
+  if (!ops.length) return new THREE.BoxGeometry(len, h, WALL_T);
+
+  const boxes = [];
+  const addBox = (x1, x2, y1, y2) => {
+    if (x2 - x1 < 0.1 || y2 - y1 < 0.1) return;
+    const g = new THREE.BoxGeometry(x2 - x1, y2 - y1, WALL_T);
+    g.translate((x1 + x2) / 2, (y1 + y2) / 2, 0);
+    boxes.push(g);
+  };
+  let cursor = -len / 2;
+  for (const o of ops) {
+    if (o.x1 > cursor) addBox(cursor, o.x1, -h / 2, h / 2);   // full-height pier before the opening
+    addBox(o.x1, o.x2, o.y2, h / 2);                          // header above
+    if (o.y1 > -h / 2) addBox(o.x1, o.x2, -h / 2, o.y1);      // sill below (windows)
+    cursor = Math.max(cursor, o.x2);
+  }
+  if (cursor < len / 2) addBox(cursor, len / 2, -h / 2, h / 2);   // pier after the last opening
+  const merged = mergeGeoms(boxes);
+  // planar UVs across the whole wall face so the texture is continuous
+  const p = merged.attributes.position.array, uv = new Float32Array(merged.attributes.position.count * 2);
+  for (let i = 0, j = 0; i < p.length; i += 3, j += 2) {
+    uv[j] = (p[i] + len / 2) / len; uv[j + 1] = (p[i + 1] + h / 2) / h;
+  }
+  merged.setAttribute('uv', new THREE.BufferAttribute(uv, 2));
+  return merged;
+}
+
+// Frame + glass (window) or frame + leaf (door), built in the wall's local
+// space and added as children of the wall body. Cosmetic — not raycast for
+// wall hits, which keeps placement/drilling working exactly as before.
+const glassMat = new THREE.MeshPhysicalMaterial({
+  color: 0xaecbe0, roughness: 0.05, metalness: 0, transmission: 0.85, transparent: true,
+  opacity: 0.34, ior: 1.5, envMapIntensity: 1, thickness: 1, side: THREE.DoubleSide
+});
+const frameMatWhite = new THREE.MeshStandardMaterial({ color: 0xf2f3f5, roughness: 0.5, metalness: 0.1 });
+const doorLeafMat = new THREE.MeshStandardMaterial({ color: 0xb9942f, roughness: 0.55, metalness: 0.05 });
+function buildOpeningTrim(w, len, h) {
+  const grp = new THREE.Group();
+  for (const o of wallOpenings(w)) {
+    const std = OPENING_SIZES[o.kind] || OPENING_SIZES.window;
+    const width = o.w || std.w, height = o.h || std.h, sill = o.sill !== undefined ? o.sill : std.sill;
+    const cx = -len / 2 + (o.at !== undefined ? o.at : 0.5) * len;
+    const cy = -h / 2 + sill + height / 2;
+    const fr = 1.5, fd = WALL_T + 1;                     // frame thickness / depth
+    // frame: four bars around the opening
+    const bar = (bw, bh, x, y) => { const m = new THREE.Mesh(new THREE.BoxGeometry(bw, bh, fd), frameMatWhite);
+      m.position.set(x, y, 0); m.castShadow = true; grp.add(m); };
+    bar(width + fr * 2, fr, cx, cy + height / 2);        // head
+    bar(width + fr * 2, fr, cx, cy - height / 2);        // sill/threshold
+    bar(fr, height, cx - width / 2, cy);                 // left jamb
+    bar(fr, height, cx + width / 2, cy);                 // right jamb
+    if (o.kind === 'door') {
+      // a leaf hinged on the left, opened by o.open (0 closed .. 1 ~90°)
+      const leaf = new THREE.Group();
+      const panel = new THREE.Mesh(new THREE.BoxGeometry(width - 1, height - 1, 1.4), doorLeafMat);
+      panel.position.set((width - 1) / 2, 0, 0); panel.castShadow = true;
+      const knob = new THREE.Mesh(new THREE.SphereGeometry(0.9, 12, 12), mat(0xcaa64a, { metalness: 0.9, roughness: 0.3 }));
+      knob.position.set(width - 4, 0, 1.1); leaf.add(panel); leaf.add(knob);
+      leaf.position.set(cx - width / 2, cy, 0);
+      leaf.rotation.y = -(o.open || 0) * Math.PI * 0.5;
+      leaf.userData = { isDoorLeaf: true, wallId: w.id, openingId: o.id };
+      grp.add(leaf);
+    } else {
+      // glass pane, plus a cross mullion so it reads as a real window
+      const glass = new THREE.Mesh(new THREE.PlaneGeometry(width - 1, height - 1), glassMat);
+      glass.position.set(cx, cy, 0); grp.add(glass);
+      const mv = new THREE.Mesh(new THREE.BoxGeometry(0.7, height - 1, WALL_T + 0.4), frameMatWhite);
+      mv.position.set(cx, cy, 0); grp.add(mv);
+      const mh = new THREE.Mesh(new THREE.BoxGeometry(width - 1, 0.7, WALL_T + 0.4), frameMatWhite);
+      mh.position.set(cx, cy, 0); grp.add(mh);
+    }
+  }
+  return grp;
+}
+
 function buildWall(w) {
   const dx = w.x2 - w.x1, dz = w.z2 - w.z1;
   const len = Math.hypot(dx, dz);
   const h = w.h || WALL_H;
-  const m = new THREE.Mesh(new THREE.BoxGeometry(len, h, WALL_T), makeWallMaterial(len, h, w.material));
+  const m = new THREE.Mesh(wallBodyGeometry(w, len, h), makeWallMaterial(len, h, w.material));
   m.position.set((w.x1 + w.x2) / 2, (w.y0 || 0) + h / 2, (w.z1 + w.z2) / 2);
   m.rotation.y = Math.atan2(-dz, dx);
   m.castShadow = true;
   m.receiveShadow = true;
   m.userData = { isWall: true, wallId: w.id };
+  if (wallOpenings(w).length) m.add(buildOpeningTrim(w, len, h));
   // built-to-scale: every wall carries its length label
   const lbl = makeTextSprite(fmtLen(len), '#cfe0ff');
   lbl.position.set(0, h / 2 + 5, 0);
@@ -6935,18 +7053,32 @@ function deleteHole(id) {
   scheduleReroute();
 }
 
+// Dispose a wall's mesh (and cosmetic trim children) without touching its holes
+// or removing it from state — used by rebuildWall.
+function disposeWallMesh(id) {
+  const m = wallMeshes.get(id);
+  if (!m) return;
+  scene.remove(m);
+  m.geometry.dispose();
+  wallMats.delete(m.material);
+  if (m.material.map) m.material.map.dispose();
+  if (m.material.normalMap) m.material.normalMap.dispose();
+  m.material.dispose();
+  m.traverse(o => { if (o.geometry && o !== m) o.geometry.dispose(); });
+  wallMeshes.delete(id);
+}
+// Rebuild a wall in place after its openings or material change.
+function rebuildWall(id) {
+  const w = state.walls.find(x => x.id === id);
+  if (!w) return;
+  disposeWallMesh(id);
+  buildWall(w);
+  applyLevelVisibility();
+}
+
 function deleteWall(id) {
   for (const h of state.holes.filter(h => h.wallId === id)) deleteHole(h.id);
-  const m = wallMeshes.get(id);
-  if (m) {
-    scene.remove(m);
-    m.geometry.dispose();
-    wallMats.delete(m.material);
-    if (m.material.map) m.material.map.dispose();
-    if (m.material.normalMap) m.material.normalMap.dispose();
-    m.material.dispose();
-    wallMeshes.delete(id);
-  }
+  disposeWallMesh(id);
   removeFromArr(state.walls, w => w.id === id);
   scheduleReroute();
 }
@@ -14084,23 +14216,54 @@ function showWallProps(id) {
   const holes = state.holes.filter(h => h.wallId === id).length;
   propsTitle.textContent = 'Wall';
   const curMat = WALL_MATERIALS[w.material] ? w.material : 'drywall';
+  const ops = w.openings || [];
+  const opRows = ops.map((o, i) =>
+    `<div class="row" data-op="${i}" style="gap:5px">
+       <span class="k" style="font-size:11px;text-transform:capitalize">${o.kind}</span>
+       <input type="range" class="op-at" min="5" max="95" value="${Math.round((o.at !== undefined ? o.at : 0.5) * 100)}" style="flex:1">
+       ${o.kind === 'door' ? `<button class="op-swing" title="Open/close">${o.open ? 'Close' : 'Open'}</button>` : ''}
+       <button class="op-del" title="Remove">×</button></div>`).join('');
   propsBody.innerHTML = `
     ${row('Length', (len / 12).toFixed(1) + ' ft')}
     ${row('Height', ((w.h || WALL_H) / 12).toFixed(1) + ' ft')}
     <div class="row"><span class="k">Material</span>
       <select id="wall-mat" style="width:130px">${Object.entries(WALL_MATERIALS).map(([k, d]) =>
         `<option value="${k}" ${k === curMat ? 'selected' : ''}>${d.label}</option>`).join('')}</select></div>
+    <div class="row" style="margin-top:8px"><span class="k">Openings</span></div>${opRows}
+    <div class="row" style="gap:6px;flex-wrap:wrap">
+      <button id="wall-add-win">+ Window</button>
+      <button id="wall-add-door">+ Door</button>
+      <button id="wall-add-front">+ Storefront</button></div>
     ${row('Drilled holes', holes)}
     <button id="wall-del" class="danger">Delete wall</button>`;
   propsEl.classList.remove('hidden');
   selected = { kind: 'wall', id };
   const matSel = document.getElementById('wall-mat');
-  matSel.onchange = () => {
-    w.material = matSel.value;
-    const m = wallMeshes.get(id);
-    if (m) { wallMats.delete(m.material); m.material.dispose && m.material.dispose();
-      m.material = makeWallMaterial(len, w.h || WALL_H, w.material); }
+  matSel.onchange = () => { w.material = matSel.value; rebuildWall(id); };
+  // Add an opening at the least-crowded position, then rebuild the wall.
+  const addOpening = (kind) => {
+    w.openings = w.openings || [];
+    const used = w.openings.map(o => o.at !== undefined ? o.at : 0.5);
+    let at = 0.5; let best = -1;
+    for (const cand of [0.5, 0.25, 0.75, 0.15, 0.85, 0.4, 0.6]) {
+      const d = Math.min(1, ...used.map(u => Math.abs(u - cand)));
+      if (d > best) { best = d; at = cand; }
+    }
+    w.openings.push({ id: uid(), kind, at });
+    undoPush(); rebuildWall(id); showWallProps(id);
   };
+  document.getElementById('wall-add-win').onclick = () => addOpening('window');
+  document.getElementById('wall-add-door').onclick = () => addOpening('door');
+  document.getElementById('wall-add-front').onclick = () => addOpening('storefront');
+  for (const el of propsBody.querySelectorAll('[data-op]')) {
+    const i = +el.dataset.op;
+    const at = el.querySelector('.op-at');
+    if (at) at.oninput = () => { w.openings[i].at = +at.value / 100; rebuildWall(id); };
+    const del = el.querySelector('.op-del');
+    if (del) del.onclick = () => { w.openings.splice(i, 1); undoPush(); rebuildWall(id); showWallProps(id); };
+    const sw = el.querySelector('.op-swing');
+    if (sw) sw.onclick = () => { w.openings[i].open = w.openings[i].open ? 0 : 1; rebuildWall(id); showWallProps(id); };
+  }
   document.getElementById('wall-del').onclick = () => {
     if (confirm('Delete this wall (and its holes)?')) { undoPush(); deleteWall(id); hideProps(); }
   };

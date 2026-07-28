@@ -670,6 +670,17 @@ prominent primary button (openDeviceConsole routes IOS/UniFi/Meraki/Omada/host
 by vendor). Still open, needs more passes: the cramped sim panel, direct
 placement/cabling, fewer clicks throughout — the "point at the thing" brief.
 
+**UniFi dashboard reference (owner image, Jul 2026):** light theme, white
+cards. Left rail: device photo + name, release-notes/support links, WAN IP /
+Gateway IP, system uptime, ISP + uptime %, activity (down/up Mbps), latency
+pings (Facebook/Google/Twitter in ms), downtime + max packet loss with a
+timeline bar. Main: time range (1D/1W/1M); Traffic Overview donut with top apps
+(down/up/traffic); Client Device Types donut (Apple/iOS/Android/Windows with
+activity/experience/total); Most Active APs and Clients as device cards; a green
+Active Clients area chart. Match this look/feel for the UniFi console depth pass
+(item D). Data comes from the model where we have it; charts can be representative
+where we do not, but never fabricate specific fake numbers as if real.
+
 **D. Cloud UIs not fully fleshed out (owner).** UniFi/Meraki/Omada consoles have
 the core pages but are thinner than the real products. Flesh out: more real
 pages (Insights/Topology map, per-device detail with port panel, firewall/traffic
@@ -710,10 +721,13 @@ materials with actual texture maps. Up to 10 GB budget — real geometry and
 texture data, not procedural stand-ins. "Realistic buildings" is the phrase.
 This is owner-priority right after the "things I just said" list (A/C/D/E).
 
-**G. Functioning doors (owner) — after graphics.** There are no doors yet.
-Need door openings in walls with a frame and a door leaf that can open/close,
-placeable like windows. Part of the buildings/graphics work (framed openings in
-walls) plus interaction (swing).
+**G. Functioning doors (owner)** — DONE v0.47.0 alongside windows. Walls now
+carry openings (window / door / storefront); the wall body is rebuilt as merged
+segment geometry around each (piers, header, sill) so you see THROUGH the
+opening, with a white frame, cross mullions + glass for windows, and a swinging
+wood leaf with a knob for doors. Added/removed/positioned/swung from wall
+properties. Still open: click-on-wall placement tool (currently props buttons),
+and adjustable per-opening width/height.
 
 ## Definition of done — the data centre build
 
