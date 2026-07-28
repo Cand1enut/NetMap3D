@@ -562,3 +562,11 @@ select:focus, input:focus { border-color: var(--accent); }
 .om-sw.on { background: #00c2b3; }
 .om-sw::after { content: ""; position: absolute; top: 2px; left: 2px; width: 18px; height: 18px; border-radius: 50%; background: #fff; transition: left .15s; }
 .om-sw.on::after { left: 20px; }
+
+/* Prominent primary action inside the properties panel (Open console, etc.) */
+#props .cta { background: var(--accent); color: #fff; border-color: var(--accent);
+  width: 100%; margin: 8px 0 4px; font-weight: 600; display: flex; align-items: center;
+  justify-content: center; gap: 8px; }
+#props .cta:hover { background: var(--accent-hi); }
+#props .cta .kbd { font-size: 11px; opacity: .8; border: 1px solid rgba(255,255,255,.5);
+  border-radius: 4px; padding: 0 5px; line-height: 1.5; }

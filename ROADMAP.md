@@ -652,10 +652,11 @@ have a service input plus multiple Ethernet outs. Give the WAN chain realistic
 port counts and clear upstream/downstream so the internet→demarc→ONT/modem→
 router chain is buildable and sensible. — DONE v0.41.0.
 
-**C. Ease of use is clunky (owner, repeatedly).** Still the standing UX verdict.
-Concrete: opening a console/config should be fewer clicks; the sim panel is
-cramped; placing and cabling should feel direct. This is the same brief as the
-"point at the thing" note above. Needs a focused pass, not one fix.
+**C. Ease of use is clunky (owner, repeatedly).** Standing UX verdict. First
+pass DONE v0.44.0: a selected device's console/dashboard opens with Enter or a
+prominent primary button (openDeviceConsole routes IOS/UniFi/Meraki/Omada/host
+by vendor). Still open, needs more passes: the cramped sim panel, direct
+placement/cabling, fewer clicks throughout — the "point at the thing" brief.
 
 **D. Cloud UIs not fully fleshed out (owner).** UniFi/Meraki/Omada consoles have
 the core pages but are thinner than the real products. Flesh out: more real
@@ -669,6 +670,24 @@ even another switch) and the field device sits on it — surface detection is a
 raycast against device bodies with a mostly-up face normal, placed at the hit
 height. Verified a modem sits cleanly on a desktop with a contact shadow, and
 the placement persists through save/load.
+
+**Graphics reference targets (owner supplied images, Jul 2026):**
+- **Device chassis — the UniFi gateway product photo.** A brushed-aluminium 1U
+  chassis with crisp modelled RJ45 jacks (green link LEDs in the corners), SFP
+  cages, a real recessed power button, and engraved/silkscreen labels. This is
+  the bar for device models: proper metal PBR, real jack bezels and latch tabs,
+  readable faceplate artwork — not flat coloured boxes with decals.
+- **Buildings — Home Design 3D "Industrial House".** Real brick, exposed
+  concrete, wood-plank and tile materials with texture maps; window mullions and
+  frames; stair railings with balusters; cabinetry and trim; warm daylight
+  through glazing. Detailed but clean and readable. THIS is the ceiling for
+  building realism.
+- **Baseline (the simpler floor-plan shots)** — clean walls, simple furniture,
+  soft AO — is the floor, already roughly met. The Industrial House is the goal.
+Approach: real PBR texture sets (albedo/normal/roughness/AO) for architectural
+surfaces and materials; higher-poly device chassis with modelled jacks; window/
+door frames and mullions as geometry; material picker (item 10). 10 GB budget —
+ship real texture/geometry data, not procedural stand-ins.
 
 **F. Graphics: real geometric detail, NOT more shadows/lighting (owner,
 emphatic).** The lighting/shadow pass is done (VSM). What is missing is

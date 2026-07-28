@@ -7954,7 +7954,7 @@ function showDeviceProps(id) {
     ${aclPropsHtml(dev)}
     ${l2TablesHtml(dev)}
     ${!isPlaced(dev) ? '<button id="dev-place">Place in 3D map</button>' : ''}
-    ${(netClass(dev) === 'switch' || netClass(dev) === 'router') ? `<button id="dev-console">${isMerakiDevice(dev) ? 'Open Meraki Dashboard' : isOmadaDevice(dev) ? 'Open Omada Controller' : isUnifiController(dev) ? 'Open UniFi Network' : (/UniFi/.test((DEVICE_TYPES[dev.type]||{}).cat||'') ? 'Manage in UniFi' : 'Open console (CLI)')}</button>` : ''}
+    ${(netClass(dev) === 'switch' || netClass(dev) === 'router') ? `<button id="dev-console" class="cta">${isMerakiDevice(dev) ? 'Open Meraki Dashboard' : isOmadaDevice(dev) ? 'Open Omada Controller' : isUnifiController(dev) ? 'Open UniFi Network' : (/UniFi/.test((DEVICE_TYPES[dev.type]||{}).cat||'') ? 'Manage in UniFi' : 'Open console (CLI)')} <span class="kbd">⏎</span></button>` : ''}
     ${netClass(dev) === 'host' ? `<div class="row" style="margin-top:8px"><span class="k">OS</span>
       <select id="dev-os"><option value="windows" ${hostOs(dev)==='windows'?'selected':''}>Windows</option>
         <option value="macos" ${hostOs(dev)==='macos'?'selected':''}>macOS</option>
@@ -7990,20 +7990,25 @@ function showDeviceProps(id) {
   const termBtn = document.getElementById('dev-terminal');
   if (termBtn) termBtn.onclick = () => openHostTerminal(dev);
   const consoleBtn = document.getElementById('dev-console');
-  if (consoleBtn) consoleBtn.onclick = () => {
-    // Cloud-managed gear opens its GUI; everything else opens the CLI. A UniFi
-    // switch or AP has no CLI of its own — it is managed from the controller, so
-    // it opens the controller's console rather than a fake terminal.
-    // Meraki is cloud-managed via the Dashboard; UniFi via its controller; a
-    // Cisco/generic box has its own IOS CLI. Route to the right one.
-    if (isMerakiDevice(dev)) openMeraki(dev);
-    else if (isOmadaDevice(dev)) openOmada(dev);
-    else if (/UniFi/.test((DEVICE_TYPES[dev.type] || {}).cat || '')) {
-      const ctrl = isUnifiController(dev) ? dev : (unifiDevices().find(isUnifiController) || dev);
-      openUnifi(ctrl);
-    } else openConsole(dev);
-  };
+  if (consoleBtn) consoleBtn.onclick = () => openDeviceConsole(dev);
   document.getElementById('dev-del').onclick = () => { undoPush(); deleteDevice(id); hideProps(); };
+}
+
+// Open the right management surface for a device. Cloud-managed gear opens its
+// GUI; a Cisco/generic switch/router opens IOS; a host opens its OS shell. One
+// place so the props button, a keyboard shortcut and a double-click all agree.
+function openDeviceConsole(dev) {
+  if (!dev) return false;
+  if (isMerakiDevice(dev)) { openMeraki(dev); return true; }
+  if (isOmadaDevice(dev)) { openOmada(dev); return true; }
+  if (/UniFi/.test((DEVICE_TYPES[dev.type] || {}).cat || '')) {
+    const ctrl = isUnifiController(dev) ? dev : (unifiDevices().find(isUnifiController) || dev);
+    openUnifi(ctrl); return true;
+  }
+  const cls = netClass(dev);
+  if (cls === 'switch' || cls === 'router') { openConsole(dev); return true; }
+  if (cls === 'host' && typeof openHostTerminal === 'function') { openHostTerminal(dev); return true; }
+  return false;
 }
 
 function showPortProps(deviceId, port, side) {
@@ -8410,6 +8415,12 @@ window.addEventListener('keydown', e => {
     return;
   }
   if (e.target.tagName === 'INPUT' || e.target.tagName === 'SELECT') return;
+  // Enter opens the selected device's console/dashboard — one keystroke instead
+  // of scrolling the properties panel to find the button.
+  if (e.key === 'Enter' && selected && selected.kind === 'device') {
+    const dev = deviceById(selected.id);
+    if (dev && openDeviceConsole(dev)) { e.preventDefault(); return; }
+  }
   if ((e.metaKey || e.ctrlKey) && (e.key === 'z' || e.key === 'Z')) {
     e.preventDefault();
     if (undoStack.length) { restore(undoStack.pop()); setStatus('Undone.'); }
