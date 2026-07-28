@@ -5,7 +5,13 @@
 //////////////////// Constants & catalog ////////////////////
 
 const U = 1.75;
-const RACK_UNITS = 42;
+const RACK_UNITS = 42;                 // default when a rack has no size set
+// Standard rack heights, the ones you actually buy: small wall-mount cabinets
+// up through full-height data-centre racks. A rack's size is per-rack now
+// (rack.units); this is just the menu and the default.
+const RACK_SIZES = [4, 6, 9, 12, 15, 18, 24, 27, 36, 42, 45, 48];
+function rackUnits(rack) { const u = rack && +rack.units; return (u && u >= 1) ? u : RACK_UNITS; }
+function rackHeight(rack) { return RACK_BASE + rackUnits(rack) * U + 1; }
 const RACK_W = 19;          // rail-to-rail
 const RACK_OUTER_W = 23;
 
@@ -1692,16 +1698,20 @@ function buildRackGroup(rack) {
   g.position.set(rack.x, rack.y0 || 0, rack.z);
   g.rotation.y = rack.rotY || 0;
   const frameMat = mat(0x161b23, { roughness: 0.4, metalness: 0.65 });
+  // Rack size is per-rack now: a 6U wall cabinet and a 48U data-centre rack are
+  // the same code, different `units`.
+  const units = rackUnits(rack);
+  const rh = rackHeight(rack);
 
-  const postGeo = new THREE.BoxGeometry(2, RACK_H, 3);
+  const postGeo = new THREE.BoxGeometry(2, rh, 3);
   for (const [px, pz] of [[-1, 1], [1, 1], [-1, -1], [1, -1]]) {
     const post = new THREE.Mesh(postGeo, frameMat);
-    post.position.set(px * (RACK_OUTER_W / 2 - 1), RACK_H / 2, pz * (RACK_D / 2 - 1.5));
+    post.position.set(px * (RACK_OUTER_W / 2 - 1), rh / 2, pz * (RACK_D / 2 - 1.5));
     post.castShadow = true;
     post.userData = { isRackFrame: true, rackId: rack.id };
     g.add(post); rackFrames.push(post);
   }
-  for (const y of [1, RACK_H - 0.5]) {
+  for (const y of [1, rh - 0.5]) {
     const bar = new THREE.Mesh(new THREE.BoxGeometry(RACK_OUTER_W, y === 1 ? 2 : 1, RACK_D), frameMat);
     bar.position.y = y;
     bar.castShadow = true;
@@ -1709,27 +1719,30 @@ function buildRackGroup(rack) {
     g.add(bar); rackFrames.push(bar);
   }
 
-  // 19" mounting rails with square holes
-  const railGeo = new THREE.BoxGeometry(1.4, RACK_UNITS * U, 0.5);
-  const railMat = new THREE.MeshStandardMaterial({ map: getRailTexture(), roughness: 0.45, metalness: 0.55, envMapIntensity: 0.8 });
+  // 19" mounting rails with square holes. The hole texture repeats once per U,
+  // so a shorter rack shows fewer holes — the texture is cloned per rack because
+  // repeat is a per-texture property and racks now differ in height.
+  const railGeo = new THREE.BoxGeometry(1.4, units * U, 0.5);
+  const railTex = getRailTexture().clone(); railTex.needsUpdate = true; railTex.repeat.set(1, units);
+  const railMat = new THREE.MeshStandardMaterial({ map: railTex, roughness: 0.45, metalness: 0.55, envMapIntensity: 0.8 });
   for (const [rx, rz] of [[-1, 1], [1, 1], [-1, -1], [1, -1]]) {
     const rail = new THREE.Mesh(railGeo, railMat);
-    rail.position.set(rx * (RACK_W / 2 + 0.8), RACK_BASE + RACK_UNITS * U / 2, rz * (RACK_D / 2 - 1.3));
+    rail.position.set(rx * (RACK_W / 2 + 0.8), RACK_BASE + units * U / 2, rz * (RACK_D / 2 - 1.3));
     rail.userData = { isRackFrame: true, rackId: rack.id };
     g.add(rail); rackFrames.push(rail);
   }
 
   // Invisible plane used for U-slot placement raycasts
   const plane = new THREE.Mesh(
-    new THREE.PlaneGeometry(RACK_W + 6, RACK_UNITS * U),
+    new THREE.PlaneGeometry(RACK_W + 6, units * U),
     new THREE.MeshBasicMaterial({ visible: false })
   );
-  plane.position.set(0, RACK_BASE + RACK_UNITS * U / 2, RACK_D / 2);
+  plane.position.set(0, RACK_BASE + units * U / 2, RACK_D / 2);
   plane.userData = { isRackPlane: true, rackId: rack.id };
   g.add(plane); rackPlanes.push(plane);
 
   // U markings every 5U on the left post
-  for (let u = 5; u <= RACK_UNITS; u += 5) {
+  for (let u = 5; u <= units; u += 5) {
     const tick = new THREE.Mesh(new THREE.BoxGeometry(0.3, 0.12, 0.12), mat(0x4da3ff));
     tick.position.set(-(RACK_OUTER_W / 2 - 1) + 1.2, RACK_BASE + (u - 0.5) * U, RACK_D / 2 - 1.4);
     g.add(tick);
@@ -2278,7 +2291,7 @@ function buildDeviceGroup(dev) {
     // fingers across the front. Cable lives inside it, behind the fingers, and
     // the fingers are what retain it. Modelling it solid meant runs had nowhere
     // to go but in front of the whole assembly.
-    const h = RACK_UNITS * U;
+    const h = rackUnits(rackById(dev.rackId)) * U;   // as tall as its rack
     const pan = new THREE.Mesh(new THREE.BoxGeometry(VCM_W, h, 0.4), mat(def.color, { roughness: 0.85 }));
     pan.position.z = -VCM_D / 2 + 0.2;
     pan.castShadow = true;
@@ -6272,6 +6285,23 @@ function deleteDevice(id) {
   collidersDirty = true;
 }
 
+// Rebuild a rack's frame in place (after a size change), then rebuild every
+// device mounted in it so vertical managers re-fit the new height, and re-dress
+// the cables that touch it. The devices keep their U — only the frame changed.
+function rebuildRack(id) {
+  const g = rackGroups.get(id);
+  if (g) { scene.remove(g); rackGroups.delete(id);
+    removeFromArr(rackPlanes, p => p.userData.rackId === id);
+    removeFromArr(rackFrames, f => f.userData.rackId === id); }
+  buildRackGroup(rackById(id));
+  for (const d of state.devices.filter(d => d.rackId === id)) buildDeviceGroup(d);
+  for (const c of state.cables) {
+    const ta = deviceById(c.a.deviceId), tb = deviceById(c.b.deviceId);
+    if ((ta && ta.rackId === id) || (tb && tb.rackId === id)) rebuildCable(c);
+  }
+  collidersDirty = true;
+}
+
 function deleteRack(id) {
   for (const d of state.devices.filter(d => d.rackId === id)) deleteDevice(d.id);
   const g = rackGroups.get(id);
@@ -6288,6 +6318,10 @@ function deleteRack(id) {
 //////////////////// Placement helpers ////////////////////
 
 function rackOccupied(rackId, u, uh, ignoreId) {
+  // Out of the rack's bounds counts as "occupied" so gear cannot mount above a
+  // short rack — a 12U cabinet has no U 13.
+  const cap = rackUnits(rackById(rackId));
+  if (u < 1 || u + uh - 1 > cap) return true;
   return state.devices.some(d => {
     if (d.rackId !== rackId || d.id === ignoreId) return false;
     const def = DEVICE_TYPES[d.type];
@@ -6489,19 +6523,20 @@ function updateHover(cx, cy) {
     if (hit) {
       const rackId = hit.object.userData.rackId;
       const g = rackGroups.get(rackId);
+      const rkUnits = rackUnits(rackById(rackId));
       const local = g.worldToLocal(hit.point.clone());
       if (def.vertical) {
         const side = local.x >= 0 ? 'R' : 'L';
         const exists = state.devices.some(d => d.rackId === rackId && d.type === 'vcm' && d.side === side);
-        makeGhost(3.4, RACK_UNITS * U, 6, !exists);
-        const lp = new THREE.Vector3((side === 'L' ? -1 : 1) * (RACK_OUTER_W / 2 + 1.8), RACK_BASE + RACK_UNITS * U / 2, RACK_D / 2 - 3);
+        makeGhost(3.4, rkUnits * U, 6, !exists);
+        const lp = new THREE.Vector3((side === 'L' ? -1 : 1) * (RACK_OUTER_W / 2 + 1.8), RACK_BASE + rkUnits * U / 2, RACK_D / 2 - 3);
         ghost.position.copy(g.localToWorld(lp));
         ghost.quaternion.copy(g.quaternion);
         hoverInfo = exists ? null : { rackId, side };
         setStatus(`Vertical manager — ${side === 'L' ? 'left' : 'right'} side ${exists ? '(occupied)' : ''}`);
       } else {
         let u = Math.floor((local.y - RACK_BASE) / U) + 1;
-        u = Math.max(1, Math.min(RACK_UNITS - def.uh + 1, u));
+        u = Math.max(1, Math.min(rkUnits - def.uh + 1, u));
         const ok = !rackOccupied(rackId, u, def.uh);
         makeGhost(RACK_W + 2, def.uh * U - 0.1, def.depth, ok);
         const lp = new THREE.Vector3(0, RACK_BASE + (u - 1) * U + def.uh * U / 2, RACK_D / 2 - 1);
@@ -6516,12 +6551,39 @@ function updateHover(cx, cy) {
   }
 
   if (mode === 'rack') {
+    const ghH = RACK_BASE + pendingRackUnits * U + 1;
+    // Wall-mount cabinet: sits against a wall face at a mounting height, like a
+    // small comms enclosure, rather than free-standing on the floor.
+    if (pendingRackMount === 'wall') {
+      const wh = firstHit([...wallMeshes.values()]);
+      if (wh) {
+        const n = wh.face.normal.clone().transformDirection(wh.object.matrixWorld); n.y = 0;
+        if (n.lengthSq() > 0.01) {
+          n.normalize();
+          const rotY = Math.atan2(n.x, n.z);
+          const wref = state.walls.find(w => w.id === wh.object.userData.wallId);
+          const wb = (wref && wref.y0) || 0;
+          // hang the cabinet so its centre is near where you point, kept on-wall
+          const yc = Math.max(wb + ghH / 2 + 6, Math.min(wb + ((wref && wref.h) || WALL_H) - ghH / 2 - 2, wh.point.y));
+          const p = wh.point.clone().addScaledVector(n, RACK_D / 2 + 0.3);
+          makeGhost(RACK_OUTER_W, ghH, RACK_D, true);
+          ghost.position.set(p.x, yc, p.z);
+          ghost.rotation.y = rotY;
+          hoverInfo = { wall: true, x: p.x, z: p.z, y0: yc - ghH / 2, rotY };
+          setStatus(`${pendingRackUnits}U wall cabinet @ ${(yc / 12).toFixed(1)} ft. Click to place.`);
+          return;
+        }
+      }
+      clearGhost(); hoverInfo = null;
+      setStatus('Wall-mount rack — point at a wall to hang it.');
+      return;
+    }
     const hit = firstHit(groundTargets());
     if (hit) {
       const x = Math.round(hit.point.x / 6) * 6, z = Math.round(hit.point.z / 6) * 6;
       const y0 = groundYFromHit(hit);
-      makeGhost(RACK_OUTER_W, RACK_H, RACK_D, true);
-      ghost.position.set(x, y0 + RACK_H / 2, z);
+      makeGhost(RACK_OUTER_W, ghH, RACK_D, true);
+      ghost.position.set(x, y0 + ghH / 2, z);
       ghost.rotation.y = pendingRackRot;
       hoverInfo = { x, z, y0 };
     }
@@ -6863,6 +6925,8 @@ function updateCablePropStats(c) {
 //////////////////// Click handling ////////////////////
 
 let pendingRackRot = 0;
+let pendingRackUnits = RACK_UNITS;   // size chosen in the toolbar before placing
+let pendingRackMount = 'floor';      // 'floor' | 'wall'
 
 renderer.domElement.addEventListener('pointerdown', e => { downPos = { x: e.clientX, y: e.clientY }; camTween = null; });
 
@@ -6964,10 +7028,13 @@ function handleClick() {
   if (mode === 'rack') {
     if (!hoverInfo) return;
     undoPush();
-    const rack = { id: uid(), x: hoverInfo.x, z: hoverInfo.z, y0: hoverInfo.y0 || 0, rotY: pendingRackRot, name: `Rack-${state.racks.length + 1}` };
+    const rack = { id: uid(), x: hoverInfo.x, z: hoverInfo.z, y0: hoverInfo.y0 || 0,
+      rotY: hoverInfo.wall ? hoverInfo.rotY : pendingRackRot,
+      units: pendingRackUnits, mount: hoverInfo.wall ? 'wall' : 'floor',
+      name: `Rack-${state.racks.length + 1}` };
     state.racks.push(rack);
     buildRackGroup(rack);
-    setStatus(`Placed ${rack.name}. Click to add another, Q rotates, Esc to finish.`);
+    setStatus(`Placed ${rack.name} (${pendingRackUnits}U${rack.mount === 'wall' ? ', wall' : ''}). Click to add another, Q rotates, Esc to finish.`);
     return;
   }
 
@@ -8053,15 +8120,30 @@ function showRackProps(id) {
   if (!r) return;
   const devs = state.devices.filter(d => d.rackId === id).length;
   propsTitle.textContent = 'Rack';
+  const cur = rackUnits(r);
+  const highest = Math.max(0, ...state.devices.filter(d => d.rackId === id && !DEVICE_TYPES[d.type].vertical)
+    .map(d => d.u + DEVICE_TYPES[d.type].uh - 1));
   propsBody.innerHTML = `
     <input type="text" id="rack-name" value="${r.name || 'Rack'}">
-    ${row('Size', RACK_UNITS + 'U')}
+    <div class="row"><span class="k">Size</span>
+      <select id="rack-size" style="width:90px">${RACK_SIZES.map(u =>
+        `<option value="${u}" ${u === cur ? 'selected' : ''}>${u}U</option>`).join('')}</select></div>
     ${row('Devices', devs)}
+    ${highest > cur ? `<p class="cbl-edit-hint ai-bad">Gear is mounted up to U${highest} — shrinking below that will not remove it, but it will hang past the frame.</p>` : ''}
     <button id="rack-rot">Rotate 90°</button>
     <button id="rack-del" class="danger">Delete rack</button>`;
   propsEl.classList.remove('hidden');
   selected = { kind: 'rack', id };
   document.getElementById('rack-name').onchange = e => { r.name = e.target.value.trim() || r.name; };
+  // Changing size rebuilds the rack frame (and everything mounted in it, so the
+  // vertical managers re-fit) and re-runs cable dressing against the new height.
+  const rackSizeSel = document.getElementById('rack-size');
+  rackSizeSel.onchange = () => {
+    undoPush();
+    r.units = +rackSizeSel.value;
+    rebuildRack(id);
+    showRackProps(id);
+  };
   document.getElementById('rack-rot').onclick = () => {
     r.rotY = ((r.rotY || 0) + Math.PI / 2) % (Math.PI * 2);
     rackGroups.get(id).rotation.y = r.rotY;
@@ -8179,6 +8261,16 @@ function currentBitDiameter() {
     sel.appendChild(o);
   }
   sel.value = 'emt100';
+})();
+
+(function initRackUI() {
+  const sz = document.getElementById('rack-size-sel');
+  if (sz) {
+    sz.innerHTML = RACK_SIZES.map(u => `<option value="${u}" ${u === RACK_UNITS ? 'selected' : ''}>${u}U</option>`).join('');
+    sz.onchange = () => { pendingRackUnits = +sz.value; };
+  }
+  const mt = document.getElementById('rack-mount-sel');
+  if (mt) mt.onchange = () => { pendingRackMount = mt.value; };
 })();
 
 // Level selector: populated from LEVELS so adding a storey is a data edit.
@@ -10238,14 +10330,15 @@ function rebuildRopeColliders() {
     });
   }
   // rack corner posts — cables route around the frame, not through it
-  for (const [, rg] of rackGroups) {
+  for (const [rackId, rg] of rackGroups) {
     rg.updateMatrixWorld(true);
     const inv = rg.matrixWorld.clone().invert(), mtx = rg.matrixWorld.clone();
+    const rh = rackHeight(rackById(rackId));
     for (const [px2, pz2] of [[-1, 1], [1, 1], [-1, -1], [1, -1]]) {
       ropeColliders.push({
         inv, mat: mtx,
-        cx: px2 * (RACK_OUTER_W / 2 - 1), cy: RACK_H / 2, cz: pz2 * (RACK_D / 2 - 1.5),
-        hx: 1 + R, hy: RACK_H / 2, hz: 1.5 + R
+        cx: px2 * (RACK_OUTER_W / 2 - 1), cy: rh / 2, cz: pz2 * (RACK_D / 2 - 1.5),
+        hx: 1 + R, hy: rh / 2, hz: 1.5 + R
       });
     }
   }

@@ -637,13 +637,14 @@ look like its real-life counterpart rather than like a diagram.
 
 Working through these in order, each completed before the next:
 
-**A. Variable-size racks (owner: "big thing").** Racks are hardcoded 42U
-(RACK_UNITS = 42, RACK_H derived globally). Real racks come in many sizes — 4U/
-6U/9U/12U wall-mount, 24U, 42U, 45U, 48U full-height, plus 2-post open frame vs
-4-post enclosed. Rack height (U count) must be per-rack (rack.units), the frame
-geometry/rails/posts/colliders must follow it, device U-placement must validate
-against the actual size, rackDressRoute must use per-rack height, and the save
-format carries it. A size picker when placing/selecting a rack.
+**A. Variable-size racks (owner: "big thing")** — DONE v0.42.0. Per-rack
+`rack.units` (default 42) drives frame/rails/posts/plane/colliders and the
+vertical-manager height; placement validates against the actual size (a 12U
+cabinet has no U 13); resize in properties rebuilds in place; toolbar size picker
+(4U-48U) when placing. Save format carries `units` and `mount`. **Wall-mount
+racks** also done — a Mount picker (floor / wall-mount) hangs a cabinet on a wall
+face at a mounting height. Still open: 2-post open frame vs 4-post enclosed, and
+variable width/depth (23" telco, half-width).
 
 **B. WAN gear has too few ports (owner: "they only have one port?!?!?").** The
 internet node has 1 port; a real ISP handoff serves many circuits. ONT/modem
@@ -661,6 +662,22 @@ the core pages but are thinner than the real products. Flesh out: more real
 pages (Insights/Topology map, per-device detail with port panel, firewall/traffic
 rules that edit ACLs, client detail, WiFi with band/guest options, per-port PoE),
 and make them feel like the real dashboards. Each page still bound to the model.
+
+**E. Can't place devices on tables/furniture (owner: "big nono").** Field
+devices only mount to floor/wall/ceiling/desk-of-a-specific-desk. The owner
+wants to drop gear onto ANY furniture surface — a switch on a desk, a modem on a
+shelf, an AP on a cabinet top. Needs surface detection (raycast the top face of
+furniture) and snap-to-surface placement, with the device sitting on top and
+moving/deleting with sane behaviour.
+
+**F. Graphics: real geometric detail, NOT more shadows/lighting (owner,
+emphatic).** The lighting/shadow pass is done (VSM). What is missing is
+GEOMETRIC and material fidelity: buildings that read as real construction
+(trim, door/window frames, baseboards, mullions, ceiling grid depth, wall
+thickness), furniture with real detail, device chassis detail, and richer PBR
+materials with actual texture maps. Up to 10 GB budget — real geometry and
+texture data, not procedural stand-ins. "Realistic buildings" is the phrase.
+This is owner-priority right after the "things I just said" list (A/C/D/E).
 
 ## Definition of done — the data centre build
 
