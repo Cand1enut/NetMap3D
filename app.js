@@ -7867,7 +7867,7 @@ function showDeviceProps(id) {
     ${aclPropsHtml(dev)}
     ${l2TablesHtml(dev)}
     ${!isPlaced(dev) ? '<button id="dev-place">Place in 3D map</button>' : ''}
-    ${(netClass(dev) === 'switch' || netClass(dev) === 'router') ? `<button id="dev-console">${isMerakiDevice(dev) ? 'Open Meraki Dashboard' : isUnifiController(dev) ? 'Open UniFi Network' : (/UniFi/.test((DEVICE_TYPES[dev.type]||{}).cat||'') ? 'Manage in UniFi' : 'Open console (CLI)')}</button>` : ''}
+    ${(netClass(dev) === 'switch' || netClass(dev) === 'router') ? `<button id="dev-console">${isMerakiDevice(dev) ? 'Open Meraki Dashboard' : isOmadaDevice(dev) ? 'Open Omada Controller' : isUnifiController(dev) ? 'Open UniFi Network' : (/UniFi/.test((DEVICE_TYPES[dev.type]||{}).cat||'') ? 'Manage in UniFi' : 'Open console (CLI)')}</button>` : ''}
     ${netClass(dev) === 'host' ? `<div class="row" style="margin-top:8px"><span class="k">OS</span>
       <select id="dev-os"><option value="windows" ${hostOs(dev)==='windows'?'selected':''}>Windows</option>
         <option value="macos" ${hostOs(dev)==='macos'?'selected':''}>macOS</option>
@@ -7910,6 +7910,7 @@ function showDeviceProps(id) {
     // Meraki is cloud-managed via the Dashboard; UniFi via its controller; a
     // Cisco/generic box has its own IOS CLI. Route to the right one.
     if (isMerakiDevice(dev)) openMeraki(dev);
+    else if (isOmadaDevice(dev)) openOmada(dev);
     else if (/UniFi/.test((DEVICE_TYPES[dev.type] || {}).cat || '')) {
       const ctrl = isUnifiController(dev) ? dev : (unifiDevices().find(isUnifiController) || dev);
       openUnifi(ctrl);
@@ -8472,6 +8473,189 @@ function updatePulses(dt) {
 
 
 
+
+
+//////////////////// TP-Link Omada Controller console ////////////////////
+// Omada is controller-managed through a web console, like UniFi, so it gets that
+// console — same binding rule: every control writes the model the simulation
+// reads. Omada's own layout is a Dashboard/Devices/Clients set plus a Settings
+// tree (Wired Networks, Wireless Networks, Internet). The gateway/router holds
+// L3, exactly as the UniFi gateway and the Meraki MX do.
+function isOmadaDevice(dev) { return /Omada/i.test((DEVICE_TYPES[dev.type] || {}).label || ''); }
+function omadaDevices() { return state.devices.filter(d => isPlaced(d) && isOmadaDevice(d)); }
+function omadaGateway() {
+  return omadaDevices().find(d => netClass(d) === 'router') || (_om && _om.dev);
+}
+let _om = null;
+function openOmada(dev) { _om = { dev, page: 'dashboard' }; document.getElementById('omada').classList.remove('hidden'); omRender(); }
+function omClose() { const b = document.getElementById('omada'); if (b) b.classList.add('hidden'); _om = null; }
+
+const OM_NAV = [
+  { id: 'dashboard', label: 'Dashboard' },
+  { id: 'devices', label: 'Devices' },
+  { id: 'clients', label: 'Clients' },
+  { sec: 'SETTINGS' },
+  { id: 'wired', label: 'Wired Networks' },
+  { id: 'wireless', label: 'Wireless Networks' },
+  { id: 'ports', label: 'Switch Ports' },
+  { id: 'internet', label: 'Internet' }
+];
+function omRender() {
+  if (!_om) return;
+  const nav = document.getElementById('om-nav');
+  nav.innerHTML = OM_NAV.map(n => n.sec ? `<div class="om-sec">${n.sec}</div>`
+    : `<div class="om-item ${_om.page === n.id ? 'active' : ''}" data-om="${n.id}">${n.label}</div>`).join('');
+  for (const el of nav.querySelectorAll('[data-om]')) el.onclick = () => { _om.page = el.dataset.om; omRender(); };
+  document.getElementById('om-title').textContent = 'Omada';
+  document.getElementById('om-top').textContent = (OM_NAV.find(n => n.id === _om.page) || {}).label || 'Dashboard';
+  const page = document.getElementById('om-page');
+  const R = { dashboard: omDashboard, devices: omDevices, clients: omClients,
+    wired: omWired, wireless: omWireless, ports: omPorts, internet: omInternet }[_om.page] || omDashboard;
+  page.innerHTML = R();
+  omWire(page);
+}
+function omDashboard() {
+  resolveDhcp();
+  const gw = omadaGateway();
+  const up = wanUplink ? wanUplink(gw) : { ok: false };
+  const tile = (l, b, s) => `<div class="om-tile"><div class="lbl">${l}</div><div class="big">${b}</div>${s ? `<div class="sub">${s}</div>` : ''}</div>`;
+  return `<div class="om-tiles">
+    ${tile('Devices', omadaDevices().length, 'connected')}
+    ${tile('Clients', state.devices.filter(isHostDev).length, 'active')}
+    ${tile('Internet', up.ok ? 'Online' : 'Offline', up.ok ? (up.circuit && up.circuit.provider || 'ISP') : 'no circuit')}
+    ${tile('Networks', [...vlanDb(gw).values()].length, 'LAN')}
+  </div>
+  <table class="om-table"><tr><th>Device</th><th>Model</th><th>IP</th><th>Status</th></tr>
+  ${omadaDevices().map(d => { const ip = deviceInterfaces(d)[0];
+    return `<tr><td>${esc(d.name)}</td><td>${esc(DEVICE_TYPES[d.type].label)}</td>
+      <td>${ip ? ipStr(ip.ip.int) : (d.ip && d.ip !== 'dhcp' ? esc(d.ip) : '—')}</td>
+      <td><span class="om-dot up"></span>Connected</td></tr>`; }).join('')}</table>`;
+}
+function omDevices() {
+  return `<table class="om-table"><tr><th>Name</th><th>Model</th><th>Type</th><th>IP</th><th>Ports</th></tr>
+  ${omadaDevices().map(d => { const def = DEVICE_TYPES[d.type]; const ip = deviceInterfaces(d)[0];
+    const used = state.cables.filter(c => c.a.deviceId === d.id || c.b.deviceId === d.id).length;
+    return `<tr><td>${esc(d.name)}</td><td>${esc(def.label)}</td><td>${netClass(d)}</td>
+      <td>${ip ? ipStr(ip.ip.int) : '—'}</td><td>${used}/${def.ports || 0}</td></tr>`; }).join('')}</table>`;
+}
+function omClients() {
+  resolveDhcp();
+  return `<table class="om-table"><tr><th>Name</th><th>IP</th><th>Network (VLAN)</th><th>Connected To</th><th>MAC</th></tr>
+  ${state.devices.filter(isHostDev).map(h => { const c = hopThroughPatches(h, hostPort(h), FRONT);
+    return `<tr><td>${esc(h.name)}</td><td>${hostAddr(h)}</td><td>${hostVlan(h)}</td>
+      <td>${c ? esc(c.dev.name) + ' · P' + c.port : '—'}</td>
+      <td style="font-family:monospace;font-size:11px">${nicMac(h, hostPort(h))}</td></tr>`; }).join('')}</table>`;
+}
+// Wired Networks — Omada's LAN = VLAN + subnet + DHCP. Writes the gateway model.
+function omWired() {
+  const gw = omadaGateway();
+  const db = [...vlanDb(gw).values()];
+  const pools = dhcpPools(gw);
+  return db.map(v => {
+    const svi = (gw.svi || {})[v.id]; const ip = svi ? parseIp(svi) : null;
+    const pool = pools.find(p => ip && sameSubnet(p.net, ip));
+    return `<div class="om-row" data-lan="${v.id}">
+      <h4><span class="om-dot up"></span>${esc(v.name)} <span style="color:#8b95a1;font-weight:400">· VLAN ${v.id}</span></h4>
+      <div class="om-f"><label>Name</label><input class="om-l-name" value="${esc(v.name)}" ${v.builtin ? 'disabled' : ''}></div>
+      <div class="om-f"><label>VLAN</label><input class="om-l-vlan" value="${v.id}" ${v.builtin ? 'disabled' : ''} style="width:80px"></div>
+      <div class="om-f"><label>Gateway/Subnet</label><input class="om-l-subnet" value="${svi ? esc(svi) : ''}" placeholder="10.0.${v.id}.1/24"></div>
+      <div class="om-f"><label>DHCP Server</label><div class="om-sw ${pool ? 'on' : ''}" data-dhcp="${v.id}"></div></div>
+      ${pool ? `<div class="om-f"><label>DHCP Range</label>
+        <input class="om-l-start" value="${esc(pool.poolStart || ipStr(pool.start))}" style="width:118px">–
+        <input class="om-l-end" value="${esc(pool.poolEnd || ipStr(pool.end))}" style="width:118px"></div>
+        <div class="om-f"><label>DNS</label><input class="om-l-dns" value="${esc([].concat(pool.dns||[]).join(', '))}"></div>` : ''}
+      <div style="margin-top:10px"><button class="om-btn om-l-save">Apply</button>
+        ${v.builtin ? '' : '<button class="om-btn ghost om-l-del">Delete</button>'}</div></div>`;
+  }).join('') + `<button class="om-btn" id="om-lan-add">Create New LAN</button>`;
+}
+function omWireless() {
+  const gw = omadaGateway();
+  const ssids = gw.ssids || []; const nets = [...vlanDb(gw).values()];
+  return ssids.map((s, i) => `<div class="om-row" data-wl="${i}">
+    <h4>${esc(s.name || 'SSID')}</h4>
+    <div class="om-f"><label>SSID Name</label><input class="om-w-name" value="${esc(s.name || '')}"></div>
+    <div class="om-f"><label>Network</label><select class="om-w-net">
+      ${nets.map(n => `<option value="${n.id}" ${s.vlan === n.id ? 'selected' : ''}>${esc(n.name)} (${n.id})</option>`).join('')}</select></div>
+    <div class="om-f"><label>Security</label><select class="om-w-sec">
+      ${['WPA2-PSK', 'WPA3-SAE', 'WPA2/WPA3', 'Open'].map(x => `<option ${s.security === x ? 'selected' : ''}>${x}</option>`).join('')}</select></div>
+    <div style="margin-top:10px"><button class="om-btn om-w-save">Apply</button>
+      <button class="om-btn ghost om-w-del">Delete</button></div></div>`).join('')
+    + `<button class="om-btn" id="om-wl-add">Create New WLAN</button>`;
+}
+function omPorts() {
+  const switches = omadaDevices().filter(d => netClass(d) === 'switch');
+  if (!switches.length) return '<p>No Omada switches.</p>';
+  const gw = omadaGateway(); const nets = [...vlanDb(gw).values()];
+  return switches.map(sw => {
+    const def = DEVICE_TYPES[sw.type]; let rows = '';
+    for (let p = 1; p <= (def.ports || 0); p++) {
+      if (portRole(def, p) === 'PWR') continue;
+      const link = linkFor(sw.id, p); const trunk = portMode(sw, p) === 'trunk';
+      rows += `<tr><td>Port ${p}</td>
+        <td><span class="om-dot ${link && link.up ? 'up' : 'down'}"></span>${link && link.up ? fmtSpeed(link.speed) : 'down'}</td>
+        <td>${trunk ? '<b>Trunk (native ' + nativeVlanOf(sw, p) + ')</b>' :
+          `<select class="om-portvlan" data-swp="${sw.id}:${p}">${nets.map(n =>
+            `<option value="${n.id}" ${nativeVlanOf(sw, p) === n.id ? 'selected' : ''}>${esc(n.name)} (${n.id})</option>`).join('')}</select>`}</td></tr>`;
+    }
+    return `<h4 style="margin:6px 0 8px;font-size:15px">${esc(sw.name)}</h4>
+      <table class="om-table"><tr><th>Port</th><th>Link</th><th>Profile / VLAN</th></tr>${rows}</table><div style="height:16px"></div>`;
+  }).join('');
+}
+function omInternet() {
+  const gw = omadaGateway(); const up = wanUplink ? wanUplink(gw) : { ok: false };
+  return `<div class="om-row"><h4><span class="om-dot ${up.ok ? 'up' : 'down'}"></span>WAN</h4>
+    <div class="om-f"><label>Status</label><span>${up.ok ? 'Connected' : (up.reason || 'No circuit')}</span></div>
+    ${up.ok ? `<div class="om-f"><label>ISP</label><span>${esc((up.circuit && up.circuit.provider) || 'ISP')}</span></div>
+    <div class="om-f"><label>WAN IP</label><span>${esc((up.circuit && up.circuit.wanIp) || 'from ISP')}</span></div>` : ''}</div>`;
+}
+function omWire(page) {
+  const gw = omadaGateway();
+  const commit = () => { flushL2Tables(); dhcpClearBindings(); resolveDhcp(); refreshAfterCli(gw); };
+  for (const sel of page.querySelectorAll('.om-portvlan')) sel.onchange = () => {
+    const [sid, p] = sel.dataset.swp.split(':'); const sw = deviceById(+sid);
+    sw.portCfg = sw.portCfg || {}; sw.portCfg[+p] = sw.portCfg[+p] || {}; sw.portCfg[+p].vlan = sel.value; sw.portCfg[+p].mode = 'access'; commit();
+  };
+  for (const t of page.querySelectorAll('[data-dhcp]')) t.onclick = () => {
+    const vid = +t.dataset.dhcp; const svi = (gw.svi || {})[vid]; const ip = svi ? parseIp(svi) : null;
+    if (!ip) { alert('Set the gateway/subnet first.'); return; }
+    gw.dhcp = gw.dhcp || { enabled: true, pools: [], excluded: [] }; gw.dhcp.enabled = true; gw.dhcp.pools = gw.dhcp.pools || [];
+    const has = gw.dhcp.pools.find(pp => { const pn = parseIp(pp.network); return pn && sameSubnet(pn, ip); });
+    if (has) gw.dhcp.pools = gw.dhcp.pools.filter(pp => pp !== has);
+    else gw.dhcp.pools.push({ name: (vlanDb(gw).get(vid) || {}).name || `VLAN${vid}`, network: subnetLabel(ip),
+      poolStart: ipStr((ip.network + 100) >>> 0), poolEnd: ipStr((ip.network + 200) >>> 0), lease: { days: 1 }, defaultRouter: ipStr(ip.int), dns: [], reservations: [] });
+    commit(); omRender();
+  };
+  for (const b of page.querySelectorAll('.om-l-save')) b.onclick = () => {
+    const card = b.closest('.om-row'); const vid = +card.dataset.lan; const g = c => (card.querySelector('.' + c) || {}).value;
+    const db = vlanDb(gw).get(vid);
+    if (db && !db.builtin) { gw.vlans = gw.vlans || []; const v = gw.vlans.find(x => +x.id === vid);
+      if (v) { v.name = (g('om-l-name') || '').trim(); v.id = +g('om-l-vlan') || vid; } }
+    const sub = (g('om-l-subnet') || '').trim(); gw.svi = gw.svi || {}; if (sub) gw.svi[vid] = sub; else delete gw.svi[vid];
+    const ip = sub ? parseIp(sub) : null;
+    if (ip && gw.dhcp && gw.dhcp.pools) { const pool = gw.dhcp.pools.find(pp => { const pn = parseIp(pp.network); return pn && sameSubnet(pn, ip); });
+      if (pool) { pool.network = subnetLabel(ip); if (g('om-l-start')) pool.poolStart = g('om-l-start').trim();
+        if (g('om-l-end')) pool.poolEnd = g('om-l-end').trim(); pool.defaultRouter = ipStr(ip.int);
+        const dns = (g('om-l-dns') || '').split(',').map(x => x.trim()).filter(Boolean); if (dns.length) pool.dns = dns; } }
+    commit(); omRender();
+  };
+  for (const b of page.querySelectorAll('.om-l-del')) b.onclick = () => {
+    const vid = +b.closest('.om-row').dataset.lan; gw.vlans = (gw.vlans || []).filter(v => +v.id !== vid); if (gw.svi) delete gw.svi[vid]; commit(); omRender();
+  };
+  const ladd = page.querySelector('#om-lan-add');
+  if (ladd) ladd.onclick = () => { const used = new Set([...vlanDb(gw).keys()]); let id = 10; while (used.has(id)) id += 10;
+    gw.vlans = gw.vlans || []; gw.vlans.push({ id, name: `LAN ${id}` }); gw.svi = gw.svi || {}; gw.svi[id] = `10.0.${id}.1/24`; commit(); omRender(); };
+  for (const b of page.querySelectorAll('.om-w-save')) b.onclick = () => {
+    const card = b.closest('.om-row'); const i = +card.dataset.wl; gw.ssids = gw.ssids || [];
+    gw.ssids[i] = { name: (card.querySelector('.om-w-name').value || '').trim(), vlan: +card.querySelector('.om-w-net').value, security: card.querySelector('.om-w-sec').value }; commit(); omRender();
+  };
+  for (const b of page.querySelectorAll('.om-w-del')) b.onclick = () => {
+    const i = +b.closest('.om-row').dataset.wl; gw.ssids = (gw.ssids || []).filter((_, j) => j !== i); commit(); omRender();
+  };
+  const wadd = page.querySelector('#om-wl-add');
+  if (wadd) wadd.onclick = () => { gw.ssids = gw.ssids || []; const nets = [...vlanDb(gw).values()];
+    gw.ssids.push({ name: 'New WLAN', vlan: nets[0] ? nets[0].id : 1, security: 'WPA2/WPA3' }); omRender(); };
+}
+(function initOmada() { const c = document.getElementById('om-close'); if (c) c.onclick = omClose; })();
 
 //////////////////// Meraki Dashboard console ////////////////////
 // Meraki is cloud-managed through the Dashboard, organised by product line
