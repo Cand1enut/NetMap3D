@@ -820,8 +820,25 @@ Measured, same machine, same renderer:
 | frame | 81 ms | **<1 ms** |
 | build | 2.3 s (34 s projected at 300 racks) | **6 ms** |
 
-A data centre is massively repetitive: ~12,000 devices but only ~50 distinct
-product types. That is exactly what GPU instancing is for. Moving to another
+**"Not everything we build is repetitive"** — correct, and instancing alone is
+not the whole answer. Two techniques cover the two halves, both benchmarked:
+
+| case | setup | draw calls | frame |
+|---|---|---|---|
+| worst-case NON-repetitive devices | 12,000 devices spread across **all 40** distinct rack-mount types, no two alike in a rack | **45** | 0.1 ms |
+| fully UNIQUE geometry | 20,000 cables, every one a different random path | **46** | 0.2 ms |
+
+The reason instancing still wins on a non-repetitive site: it keys on
+GEOMETRY + MATERIAL, not on scene layout. Draw calls scale with how many
+distinct product TYPES exist (~40-100 in the catalog), not with how many
+objects are placed. A hall where every rack is different is still 40 types.
+
+And the genuinely unique geometry — cables, walls, rooms, raceway — is handled
+by MERGING into one buffer per category, which scales with total vertex count
+(trivial) rather than object count. 20,000 unique cable paths merged is one
+draw call at 6 ms to build.
+
+So: instancing for the repeated mass, merging for the unique. Moving to another
 engine would have carried the same broken architecture across.
 
 **The rebuild (render layer only — the simulation model does not change):**
