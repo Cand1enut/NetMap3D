@@ -19090,15 +19090,30 @@ function maybeShowHelp() {
 //   50 CAMERA     UniFi Protect cameras + NVR, isolated by ACL
 //   60 ACCESS     door controllers/readers, isolated by ACL
 //   70 CORP       staff / NOC workstations
+// Subnet SIZE is a real design decision, not decoration: a /24 holds 254 hosts,
+// and a hall with 100 racks holds thousands of servers. Sizing every VLAN /24
+// silently produced addresses like 10.10.20.650 — invalid, and hundreds of hosts
+// ended up with no address at all. The big host VLANs are /16s, the way a real
+// data centre sizes them; the small service VLANs stay /24.
 const DC_VLANS = [
-  { id: 10, name: 'MGMT-OOB', net: '10.10.10' },
-  { id: 20, name: 'PROD',     net: '10.10.20' },
-  { id: 30, name: 'DMZ',      net: '10.10.30' },
-  { id: 40, name: 'STORAGE',  net: '10.10.40' },
-  { id: 50, name: 'CAMERA',   net: '10.10.50' },
-  { id: 60, name: 'ACCESS',   net: '10.10.60' },
-  { id: 70, name: 'CORP',     net: '10.10.70' },
+  { id: 10, name: 'MGMT-OOB', net: '10.10',    cidr: 16, base: '10.10.0.0' },
+  { id: 20, name: 'PROD',     net: '10.20',    cidr: 16, base: '10.20.0.0' },
+  { id: 30, name: 'DMZ',      net: '10.30',    cidr: 16, base: '10.30.0.0' },
+  { id: 40, name: 'STORAGE',  net: '10.40',    cidr: 16, base: '10.40.0.0' },
+  { id: 50, name: 'CAMERA',   net: '10.50',    cidr: 16, base: '10.50.0.0' },
+  { id: 60, name: 'ACCESS',   net: '10.60.0',  cidr: 24, base: '10.60.0.0' },
+  { id: 70, name: 'CORP',     net: '10.70.0',  cidr: 24, base: '10.70.0.0' },
 ];
+// nth usable host address in a VLAN, honouring its real prefix length
+// The prefix length is part of the address. A bare IP parses as /24, so a host
+// in a /16 VLAN would carry the wrong mask and never match its own gateway —
+// exactly the fault a mistyped mask causes on a real machine.
+function dcHost(v, n) {
+  const a = v.cidr === 24 ? `${v.net}.${10 + (n % 240)}`
+                          : `${v.net}.${1 + Math.floor(n / 250)}.${10 + (n % 250)}`;
+  return `${a}/${v.cidr}`;
+}
+function dcGw(v) { return v.cidr === 24 ? `${v.net}.1` : `${v.net}.0.1`; }
 
 function buildDataCentre(opts = {}) {
   const ROWS = opts.rows || 2, PER_ROW = opts.racksPerRow || 6;
@@ -19127,12 +19142,15 @@ function buildDataCentre(opts = {}) {
   };
   const svi = {}, pools = [];
   for (const v of DC_VLANS) {
-    svi[v.id] = `${v.net}.1/24`;
+    svi[v.id] = `${dcGw(v)}/${v.cidr}`;
     // STORAGE is deliberately static-only — a storage fabric does not DHCP.
     if (v.id === 40) continue;
-    pools.push({ name: v.name, network: `${v.net}.0/24`, poolStart: `${v.net}.100`, poolEnd: `${v.net}.200`,
-      lease: { days: 1 }, defaultRouter: `${v.net}.1`, dns: ['10.10.20.10'], domain: 'dc.local', reservations: [] });
+    const lo = v.cidr === 24 ? `${v.net}.150` : `${v.net}.200.10`;
+    const hi = v.cidr === 24 ? `${v.net}.240` : `${v.net}.250.250`;
+    pools.push({ name: v.name, network: `${v.base}/${v.cidr}`, poolStart: lo, poolEnd: hi,
+      lease: { days: 1 }, defaultRouter: dcGw(v), dns: ['10.20.0.10'], domain: 'dc.local', reservations: [] });
   }
+  const V = Object.fromEntries(DC_VLANS.map(v => [v.id, v]));
 
   // ---- the building: data hall, MDF, UPS room, and a mantrap vestibule ----
   const HALL_X = ROWS * 130 + 120, HALL_Z = PER_ROW * 46 + 120;
@@ -19162,10 +19180,10 @@ function buildDataCentre(opts = {}) {
   // ---- MDF rack: edge, core, OOB, NVR, access controller ----
   const mdf = rack(-HALL_X/2 + 60, -HALL_Z/2 + 70, 'MDF-01');
   inRack(mdf, 'vcm', 0, { side: 'R' });
-  const edgeA = inRack(mdf, 'c_mx105', 41, { name: 'EDGE-A', ip: '10.10.10.2',
+  const edgeA = inRack(mdf, 'c_mx105', 41, { name: 'EDGE-A', ip: '10.10.0.2/16',
     portCfg: { 2: { ip: '192.168.255.1/29' } },
     ospf: { enabled: true, area: 0, refBw: 10000 } });
-  const edgeB = inRack(mdf, 'c_mx95', 39, { name: 'EDGE-B', ip: '10.10.10.3',
+  const edgeB = inRack(mdf, 'c_mx95', 39, { name: 'EDGE-B', ip: '10.10.0.3/16',
     portCfg: { 2: { ip: '192.168.255.2/29' } },
     ospf: { enabled: true, area: 0, refBw: 10000 } });
   link(ontA, 2, edgeA, 1); link(ontB, 2, edgeB, 1);
@@ -19173,7 +19191,7 @@ function buildDataCentre(opts = {}) {
 
   // Core: the L3 boundary. Holds every SVI, every DHCP scope, and the ACLs that
   // segment the zones from each other.
-  const coreA = inRack(mdf, 'u_udmpromax', 37, { name: 'CORE-A', ip: '10.10.10.4', svi: { ...svi },
+  const coreA = inRack(mdf, 'u_udmpromax', 37, { name: 'CORE-A', ip: '10.10.0.4/16', svi: { ...svi },
     portCfg: { 1: { ip: '192.168.255.3/29' } },
     ospf: { enabled: true, area: 0, refBw: 10000 },
     routes: [{ prefix: '0.0.0.0/0', via: '192.168.255.1' }],
@@ -19184,23 +19202,33 @@ function buildDataCentre(opts = {}) {
   // The OOB/services switch carries management, camera, access and corp — so its
   // uplink to the core is a TRUNK. An access port here was the bug that left
   // cameras and the NOC stranded: their VLANs could not reach their gateway.
-  const oob = inRack(mdf, 'c_ms120_24p', 35, { name: 'OOB-SW', ip: '10.10.10.5',
+  const oob = inRack(mdf, 'c_ms120_24p', 35, { name: 'OOB-SW', ip: '10.10.0.5/16',
     vlans: DC_VLANS.map(v => ({ id: v.id, name: v.name })),
     portCfg: Object.fromEntries([...Array(23)].map((_, i) => [i + 1, { vlan: '10' }])) });
   oob.portCfg[24] = { mode: 'trunk', native: '10', tagged: DC_VLANS.map(v => v.id).join(',') };
   // Aggregation/distribution layer. A core gateway does not have a port per rack
   // — real halls put a 48-port aggregation switch between core and the ToRs.
-  const agg = inRack(mdf, 'c_c9300l48', 33, { name: 'AGG-01', ip: '10.10.10.6',
-    vlans: DC_VLANS.map(v => ({ id: v.id, name: v.name })) });
-  agg.portCfg = { 48: { mode: 'trunk', native: '10', tagged: DC_VLANS.map(v => v.id).join(',') } };
-  link(agg, 48, coreA, 4, 0xf0883e);
+  // POD DESIGN: one aggregation switch per row. A single 48-port aggregation
+  // switch cannot serve 100 racks — racks past the 48th silently had no uplink
+  // and were isolated. Real halls scale by adding a pod, not by wishing the
+  // switch had more ports.
+  const trunkAll = () => ({ mode: 'trunk', native: '10', tagged: DC_VLANS.map(v => v.id).join(',') });
+  const aggs = [];
+  for (let row = 0; row < ROWS; row++) {
+    const a = inRack(mdf, 'c_c9300l48', 33 - row, { name: `AGG-${row + 1}`, ip: `10.10.0.${10 + row}/16`,
+      vlans: DC_VLANS.map(v => ({ id: v.id, name: v.name })) });
+    a.portCfg = { 48: trunkAll() };
+    link(a, 48, coreA, 4 + row, 0xf0883e);
+    aggs.push(a);
+  }
+  const agg = aggs[0];                       // services switch lands on pod 1
   // Services switch joins the SAME layer-2 fabric as the racks. Hanging it off
   // the core instead put the NVR in a different L2 island from the cameras even
   // though both were "VLAN 50" — a router does not bridge a VLAN.
   agg.portCfg[47] = { mode: 'trunk', native: '10', tagged: DC_VLANS.map(v => v.id).join(',') };
   link(oob, 24, agg, 47, 0x3fb950);
-  const nvr = inRack(mdf, 'u_unvrpro', 31, { name: 'NVR-01', ip: '10.10.50.10', gateway: '10.10.50.1' });
-  const acHub = inRack(mdf, 'u_accesshub', 29, { name: 'ACCESS-HUB', ip: '10.10.60.10', gateway: '10.10.60.1' });
+  const nvr = inRack(mdf, 'u_unvrpro', 31, { name: 'NVR-01', ip: '10.50.0.10/16', gateway: '10.50.0.1' });
+  const acHub = inRack(mdf, 'u_accesshub', 29, { name: 'ACCESS-HUB', ip: '10.60.0.10/24', gateway: '10.60.0.1' });
   const mdfPatch = inRack(mdf, 'patch24', 42);
   inRack(mdf, 'hcm', 40); inRack(mdf, 'hcm', 38); inRack(mdf, 'hcm', 36);
   const mdfUps = inRack(mdf, 'ups', 1, { name: 'UPS-MDF' });
@@ -19217,7 +19245,7 @@ function buildDataCentre(opts = {}) {
       const patch = inRack(r, 'patch24', 42);
       inRack(r, 'hcm', 41);
       // ToR pair is overkill per rack in a small hall; one ToR + uplink to core
-      const tor = inRack(r, 'c_ms250_48', 40, { name: `TOR-${row+1}-${i+1}`, ip: `10.10.10.${20 + tors.length}`,
+      const tor = inRack(r, 'c_ms250_48', 40, { name: `TOR-${row+1}-${i+1}`, ip: `10.10.200.${1 + tors.length % 250}/16`,
         vlans: DC_VLANS.map(v => ({ id: v.id, name: v.name })),
         portCfg: { 48: { mode: 'trunk', native: '10', tagged: DC_VLANS.map(v=>v.id).join(',') } } });
       tors.push(tor);
@@ -19227,9 +19255,9 @@ function buildDataCentre(opts = {}) {
         const u = 36 - s * 2;
         const n = tors.length * 10 + s;
         const srv = inRack(r, 'server', u, { name: `SRV-${row+1}${i+1}-${s+1}`,
-          nics: { 1: { ip: `10.10.20.${50 + n}`, gateway: '10.10.20.1', label: 'prod' },
-                  2: { ip: `10.10.40.${50 + n}`, label: 'storage' },
-                  3: { ip: `10.10.10.${100 + n}`, gateway: '10.10.10.1', label: 'oob' } } });
+          nics: { 1: { ip: dcHost(V[20], n), gateway: dcGw(V[20]), label: 'prod' },
+                  2: { ip: dcHost(V[40], n), label: 'storage' },
+                  3: { ip: dcHost(V[10], n), gateway: dcGw(V[10]), label: 'oob' } } });
         // prod + storage land on the ToR, management goes back to the OOB switch
         tor.portCfg[s*2+1] = { vlan: '20' }; tor.portCfg[s*2+2] = { vlan: '40' };
         link(srv, 1, tor, s*2+1, 0x2f81f7);
@@ -19237,10 +19265,12 @@ function buildDataCentre(opts = {}) {
       }
       const ru = inRack(r, 'ups', 1, { name: `UPS-${row+1}-${i+1}` });
       link(tor, 'PWR', ru, 1, 0xe5534b);
-      // ToR trunk up to aggregation (not the core — the core has no port per rack)
-      const aggPort = tors.length;                       // 1..N, agg has 48
-      agg.portCfg[aggPort] = { mode: 'trunk', native: '10', tagged: DC_VLANS.map(v => v.id).join(',') };
-      link(tor, 48, agg, aggPort, 0xf0883e);
+      // ToR trunks up to ITS ROW's aggregation switch — a pod uplink, and one
+      // that exists: port index is within that switch's real port count.
+      const myAgg = aggs[row];
+      const aggPort = i + 1;                              // <= racksPerRow, well under 47
+      myAgg.portCfg[aggPort] = trunkAll();
+      link(tor, 48, myAgg, aggPort, 0xf0883e);
       // rack-level security: a camera watching the aisle and a reader on the cage
       const cam = field('u_g6turret', { mount: 'wall', x, y: 96, z: z - 22, rotY: 0,
         name: `CAM-R${row+1}-${i+1}`, ip: 'dhcp' });
@@ -19273,8 +19303,8 @@ function buildDataCentre(opts = {}) {
   link(noc, 1, oob, 20, 0x2f81f7);
   oob.portCfg[20] = { vlan: '70' };
   const jump = inRack(mdf, 'server', 27, { name: 'JUMP-01',
-    nics: { 1: { ip: '10.10.70.10', gateway: '10.10.70.1', label: 'corp' },
-            2: { ip: '10.10.10.11', gateway: '10.10.10.1', label: 'oob' } } });
+    nics: { 1: { ip: '10.70.0.10/24', gateway: '10.70.0.1', label: 'corp' },
+            2: { ip: '10.10.0.11/16', gateway: '10.10.0.1', label: 'oob' } } });
   link(jump, 1, oob, 21, 0x2f81f7); oob.portCfg[21] = { vlan: '70' };
   link(jump, 2, oob, 22, 0x3fb950); oob.portCfg[22] = { vlan: '10' };
   link(nvr, 1, oob, 23, 0xdb61a2); oob.portCfg[23] = { vlan: '50' };
@@ -19284,19 +19314,19 @@ function buildDataCentre(opts = {}) {
   coreA.acls = parseAclText([
     'ip access-list extended CAMERA-ISOLATION',
     ' 10 remark cameras talk to the NVR and nothing else',
-    ' 20 permit ip 10.10.50.0 0.0.0.255 host 10.10.50.10',
-    ' 30 deny ip 10.10.50.0 0.0.0.255 any',
+    ' 20 permit ip 10.50.0.0 0.0.255.255 host 10.50.0.10',
+    ' 30 deny ip 10.50.0.0 0.0.255.255 any',
     ' 40 permit ip any any',
     'ip access-list extended ACCESS-ISOLATION',
     ' 10 remark door hardware talks only to the access controller',
-    ' 20 permit ip 10.10.60.0 0.0.0.255 host 10.10.60.10',
-    ' 30 deny ip 10.10.60.0 0.0.0.255 any',
+    ' 20 permit ip 10.60.0.0 0.0.0.255 host 10.60.0.10',
+    ' 30 deny ip 10.60.0.0 0.0.0.255 any',
     ' 40 permit ip any any',
     'ip access-list extended OOB-LOCKDOWN',
     ' 10 remark only the jump host reaches out-of-band management',
-    ' 20 permit ip host 10.10.10.11 any',
-    ' 30 permit ip host 10.10.70.10 10.10.10.0 0.0.0.255',
-    ' 40 deny ip any 10.10.10.0 0.0.0.255',
+    ' 20 permit ip host 10.10.0.11 any',
+    ' 30 permit ip host 10.70.0.10 10.10.0.0 0.0.255.255',
+    ' 40 deny ip any 10.10.0.0 0.0.255.255',
     ' 50 permit ip any any',
   ].join('\n')).acls;
   coreA.aclApply = { 'Vlan50': { in: 'CAMERA-ISOLATION' }, 'Vlan60': { in: 'ACCESS-ISOLATION' },

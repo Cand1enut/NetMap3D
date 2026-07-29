@@ -929,6 +929,41 @@ Scope to build (each part must actually work in the sim, not be scenery):
 
 This is the acceptance test for the alpha. Build it after the cloud UIs.
 
+## Data-centre test env — status and the open item (Jul 2026)
+
+`referenceSite()` = `buildDataCentre({rows, racksPerRow})`. Verified working at
+25 racks / 340 devices: same-pod server reachability, storage NICs, camera→NVR,
+jump→server over OOB, internet from servers and NOC through NAT, DHCP leasing
+per VLAN, and camera→server + reader→server correctly BLOCKED by ACL.
+
+**Scale bugs found and fixed by testing at 100 racks (all were real):**
+- Every VLAN sized /24 — a /24 holds 254 hosts, so 600 servers produced invalid
+  addresses like 10.10.20.650 and ~400 hosts silently had none. Big host VLANs
+  are /16 now.
+- Hosts carried a bare IP, which parses as /24, so a host in a /16 VLAN had the
+  wrong mask and never matched its own gateway. Prefix length is part of the
+  address now.
+- One 48-port aggregation switch cannot serve 100 racks: racks past the 48th had
+  an uplink to a port that does not exist and were isolated. Now one aggregation
+  switch PER ROW (pod design) — real halls scale by adding a pod.
+
+**OPEN — inter-pod reachability.** Each pod's aggregation switch trunks to the
+core, and the core is a router, so a VLAN does not span pods: two servers in
+"VLAN 20" in different pods are in different L2 domains. That is correct
+behaviour, not a bug — the design is wrong, not the engine. Two true-to-life
+fixes, pick one:
+  (a) **Per-pod subnets (modern, preferred)** — pod N gets 10.20.N.0/24 with its
+      own SVI on the core, and inter-pod traffic is ROUTED. This is L3-to-the-pod
+      and is what current DC design does.
+  (b) L2 core that bridges the VLANs across pods, with STP protecting the loops.
+Do (a): give each pod its own SVI + DHCP scope per VLAN and address servers from
+their pod's range.
+
+**Build cost blocks the 100-rack target**: 25 s to build, 199 ms/frame, and the
+100-rack build now exceeds a 30 s tool timeout. This is the instanced render
+layer (ARCHITECTURE DECISION above), and it must land before the full-size
+example is usable.
+
 ## Definition of done — the data centre build
 
 Owner-set acceptance test for the whole simulation: **build an entire data
