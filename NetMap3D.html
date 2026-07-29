@@ -843,7 +843,7 @@ select:focus, input:focus { border-color: var(--accent); }
       </div>
       <div class="l-actions">
         <button id="launch-new" class="l-primary">＋ New Project</button>
-        <button id="launch-sample">Open Reference Site</button>
+        <button id="launch-sample">Open Data Centre</button>
         <button id="launch-import">Import .json…</button>
         <button id="launcher-close" class="hidden">Back to current project</button>
       </div>
@@ -19072,153 +19072,249 @@ function maybeShowHelp() {
 // gateway routing between them on SVIs, structured cabling landing on the patch
 // panel rear with short leads to the switch. Everything here is how it would be
 // built on site — it is a starting point to edit, not a showcase.
-function referenceSite() {
-  const rack = { id: uid(), x: 0, z: 0, rotY: 0, name: 'Rack-1' };
-  state.racks.push(rack);
-  buildRackGroup(rack);
 
-  const mk = (type, u, extra = {}) => {
-    const d = DEVICE_TYPES[type].field
-      ? { id: uid(), type, name: deviceLabelCounter(type), ...extra }
-      : { id: uid(), type, rackId: rack.id, u, name: deviceLabelCounter(type), ...extra };
-    state.devices.push(d);
-    buildDeviceGroup(d);
-    return d;
+//////////////////// Enterprise data centre — THE test environment ////////////////////
+// A real facility, built to function, not to look busy. Every VLAN, route, ACL,
+// DHCP scope, camera and door here is wired the way it would be on site, so the
+// simulation can be tested against something that has to actually work.
+//
+// Scale is a parameter. It is deliberately modest until the instanced render
+// layer lands (see ARCHITECTURE DECISION in ROADMAP) — the design does not
+// change when it is cranked up, only the row/rack counts.
+//
+// VLAN plan, the way a real DC segments:
+//   10 MGMT-OOB   out-of-band management, isolated, reachable only from jump
+//   20 PROD       production server front-end
+//   30 DMZ        internet-facing
+//   40 STORAGE    east-west storage fabric, no gateway off-net
+//   50 CAMERA     UniFi Protect cameras + NVR, isolated by ACL
+//   60 ACCESS     door controllers/readers, isolated by ACL
+//   70 CORP       staff / NOC workstations
+const DC_VLANS = [
+  { id: 10, name: 'MGMT-OOB', net: '10.10.10' },
+  { id: 20, name: 'PROD',     net: '10.10.20' },
+  { id: 30, name: 'DMZ',      net: '10.10.30' },
+  { id: 40, name: 'STORAGE',  net: '10.10.40' },
+  { id: 50, name: 'CAMERA',   net: '10.10.50' },
+  { id: 60, name: 'ACCESS',   net: '10.10.60' },
+  { id: 70, name: 'CORP',     net: '10.10.70' },
+];
+
+function buildDataCentre(opts = {}) {
+  const ROWS = opts.rows || 2, PER_ROW = opts.racksPerRow || 6;
+  clearScene();
+  const D = [], C = [];
+  const put = (o) => { state.devices.push(o); buildDeviceGroup(o); D.push(o); return o; };
+  const rack = (x, z, name, units = 42) => {
+    const r = { id: uid(), x, z, y0: 0, rotY: 0, units, mount: 'floor', name };
+    state.racks.push(r); buildRackGroup(r); return r;
   };
-  const patch = mk('patch24', 42);
-  const hcm1 = mk('hcm', 41);
-  const sw = mk('switch48', 40, { ip: '10.0.0.2' });
-  const rtr = mk('router', 38, { ip: '10.0.0.1' });
-  // Core gateway. It routes between VLANs on SVIs — one interface per VLAN, each
-  // holding the .1 of that subnet. That is what makes it the default gateway for
-  // those subnets; a router merely sitting on the wire routes nothing.
-  // One scope per VLAN, not one pool per device — each carries its own range,
-  // lease and options. Lease lengths follow real practice: a day for wired
-  // staff, half a day for transient wireless clients, a week for cameras that
-  // never move. The .1–.99 of every subnet is excluded for static infrastructure.
-  const udm = mk('u_udmpromax', 35, { ip: '10.0.0.254', notes: 'core gateway',
-    svi: { 10: '10.0.10.1/24', 20: '10.0.20.1/24', 30: '10.0.30.1/24' },
-    dhcp: { enabled: true,
-      excluded: [{ from: '10.0.10.1', to: '10.0.10.99' },
-                 { from: '10.0.20.1', to: '10.0.20.99' },
-                 { from: '10.0.30.1', to: '10.0.30.99' }],
-      pools: [
-        { name: 'SERVERS', network: '10.0.10.0/24', poolStart: '10.0.10.100', poolEnd: '10.0.10.200',
-          lease: { days: 1, hours: 0, minutes: 0 }, defaultRouter: '10.0.10.1',
-          dns: ['10.0.10.5', '1.1.1.1'], domain: 'corp.local', tftp: '', reservations: [] },
-        { name: 'WIFI', network: '10.0.20.0/24', poolStart: '10.0.20.100', poolEnd: '10.0.20.200',
-          lease: { days: 0, hours: 12, minutes: 0 }, defaultRouter: '10.0.20.1',
-          dns: ['10.0.10.5', '1.1.1.1'], domain: 'corp.local', tftp: '', reservations: [] },
-        { name: 'CCTV', network: '10.0.30.0/24', poolStart: '10.0.30.100', poolEnd: '10.0.30.200',
-          lease: { days: 7, hours: 0, minutes: 0 }, defaultRouter: '10.0.30.1',
-          dns: ['10.0.10.5'], domain: 'corp.local', tftp: '', reservations: [] }
-      ] } });
-  const pmax = mk('u_promax24', 33, { ip: '10.0.0.4', notes: 'Etherlighting demo' });
-  mk('firewall', 37, { ip: '10.0.0.254' });
-  const srv = mk('server', 20, { ip: '10.0.10.5', gateway: '10.0.10.1' });
-  const ups1 = mk('ups', 1);
-  mk('vcm', 0, { side: 'R' });
-  const ap1 = mk('ap', 0, { x: 66, z: -36, ip: '10.0.20.11', gateway: '10.0.20.1', notes: 'VLAN 20 - WiFi' });
-  const cam1 = mk('camera', 0, { x: -60, z: -48, ip: '10.0.30.21', gateway: '10.0.30.1', notes: 'VLAN 30 - CCTV' });
-
-  // walls with a drilled pass-through, a wall-mounted camera, and an AP beyond the wall
-  const wallA = { id: uid(), x1: -144, z1: -84, x2: 144, z2: -84, h: WALL_H };
-  const wallB = { id: uid(), x1: -144, z1: -84, x2: -144, z2: 120, h: WALL_H };
-  state.walls.push(wallA, wallB);
-  buildWall(wallA); buildWall(wallB);
-  const hole1 = { id: uid(), wallId: wallA.id, x: -30, y: 80, z: -84, nx: 0, nz: 1 };
-  state.holes.push(hole1);
-  buildHole(hole1);
-  const wallCam = mk('camera', 0, { mount: 'wall', x: 50, y: 84, z: -81.6, rotY: 0, ip: '10.0.30.22', gateway: '10.0.30.1', notes: 'VLAN 30 - CCTV' });
-  const apFar = mk('ap', 0, { x: -30, z: -170, ip: '10.0.20.12', gateway: '10.0.20.1', notes: 'VLAN 20 - warehouse' });
-
-  // a planned-only device and link for the 2D view
-  state.devices.push({ id: uid(), type: 'switch24', name: 'Switch-IDF', ip: '10.0.0.3', notes: 'planned IDF closet' });
-  state.links.push({ id: uid(), aId: rtr.id, bId: sw.id });
-
-  // upstairs: a level-2 slab with an AP, plus an office corner downstairs
-  const slab2 = { id: uid(), x1: -160, z1: -60, x2: -40, z2: 100, y: 120 };
-  state.slabs.push(slab2);
-  buildSlab(slab2);
-  const apUp = mk('u_u7pro', 0, { x: -100, z: 20, y0: 120, ip: '10.0.20.13', gateway: '10.0.20.1', notes: 'Level 2 WiFi' });
-  // front desk PC leases from the gateway — shows DHCP working out of the box
-  const ws1 = mk('o_ws', 0, { x: 80, z: 30, rotY: -0.7, ip: 'dhcp', notes: 'front desk PC (DHCP)' });
-  mk('o_chair', 0, { x: 92, z: 44, rotY: 2.4 });
-  mk('person', 0, { x: 40, z: 60 });
-
-  const hcmG = deviceGroups.get(hcm1.id);
-  hcmG.updateWorldMatrix(true, false);
-  const wp = hcmG.localToWorld(new THREE.Vector3(0, 0, 2.2));
-
-  // a port argument is either a plain number (front jack) or [number, side]
-  const mkCable = (a, ap, b, bp, color, wps = []) => {
-    const ep = (dev, p) => Array.isArray(p)
-      ? { deviceId: dev.id, port: p[0], side: p[1] }
-      : { deviceId: dev.id, port: p, side: FRONT };
-    const c = { id: uid(), a: ep(a, ap), b: ep(b, bp), color, waypoints: wps };
-    state.cables.push(c);
-    buildCableMesh(c);
+  const inRack = (r, type, u, extra = {}) =>
+    put({ id: uid(), type, rackId: r.id, u, name: extra.name || deviceLabelCounter(type), ...extra });
+  const field = (type, extra = {}) => put({ id: uid(), type, name: extra.name || deviceLabelCounter(type), ...extra });
+  const link = (da, pa, db, pb, color) => {
+    const c = { id: uid(), a: { deviceId: da.id, port: pa, side: FRONT },
+      b: { deviceId: db.id, port: pb, side: FRONT }, color: color || 0x2f81f7, waypoints: [] };
+    state.cables.push(c); buildCableMesh(c); C.push(c); return c;
   };
-  // Structured cabling the way it is actually installed. Every horizontal run
-  // from a field device terminates on the BACK of the patch panel and never
-  // touches the switch; a short patch lead on the FRONT jumps that same port
-  // number across to a switch port. Re-patching a drop is then a 6" lead swap,
-  // not a re-pull — which is the entire reason the panel is in the rack.
-  // dressed down the back, each run on its own vertical line like a real bundle
-  const rearWp = (n) => ({ x: 2 + n * 1.4, y: RACK_BASE + 41.5 * U, z: -RACK_D / 2 - 3 });
-  // wps empty = let the auto-router take it up into the plenum and across
-  const drops = [
-    [1, sw, 1,  ap1,     '#eab308', []],
-    [2, sw, 26, cam1,    '#a855f7', []],
-    [3, sw, 12, wallCam, '#f97316', []],
-    // this one is hand-routed through the drilled hole in wall A to the warehouse AP
-    [4, sw, 14, apFar,   '#22c55e', [{ x: -30, y: 80, z: -81 }, { x: -30, y: 80, z: -87 }]],
-    [5, sw, 18, apUp,    '#eab308', []]
+  const wall = (x1, z1, x2, z2, material, openings) => {
+    const w = { id: uid(), x1, z1, x2, z2, h: WALL_H, y0: 0, material, openings: openings || [] };
+    state.walls.push(w); buildWall(w); return w;
+  };
+  const slab = (x1, z1, x2, z2, material) => {
+    const sl = { id: uid(), x1, z1, x2, z2, y: 0, material };
+    state.slabs.push(sl); buildSlab(sl); return sl;
+  };
+  const svi = {}, pools = [];
+  for (const v of DC_VLANS) {
+    svi[v.id] = `${v.net}.1/24`;
+    // STORAGE is deliberately static-only — a storage fabric does not DHCP.
+    if (v.id === 40) continue;
+    pools.push({ name: v.name, network: `${v.net}.0/24`, poolStart: `${v.net}.100`, poolEnd: `${v.net}.200`,
+      lease: { days: 1 }, defaultRouter: `${v.net}.1`, dns: ['10.10.20.10'], domain: 'dc.local', reservations: [] });
+  }
+
+  // ---- the building: data hall, MDF, UPS room, and a mantrap vestibule ----
+  const HALL_X = ROWS * 130 + 120, HALL_Z = PER_ROW * 46 + 120;
+  slab(-HALL_X/2, -HALL_Z/2, HALL_X/2, HALL_Z/2, 'concrete');
+  // perimeter, with the only way in through the vestibule
+  wall(-HALL_X/2, -HALL_Z/2,  HALL_X/2, -HALL_Z/2, 'concrete');
+  wall(-HALL_X/2,  HALL_Z/2,  HALL_X/2,  HALL_Z/2, 'concrete');
+  wall(-HALL_X/2, -HALL_Z/2, -HALL_X/2,  HALL_Z/2, 'concrete');
+  wall( HALL_X/2, -HALL_Z/2,  HALL_X/2,  HALL_Z/2, 'concrete');
+  // MANTRAP: two doors in series, an airlock — you badge in, the outer door must
+  // close before the inner opens. Both leaves are real openings.
+  const vestZ = -HALL_Z/2;
+  wall(-60, vestZ - 90,  60, vestZ - 90, 'concrete', [{ id: uid(), kind: 'door', at: 0.5 }]);   // outer
+  wall(-60, vestZ,       60, vestZ,      'concrete', [{ id: uid(), kind: 'door', at: 0.5 }]);   // inner
+  wall(-60, vestZ - 90, -60, vestZ,      'concrete');
+  wall( 60, vestZ - 90,  60, vestZ,      'concrete');
+  slab(-60, vestZ - 90, 60, vestZ, 'vct');
+
+  // ---- WAN: two diverse carriers, each with its own ONT ----
+  const isp = field('internet', { x: -HALL_X/2 - 140, z: -HALL_Z/2 - 140, name: 'Carrier-Cloud' });
+  const ontA = field('ont', { x: -HALL_X/2 - 70, z: -HALL_Z/2 - 160, name: 'ONT-A',
+    circuit: { active: true, provider: 'Carrier A', wanIp: '203.0.113.2/30' } });
+  const ontB = field('ont', { x: -HALL_X/2 - 70, z: -HALL_Z/2 - 110, name: 'ONT-B',
+    circuit: { active: true, provider: 'Carrier B', wanIp: '198.51.100.2/30' } });
+  link(isp, 1, ontA, 1); link(isp, 2, ontB, 1);
+
+  // ---- MDF rack: edge, core, OOB, NVR, access controller ----
+  const mdf = rack(-HALL_X/2 + 60, -HALL_Z/2 + 70, 'MDF-01');
+  inRack(mdf, 'vcm', 0, { side: 'R' });
+  const edgeA = inRack(mdf, 'c_mx105', 41, { name: 'EDGE-A', ip: '10.10.10.2',
+    portCfg: { 2: { ip: '192.168.255.1/29' } },
+    ospf: { enabled: true, area: 0, refBw: 10000 } });
+  const edgeB = inRack(mdf, 'c_mx95', 39, { name: 'EDGE-B', ip: '10.10.10.3',
+    portCfg: { 2: { ip: '192.168.255.2/29' } },
+    ospf: { enabled: true, area: 0, refBw: 10000 } });
+  link(ontA, 2, edgeA, 1); link(ontB, 2, edgeB, 1);
+
+
+  // Core: the L3 boundary. Holds every SVI, every DHCP scope, and the ACLs that
+  // segment the zones from each other.
+  const coreA = inRack(mdf, 'u_udmpromax', 37, { name: 'CORE-A', ip: '10.10.10.4', svi: { ...svi },
+    portCfg: { 1: { ip: '192.168.255.3/29' } },
+    ospf: { enabled: true, area: 0, refBw: 10000 },
+    routes: [{ prefix: '0.0.0.0/0', via: '192.168.255.1' }],
+    nat: { enabled: true, insideGlobal: '203.0.113.2', overload: true },
+    dhcp: { enabled: true, pools, excluded: DC_VLANS.map(v => ({ from: `${v.net}.1`, to: `${v.net}.99` })) } });
+  link(edgeA, 2, coreA, 1, 0xf0883e);                       // core <-> edge transit
+
+  // The OOB/services switch carries management, camera, access and corp — so its
+  // uplink to the core is a TRUNK. An access port here was the bug that left
+  // cameras and the NOC stranded: their VLANs could not reach their gateway.
+  const oob = inRack(mdf, 'c_ms120_24p', 35, { name: 'OOB-SW', ip: '10.10.10.5',
+    vlans: DC_VLANS.map(v => ({ id: v.id, name: v.name })),
+    portCfg: Object.fromEntries([...Array(23)].map((_, i) => [i + 1, { vlan: '10' }])) });
+  oob.portCfg[24] = { mode: 'trunk', native: '10', tagged: DC_VLANS.map(v => v.id).join(',') };
+  // Aggregation/distribution layer. A core gateway does not have a port per rack
+  // — real halls put a 48-port aggregation switch between core and the ToRs.
+  const agg = inRack(mdf, 'c_c9300l48', 33, { name: 'AGG-01', ip: '10.10.10.6',
+    vlans: DC_VLANS.map(v => ({ id: v.id, name: v.name })) });
+  agg.portCfg = { 48: { mode: 'trunk', native: '10', tagged: DC_VLANS.map(v => v.id).join(',') } };
+  link(agg, 48, coreA, 4, 0xf0883e);
+  // Services switch joins the SAME layer-2 fabric as the racks. Hanging it off
+  // the core instead put the NVR in a different L2 island from the cameras even
+  // though both were "VLAN 50" — a router does not bridge a VLAN.
+  agg.portCfg[47] = { mode: 'trunk', native: '10', tagged: DC_VLANS.map(v => v.id).join(',') };
+  link(oob, 24, agg, 47, 0x3fb950);
+  const nvr = inRack(mdf, 'u_unvrpro', 31, { name: 'NVR-01', ip: '10.10.50.10', gateway: '10.10.50.1' });
+  const acHub = inRack(mdf, 'u_accesshub', 29, { name: 'ACCESS-HUB', ip: '10.10.60.10', gateway: '10.10.60.1' });
+  const mdfPatch = inRack(mdf, 'patch24', 42);
+  inRack(mdf, 'hcm', 40); inRack(mdf, 'hcm', 38); inRack(mdf, 'hcm', 36);
+  const mdfUps = inRack(mdf, 'ups', 1, { name: 'UPS-MDF' });
+  for (const [d, o] of [[edgeA,1],[edgeB,2],[coreA,3],[oob,4],[nvr,5],[acHub,6]]) link(d, 'PWR', mdfUps, o, 0xe5534b);
+
+  // ---- data hall: rows of racks, each with a top-of-rack switch ----
+  const tors = [];
+  for (let row = 0; row < ROWS; row++) {
+    for (let i = 0; i < PER_ROW; i++) {
+      const x = -HALL_X/2 + 200 + row * 130;
+      const z = -HALL_Z/2 + 120 + i * 46;
+      const r = rack(x, z, `R${row + 1}-${String(i + 1).padStart(2, '0')}`);
+      inRack(r, 'vcm', 0, { side: 'R' });
+      const patch = inRack(r, 'patch24', 42);
+      inRack(r, 'hcm', 41);
+      // ToR pair is overkill per rack in a small hall; one ToR + uplink to core
+      const tor = inRack(r, 'c_ms250_48', 40, { name: `TOR-${row+1}-${i+1}`, ip: `10.10.10.${20 + tors.length}`,
+        vlans: DC_VLANS.map(v => ({ id: v.id, name: v.name })),
+        portCfg: { 48: { mode: 'trunk', native: '10', tagged: DC_VLANS.map(v=>v.id).join(',') } } });
+      tors.push(tor);
+      inRack(r, 'hcm', 39);
+      // servers: dual-homed (PROD + STORAGE), plus an OOB management NIC
+      for (let s = 0; s < 6; s++) {
+        const u = 36 - s * 2;
+        const n = tors.length * 10 + s;
+        const srv = inRack(r, 'server', u, { name: `SRV-${row+1}${i+1}-${s+1}`,
+          nics: { 1: { ip: `10.10.20.${50 + n}`, gateway: '10.10.20.1', label: 'prod' },
+                  2: { ip: `10.10.40.${50 + n}`, label: 'storage' },
+                  3: { ip: `10.10.10.${100 + n}`, gateway: '10.10.10.1', label: 'oob' } } });
+        // prod + storage land on the ToR, management goes back to the OOB switch
+        tor.portCfg[s*2+1] = { vlan: '20' }; tor.portCfg[s*2+2] = { vlan: '40' };
+        link(srv, 1, tor, s*2+1, 0x2f81f7);
+        link(srv, 2, tor, s*2+2, 0xa371f7);
+      }
+      const ru = inRack(r, 'ups', 1, { name: `UPS-${row+1}-${i+1}` });
+      link(tor, 'PWR', ru, 1, 0xe5534b);
+      // ToR trunk up to aggregation (not the core — the core has no port per rack)
+      const aggPort = tors.length;                       // 1..N, agg has 48
+      agg.portCfg[aggPort] = { mode: 'trunk', native: '10', tagged: DC_VLANS.map(v => v.id).join(',') };
+      link(tor, 48, agg, aggPort, 0xf0883e);
+      // rack-level security: a camera watching the aisle and a reader on the cage
+      const cam = field('u_g6turret', { mount: 'wall', x, y: 96, z: z - 22, rotY: 0,
+        name: `CAM-R${row+1}-${i+1}`, ip: 'dhcp' });
+      link(cam, 1, tor, 40 + (i % 4), 0xdb61a2);
+      tor.portCfg[40 + (i % 4)] = { vlan: '50' };
+    }
+  }
+
+  // ---- physical security: cameras and readers on the entries ----
+  const secCams = [
+    ['CAM-VEST-OUT', 0, vestZ - 88], ['CAM-VEST-IN', 0, vestZ + 6],
+    ['CAM-HALL-N', -HALL_X/2 + 20, -HALL_Z/2 + 20], ['CAM-HALL-S', HALL_X/2 - 20, HALL_Z/2 - 20],
   ];
-  for (const [p, swDev, swPort, field, color, wps] of drops) {
-    mkCable(swDev, swPort, patch, p, '#3b82f6', [{ x: wp.x - 8 + p * 3, y: wp.y, z: wp.z }]);
-    mkCable(patch, [p, REAR], field, 1, color, wps.length ? [rearWp(p), ...wps] : []);
+  for (const [name, x, z] of secCams) {
+    const c = field('u_aipro', { mount: 'wall', x, y: 104, z, rotY: 0, name, ip: 'dhcp' });
+    link(c, 1, oob, secCams.indexOf(secCams.find(s=>s[0]===name)) + 1, 0xdb61a2);
   }
-  // in-rack and adjacent gear patches straight to the switch — no panel needed
-  mkCable(sw, 42, srv, 1, '#22c55e');
-  mkCable(sw, 17, ws1, 1, '#3b82f6');
-  // Gateway uplink. This is a trunk: it has to carry every VLAN the gateway
-  // routes for, otherwise the SVI for a missing VLAN is unreachable and that
-  // subnet has no default gateway.
-  mkCable(sw, 2, udm, 1, '#e5e7eb');
+  // badge readers: outer mantrap door, inner mantrap door, and the cage
+  const readers = [['RDR-OUTER', 0, vestZ - 86], ['RDR-INNER', 0, vestZ + 4], ['RDR-CAGE', -HALL_X/2 + 40, -HALL_Z/2 + 40]];
+  readers.forEach(([name, x, z], i) => {
+    const rd = field('u_readerg3', { mount: 'wall', x, y: 48, z, rotY: 0, name, ip: 'dhcp' });
+    link(rd, 1, oob, 10 + i, 0x3fb950);
+    oob.portCfg[10 + i] = { vlan: '60' };
+  });
+  // cameras on OOB ports land in the camera VLAN, not management
+  for (let i = 1; i <= secCams.length; i++) oob.portCfg[i] = { vlan: '50' };
 
-  // Port VLAN assignment. Each access port is placed in the VLAN matching the
-  // subnet of the device on it — one VLAN per subnet, which is the design the
-  // gateway's SVIs assume. Without this every device sits in VLAN 1 and the
-  // separation the addressing implies would be fictional.
-  const setAccess = (dev, port, vlan) => {
-    dev.portCfg = dev.portCfg || {};
-    dev.portCfg[port] = { ...(dev.portCfg[port] || {}), vlan: String(vlan) };
-  };
-  // port -> VLAN, matched to the subnet of the device actually on that port:
-  //   42 server 10.0.10.5 · 17 workstation (DHCP 10.0.10.x)      -> VLAN 10
-  //   1 AP-1 .20.11 · 18 AP upstairs .20.13 · 14 AP warehouse .20.12 -> VLAN 20
-  //   26 Cam-1 .30.21 · 12 wall camera .30.22                    -> VLAN 30
-  const VLAN_OF = { 10: [42, 17], 20: [1, 18, 14], 30: [26, 12] };
-  for (const [vlan, ports] of Object.entries(VLAN_OF)) {
-    for (const p of ports) setAccess(sw, p, vlan);
-  }
-  // The VLAN database. A port cannot be put in a VLAN that does not exist, so
-  // both ends of the trunk have to know all three.
-  const VLANS = [{ id: 10, name: 'SERVERS' }, { id: 20, name: 'WIFI' }, { id: 30, name: 'CCTV' }];
-  sw.vlans = VLANS.map(v => ({ ...v }));
-  udm.vlans = VLANS.map(v => ({ ...v }));
-  // The uplink is an explicit trunk: VLAN 10 native (untagged), 20 and 30
-  // tagged. Both ends must agree on the native VLAN or traffic silently
-  // crosses between VLANs.
-  sw.portCfg[2] = { mode: 'trunk', native: '10', tagged: '20,30' };
-  udm.portCfg = udm.portCfg || {};
-  udm.portCfg[1] = { mode: 'trunk', native: '10', tagged: '20,30' };
-  // power cords: rear inlets → UPS outlets, like a real rack
-  mkCable(sw, 'PWR', ups1, 1, '#111827');
-  mkCable(udm, 'PWR', ups1, 2, '#111827');
-  mkCable(pmax, 'PWR', ups1, 3, '#111827');
-  setStatus('Reference site loaded — field runs land on the patch panel REAR, short leads patch the FRONT to the switch. Hover any port to see both faces.');
+  // ---- NOC ----
+  const noc = field('o_ws', { x: HALL_X/2 - 60, z: HALL_Z/2 - 60, name: 'NOC-1', ip: 'dhcp' });
+  link(noc, 1, oob, 20, 0x2f81f7);
+  oob.portCfg[20] = { vlan: '70' };
+  const jump = inRack(mdf, 'server', 27, { name: 'JUMP-01',
+    nics: { 1: { ip: '10.10.70.10', gateway: '10.10.70.1', label: 'corp' },
+            2: { ip: '10.10.10.11', gateway: '10.10.10.1', label: 'oob' } } });
+  link(jump, 1, oob, 21, 0x2f81f7); oob.portCfg[21] = { vlan: '70' };
+  link(jump, 2, oob, 22, 0x3fb950); oob.portCfg[22] = { vlan: '10' };
+  link(nvr, 1, oob, 23, 0xdb61a2); oob.portCfg[23] = { vlan: '50' };
+  link(acHub, 1, oob, 19, 0x3fb950); oob.portCfg[19] = { vlan: '60' };
+
+  // ---- segmentation: the ACLs that make the zones real ----
+  coreA.acls = parseAclText([
+    'ip access-list extended CAMERA-ISOLATION',
+    ' 10 remark cameras talk to the NVR and nothing else',
+    ' 20 permit ip 10.10.50.0 0.0.0.255 host 10.10.50.10',
+    ' 30 deny ip 10.10.50.0 0.0.0.255 any',
+    ' 40 permit ip any any',
+    'ip access-list extended ACCESS-ISOLATION',
+    ' 10 remark door hardware talks only to the access controller',
+    ' 20 permit ip 10.10.60.0 0.0.0.255 host 10.10.60.10',
+    ' 30 deny ip 10.10.60.0 0.0.0.255 any',
+    ' 40 permit ip any any',
+    'ip access-list extended OOB-LOCKDOWN',
+    ' 10 remark only the jump host reaches out-of-band management',
+    ' 20 permit ip host 10.10.10.11 any',
+    ' 30 permit ip host 10.10.70.10 10.10.10.0 0.0.0.255',
+    ' 40 deny ip any 10.10.10.0 0.0.0.255',
+    ' 50 permit ip any any',
+  ].join('\n')).acls;
+  coreA.aclApply = { 'Vlan50': { in: 'CAMERA-ISOLATION' }, 'Vlan60': { in: 'ACCESS-ISOLATION' },
+                     'Vlan70': { in: 'OOB-LOCKDOWN' } };
+
+  flushL2Tables(); natClear(); dhcpClearBindings(); resolveDhcp();
+  applyLevelVisibility();
+  setStatus(`Data centre: ${state.racks.length} racks, ${state.devices.length} devices, ${state.cables.length} cables. ` +
+    `7 VLANs, dual carriers, mantrap, cameras and readers on isolated VLANs.`);
+  return { racks: state.racks.length, devices: state.devices.length, cables: state.cables.length };
+}
+
+function referenceSite() {
+  // The reference site IS an enterprise data centre — it is the environment
+  // everything gets tested against. Three-tier network (edge / core / aggregation
+  // / top-of-rack), seven segmented VLANs, dual carriers, mantrap entry, cameras
+  // and badge readers on isolated VLANs.
+  return buildDataCentre({ rows: 2, racksPerRow: 6 });
 }
 
 // boot into the project launcher — no auto-loaded demo
