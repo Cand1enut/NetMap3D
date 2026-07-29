@@ -4730,6 +4730,14 @@ function l2Walk(startDev, opts = {}) {
     seen.add(cur.key);
     const cls = netClass(cur.dev);
     if (cls === 'router') { if (!reachedRouters.has(cur.dev.id)) reachedRouters.set(cur.dev.id, cur); continue; }
+    // An L3 switch both SWITCHES and ROUTES. It keeps forwarding frames at layer
+    // 2 (so the walk continues through it), but it is also a gateway/DHCP-server
+    // candidate for any VLAN it holds an SVI on. Treating it as switch-only made
+    // a core with every SVI invisible to gateway and DHCP lookups.
+    if (cls === 'switch' && !reachedRouters.has(cur.dev.id) &&
+        deviceInterfaces(cur.dev).some(i => i.kind === 'svi')) {
+      reachedRouters.set(cur.dev.id, cur);
+    }
     if (cls === 'host') { reachedHosts.add(cur.dev.id); continue; }
     // switch (or multi-port bridge): spread to every other port on this VLAN,
     // then hop each to its neighbour through any patch panels
@@ -13314,7 +13322,8 @@ function buildDataCentre(opts = {}) {
 
   // Core: the L3 boundary. Holds every SVI, every DHCP scope, and the ACLs that
   // segment the zones from each other.
-  const coreA = inRack(mdf, 'u_udmpromax', 37, { name: 'CORE-A', ip: '10.10.0.4/16', svi: { ...svi },
+  const coreA = inRack(mdf, 'c_c9300l48', 37, { name: 'CORE-A', ip: '10.10.0.4/16', svi: { ...svi },
+    vlans: DC_VLANS.map(v => ({ id: v.id, name: v.name })),
     portCfg: { 1: { ip: '192.168.255.3/29' } },
     ospf: { enabled: true, area: 0, refBw: 10000 },
     routes: [{ prefix: '0.0.0.0/0', via: '192.168.255.1' }],
@@ -13331,20 +13340,35 @@ function buildDataCentre(opts = {}) {
   oob.portCfg[24] = { mode: 'trunk', native: '10', tagged: DC_VLANS.map(v => v.id).join(',') };
   // Aggregation/distribution layer. A core gateway does not have a port per rack
   // — real halls put a 48-port aggregation switch between core and the ToRs.
-  // POD DESIGN: one aggregation switch per row. A single 48-port aggregation
-  // switch cannot serve 100 racks — racks past the 48th silently had no uplink
-  // and were isolated. Real halls scale by adding a pod, not by wishing the
-  // switch had more ports.
   const trunkAll = () => ({ mode: 'trunk', native: '10', tagged: DC_VLANS.map(v => v.id).join(',') });
+  // Redundant three-tier, per the reference architecture: two L3 cores, an
+  // aggregation PAIR per pod, every aggregation switch dual-homed to BOTH cores,
+  // and the pair cross-linked to each other. That is what makes the design
+  // survivable — and it deliberately creates loops, which is exactly what
+  // spanning tree is for.
+  const coreB = inRack(mdf, 'c_c9300l48', 36, { name: 'CORE-B', ip: '10.10.0.7/16',
+    vlans: DC_VLANS.map(v => ({ id: v.id, name: v.name })), svi: { ...svi } });
+  coreB.portCfg = {};
+  for (let p = 10; p < 10 + ROWS * 2; p++) { coreB.portCfg[p] = trunkAll(); coreA.portCfg[p] = trunkAll(); }
+  coreB.portCfg[48] = trunkAll(); coreA.portCfg[2] = trunkAll();
+  link(coreA, 2, coreB, 48, 0xe5534b);       // core-to-core
   const aggs = [];
   for (let row = 0; row < ROWS; row++) {
-    const a = inRack(mdf, 'c_c9300l48', 33 - row, { name: `AGG-${row + 1}`, ip: `10.10.0.${10 + row}/16`,
-      vlans: DC_VLANS.map(v => ({ id: v.id, name: v.name })) });
-    a.portCfg = { 48: trunkAll() };
-    link(a, 48, coreA, 4 + row, 0xf0883e);
-    aggs.push(a);
+    const pair = [];
+    for (let k = 0; k < 2; k++) {
+      const a = inRack(mdf, 'c_c9300l48', 33 - row * 2 - k,
+        { name: `AGG-${row + 1}${k ? 'B' : 'A'}`, ip: `10.10.0.${20 + row * 2 + k}/16`,
+          vlans: DC_VLANS.map(v => ({ id: v.id, name: v.name })) });
+      a.portCfg = { 48: trunkAll(), 47: trunkAll(), 46: trunkAll() };
+      // dual-homed: one uplink to each core (10 GE in the reference)
+      link(a, 48, coreA, 10 + row * 2 + k, 0xe5534b);
+      link(a, 47, coreB, 10 + row * 2 + k, 0xe5534b);
+      pair.push(a);
+    }
+    link(pair[0], 46, pair[1], 46, 0xe5534b);   // the pair's cross-link
+    aggs.push(pair);
   }
-  const agg = aggs[0];                       // services switch lands on pod 1
+  const agg = aggs[0][0];                       // services switch lands on pod 1A
   // Services switch joins the SAME layer-2 fabric as the racks. Hanging it off
   // the core instead put the NVR in a different L2 island from the cameras even
   // though both were "VLAN 50" — a router does not bridge a VLAN.
@@ -13355,7 +13379,7 @@ function buildDataCentre(opts = {}) {
   const mdfPatch = inRack(mdf, 'patch24', 42);
   inRack(mdf, 'hcm', 40); inRack(mdf, 'hcm', 38); inRack(mdf, 'hcm', 36);
   const mdfUps = inRack(mdf, 'ups', 1, { name: 'UPS-MDF' });
-  for (const [d, o] of [[edgeA,1],[edgeB,2],[coreA,3],[oob,4],[nvr,5],[acHub,6]]) link(d, 'PWR', mdfUps, o, 0xe5534b);
+  for (const [d, o] of [[edgeA,1],[edgeB,2],[coreA,3],[coreB,7],[oob,4],[nvr,5],[acHub,6]]) link(d, 'PWR', mdfUps, o, 0xe5534b);
 
   // ---- data hall: rows of racks, each with a top-of-rack switch ----
   const tors = [];
@@ -13388,12 +13412,16 @@ function buildDataCentre(opts = {}) {
       }
       const ru = inRack(r, 'ups', 1, { name: `UPS-${row+1}-${i+1}` });
       link(tor, 'PWR', ru, 1, 0xe5534b);
-      // ToR trunks up to ITS ROW's aggregation switch — a pod uplink, and one
-      // that exists: port index is within that switch's real port count.
-      const myAgg = aggs[row];
-      const aggPort = i + 1;                              // <= racksPerRow, well under 47
-      myAgg.portCfg[aggPort] = trunkAll();
-      link(tor, 48, myAgg, aggPort, 0xf0883e);
+      // Access switch dual-homed to BOTH aggregation switches in its pod (the
+      // crossing links in the reference). One agg or one uplink can fail and the
+      // rack stays up; spanning tree blocks the redundant path meanwhile.
+      const [aggA, aggB] = aggs[row];
+      const aggPort = i + 1;                              // <= racksPerRow, well under 46
+      tor.portCfg[47] = trunkAll();
+      aggA.portCfg[aggPort] = trunkAll();
+      aggB.portCfg[aggPort] = trunkAll();
+      link(tor, 48, aggA, aggPort, 0x3fb950);
+      link(tor, 47, aggB, aggPort, 0x3fb950);
       // rack-level security: a camera watching the aisle and a reader on the cage
       const cam = field('u_g6turret', { mount: 'wall', x, y: 96, z: z - 22, rotY: 0,
         name: `CAM-R${row+1}-${i+1}`, ip: 'dhcp' });
@@ -13454,6 +13482,15 @@ function buildDataCentre(opts = {}) {
   ].join('\n')).acls;
   coreA.aclApply = { 'Vlan50': { in: 'CAMERA-ISOLATION' }, 'Vlan60': { in: 'ACCESS-ISOLATION' },
                      'Vlan70': { in: 'OOB-LOCKDOWN' } };
+  // Both cores carry the SAME policy and the same translation. Anything less
+  // means the redundant path silently bypasses security — which is exactly what
+  // happened the first time this was wired: camera isolation leaked via CORE-B.
+  coreB.acls = coreA.acls.map(a => ({ ...a, rules: a.rules.map(r => ({ ...r })) }));
+  coreB.aclApply = { ...coreA.aclApply };
+  coreB.nat = { enabled: true, insideGlobal: '198.51.100.2', overload: true };
+  coreB.routes = [{ prefix: '0.0.0.0/0', via: '192.168.255.2' }];
+  coreB.portCfg[1] = { ip: '192.168.255.4/29' };
+  link(edgeB, 2, coreB, 1, 0xf0883e);        // second core out its own carrier
 
   flushL2Tables(); natClear(); dhcpClearBindings(); resolveDhcp();
   applyLevelVisibility();
