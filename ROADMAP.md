@@ -755,7 +755,13 @@ v0.48.0 via polygonOffset on the slab material. Floor MATERIALS done v0.49.0
 (sealed concrete with saw-cut joints, carpet tile, VCT, hardwood) with a Floor
 picker on the Floor tool.
 
-## NEXT MAJOR PHASE (owner, Jul 2026): self-hosted server + real accounts
+## DEFERRED (owner, Jul 2026): self-hosted server + realtime collaboration
+
+**Owner pushed realtime collaboration OUT.** Do NOT start it. Priority is now the
+full, accurate cloud-managed UIs (item D) and the enterprise data-centre test
+environment below. The plan below is kept for when it is picked back up.
+
+### (deferred) self-hosted server + real accounts
 
 After the current bug-fixing pass, the next build is a **double-clickable
 executable that hosts a server**, with logins, so several people work on one
@@ -788,6 +794,36 @@ stop being theoretical, so build in this order:
 
 Local-first stays: the portable single file must keep working with no account,
 no server and no connection.
+
+## THE TEST ENVIRONMENT: enterprise data centre (owner, Jul 2026)
+
+Build a complete enterprise-scale data centre as the built-in example, and use
+it as THE test environment from now on — every feature gets verified against it
+instead of the small reference site. It must function 100% correctly.
+
+Owner: "insane level security from doors to cameras, go all out, no holds
+barred. Anything you can think of needs to be there and function true to life."
+
+Scope to build (each part must actually work in the sim, not be scenery):
+- **Network**: core/distribution/access layers, redundant core with STP blocking
+  a real loop, MLAG-style dual uplinks, spine-leaf where it fits, out-of-band
+  management network, dual-homed servers, full VLAN plan (mgmt, prod, DMZ,
+  storage, OOB, camera, access-control, guest), routed SVIs, OSPF between cores,
+  DHCP scopes per VLAN, DNS, ACL segmentation between zones, NAT to a real WAN
+  with dual ISP circuits and ONTs.
+- **Physical**: multiple rooms (entry vestibule/mantrap, MDF, data hall, UPS/
+  battery room, generator yard), rows of racks with real cable management,
+  structured cabling landing on patch panels, raceway/tray pathways, floor and
+  wall materials that read as a real facility.
+- **Security, in depth**: mantrap/airlock doors, badge readers on every door
+  (perimeter, hall, cage, rack), door position sensors, request-to-exit,
+  cameras covering every entry/aisle/rack row with overlapping fields of view,
+  camera VLAN isolated by ACL, NVR, access-control controller, and the access
+  system on its own VLAN. Doors must be real openings with working leaves.
+- **Verification**: the reachability matrix, PDU walks, DHCP, STP, OSPF, ACL and
+  NAT must all be correct on it, and it must save/load clean.
+
+This is the acceptance test for the alpha. Build it after the cloud UIs.
 
 ## Definition of done — the data centre build
 
@@ -1051,6 +1087,14 @@ Two tells that a shortcut is being taken, both caught in this project:
   data model is wrong, not a licence to batch-guess.
 
 ## Traps already hit once (don't repeat)
+
+- **Never gate user-facing config on `netClass()`.** It classifies packet
+  forwarding (host/switch/router), NOT product capability. Gating the properties
+  panel on it put a **DHCP server and a DNS zone on an IP camera**. Use
+  `deviceCan(dev, cap)`, which is derived from what the product actually is.
+  Before exposing any config control, ask: does this exact product have this
+  feature in real life? If not, it must not appear.
+
 
 - **Advancing a simulated clock must be a discrete-event walk, not one jump.**
   Skipping straight to the target time steps over every timer that should have

@@ -3880,6 +3880,68 @@ function ipInSubnet(addrInt, net) {
 // The old version guessed "8 or more ports means switch", which misclassified
 // a 5-port desk switch as a host and a 4-NIC server as a switch. Role is a
 // property of the product, so the product data has to carry it.
+// ---- What a device can actually be configured to do ----
+// netClass is too coarse to drive the properties panel: a camera, an access
+// point and a file server are all class "host", so gating on that offered a
+// DHCP SERVER and a DNS zone on an IP camera. Nonsense like that makes the
+// whole tool feel fake. Capability comes from what the product really is.
+//
+// An appliance endpoint (camera, AP, doorbell, reader, phone, printer, TV) gets
+// exactly what such a box gets in life: an address (static or DHCP client), a
+// VLAN, and a name. It does not serve DHCP, hold DNS records, run OSPF, do NAT
+// or filter with ACLs.
+function isApplianceEndpoint(dev) {
+  const def = DEVICE_TYPES[dev.type] || {};
+  const cat = def.cat || '', label = def.label || '';
+  if (/Cameras|Door Access/.test(cat)) return true;
+  if (/UniFi APs/.test(cat)) return true;
+  if (/Access Point|Doorbell|Camera|Reader|Phone|Printer|\bTV\b/i.test(label)) return true;
+  if (/^(ap|camera|o_printer|o_tv)$/.test(dev.type)) return true;
+  return false;
+}
+// A general-purpose computer — can carry several NICs.
+function isComputerHost(dev) {
+  if (netClass(dev) !== 'host') return false;
+  if (isApplianceEndpoint(dev)) return false;
+  const def = DEVICE_TYPES[dev.type] || {};
+  return /Server|NAS|Workstation|PC|Desktop|Laptop/i.test(def.label || '') ||
+         /^(server|o_ws|o_pc)$/.test(dev.type);
+}
+// A SERVER specifically. Server software — a DHCP scope, a DNS zone — belongs
+// on a server, not on every desktop. A workstation offering to serve DHCP is
+// the same kind of nonsense as a camera offering to.
+function isServerHost(dev) {
+  if (!isComputerHost(dev)) return false;
+  const def = DEVICE_TYPES[dev.type] || {};
+  return /Server|NAS/i.test(def.label || '') || dev.type === 'server';
+}
+// Does this device route? Only a router-class box, or an L3 switch that has
+// actually been given SVIs/routed ports (not just a management address).
+function isLayer3(dev) {
+  if (netClass(dev) === 'router') return true;
+  if (netClass(dev) !== 'switch') return false;
+  return deviceInterfaces(dev).some(i => i.kind !== 'mgmt');
+}
+function deviceCan(dev, cap) {
+  const cls = netClass(dev);
+  switch (cap) {
+    case 'dhcpServer': return cls === 'router' || isServerHost(dev);
+    case 'dnsRecords': return isServerHost(dev);
+    case 'nat':        return cls === 'router';
+    case 'acl':        return isLayer3(dev);
+    case 'routing':    return isLayer3(dev);
+    case 'ospf':       return isLayer3(dev);
+    case 'nics':       return isComputerHost(dev);
+    case 'vlanPorts':  return cls === 'switch' || cls === 'router';
+    case 'console':    return cls === 'switch' || cls === 'router' || cls === 'host';
+    // Only a general-purpose computer has an OS you open a shell on. An IP
+    // camera or an access point does not offer a Windows/macOS/Linux terminal —
+    // it is managed from its controller.
+    case 'osShell':    return isComputerHost(dev);
+    default: return false;
+  }
+}
+
 function netClass(dev) {
   const def = DEVICE_TYPES[dev.type];
   if (!def) return 'other';
@@ -7791,7 +7853,7 @@ function wireCircuitProps(dev) {
 // ACLs, written in the device's own syntax. Applying one to a port + direction
 // mirrors "ip access-group <n> in|out" on a real interface.
 function aclPropsHtml(dev) {
-  if (netClass(dev) !== 'router') return '';
+  if (!deviceCan(dev, 'acl')) return '';
   const def = DEVICE_TYPES[dev.type];
   const applied = dev.aclApply || {};
   const rows = Object.entries(applied)
@@ -7816,7 +7878,7 @@ function aclPropsHtml(dev) {
 // Static routes + the resulting table. A routing table you cannot edit from the
 // app is not a feature, so this is the `ip route` half of the mechanism.
 function routePropsHtml(dev) {
-  if (!deviceInterfaces(dev).length) return '';
+  if (!deviceCan(dev, 'routing')) return '';
   const rows = (dev.routes || []).map((r, i) =>
     `<div class="row" data-route="${i}">
        <input type="text" class="rt-prefix" style="width:104px" value="${esc(r.prefix || '')}" placeholder="0.0.0.0/0">
@@ -7854,7 +7916,7 @@ function wireRouteProps(dev) {
 // NAT config. `ip nat inside source list <acl> interface <if> overload`, static
 // one-to-one, and port forwarding — the three forms that cover real edge NAT.
 function natPropsHtml(dev) {
-  if (netClass(dev) !== 'router') return '';
+  if (!deviceCan(dev, 'nat')) return '';
   const n = dev.nat || {};
   const on = !!n.enabled;
   const st = (n.statics || []).map((s, i) =>
@@ -7923,7 +7985,7 @@ function wireNatProps(dev) {
 // had; adding a NIC switches to the per-port list, because that is the moment
 // "the device's address" stops being a meaningful idea.
 function nicPropsHtml(dev) {
-  if (netClass(dev) !== 'host') return '';
+  if (!deviceCan(dev, 'nics')) return '';
   const def = DEVICE_TYPES[dev.type] || {};
   const dataPorts = [];
   for (let p = 1; p <= (def.ports || 1); p++) if (portRole(def, p) !== 'PWR') dataPorts.push(p);
@@ -7991,7 +8053,7 @@ function wireNicProps(dev) {
 // a DNS server; a host with resolvers is a client. Both are just fields, which
 // is what they are on a real machine too.
 function dnsPropsHtml(dev) {
-  if (netClass(dev) !== 'host') return '';
+  if (!deviceCan(dev, 'dnsRecords')) return '';
   const recs = Object.entries(dev.dns || {}).map(([n, a], i) =>
     `<div class="row" data-dnsrec="${i}">
        <input type="text" class="dn-name" style="width:130px" value="${esc(n)}" placeholder="host.corp.local">
@@ -8036,7 +8098,7 @@ function wireDnsProps(dev) {
 // reference bandwidth is here because leaving it at Cisco's 100 Mbps default
 // makes every link 1G and above cost the same, which is a real trap.
 function ospfPropsHtml(dev) {
-  if (!deviceInterfaces(dev).length) return '';
+  if (!deviceCan(dev, 'ospf')) return '';
   const o = dev.ospf || {};
   const on = !!o.enabled;
   const ifaces = deviceInterfaces(dev);
@@ -8182,8 +8244,7 @@ function scopeHtml(p, i) {
 }
 
 function dhcpPropsHtml(dev) {
-  const cls = netClass(dev);
-  if (cls !== 'router' && cls !== 'switch' && cls !== 'host') return '';
+  if (!deviceCan(dev, 'dhcpServer')) return '';
   const d = dev.dhcp || {};
   const on = !!d.enabled;
   const pools = d.pools || [];
@@ -8342,7 +8403,7 @@ function showDeviceProps(id) {
     ${l2TablesHtml(dev)}
     ${!isPlaced(dev) ? '<button id="dev-place">Place in 3D map</button>' : ''}
     ${(netClass(dev) === 'switch' || netClass(dev) === 'router') ? `<button id="dev-console" class="cta">${isMerakiDevice(dev) ? 'Open Meraki Dashboard' : isOmadaDevice(dev) ? 'Open Omada Controller' : isUnifiController(dev) ? 'Open UniFi Network' : (/UniFi/.test((DEVICE_TYPES[dev.type]||{}).cat||'') ? 'Manage in UniFi' : 'Open console (CLI)')} <span class="kbd">⏎</span></button>` : ''}
-    ${netClass(dev) === 'host' ? `<div class="row" style="margin-top:8px"><span class="k">OS</span>
+    ${deviceCan(dev, 'osShell') ? `<div class="row" style="margin-top:8px"><span class="k">OS</span>
       <select id="dev-os"><option value="windows" ${hostOs(dev)==='windows'?'selected':''}>Windows</option>
         <option value="macos" ${hostOs(dev)==='macos'?'selected':''}>macOS</option>
         <option value="linux" ${hostOs(dev)==='linux'?'selected':''}>Linux</option></select></div>
