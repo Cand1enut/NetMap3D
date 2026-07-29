@@ -729,6 +729,30 @@ wood leaf with a knob for doors. Added/removed/positioned/swung from wall
 properties. Still open: click-on-wall placement tool (currently props buttons),
 and adjustable per-opening width/height.
 
+**UniFiOS is a multi-app shell (owner images, Jul 2026):** a top app switcher
+hosts Network, Protect, Access, Talk and Connect. Protect reference: dark-chrome
+window, left rail (console photo + name, UniFi OS version, WAN IP / Gateway IP,
+System Uptime, Camera Capacity bar by resolution, Storage Overview bar with
+Timelapse/Detections/Continuous + capacity/earliest recording), a grid of camera
+event thumbnails with timestamps, Most Active cameras as device cards, and an
+All Cameras activity chart (Detections/Sound/Motion). Build the console as this
+shell with the app switcher; Network is done. Protect/Access are model-driven:
+list the UniFi cameras / door-access devices actually placed (the catalog has
+G6 Bullet/Turret/Dome/PTZ/AI Pro cameras and G6 Entry doorbell + Access Hub).
+Camera streams/retention and door schedules/credentials are device models to
+spec before going deeper. Never fabricate specific event data as if real.
+
+**H. Manual cable routing is confusing (owner).** Autopathing is serviceable;
+hand-adjusting a run is not. Waypoint handles exist but the interaction is
+opaque — unclear what is draggable, what a drag will do, and how to add/remove a
+bend. Wanted: grab the run anywhere and pull, obvious affordances, snapping,
+preview before release. Same "point at the thing" brief as item C.
+
+**I. Floor textures + floor z-fighting (owner).** Floors need real material
+choices like walls got (carpet tile, VCT, polished concrete, hardwood, tile).
+The z-fighting where a slab sits coplanar with the ground plane is FIXED in
+v0.48.0 via polygonOffset on the slab material; floor MATERIALS are still to do.
+
 ## Definition of done — the data centre build
 
 Owner-set acceptance test for the whole simulation: **build an entire data

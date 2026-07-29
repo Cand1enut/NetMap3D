@@ -577,6 +577,27 @@ select:focus, input:focus { border-color: var(--accent); }
 #props .cta .kbd { font-size: 11px; opacity: .8; border: 1px solid rgba(255,255,255,.5);
   border-radius: 4px; padding: 0 5px; line-height: 1.5; }
 
+/* UniFiOS app-switcher shell */
+#uf-shell { flex-direction: column; }
+#uf-apptop { display: flex; align-items: center; gap: 10px; padding: 8px 12px; background: #0b0d10;
+  border-bottom: 1px solid #1c2634; }
+#uf-apptop .uf-logo { width: 24px; height: 24px; font-size: 11px; }
+#uf-apps { display: flex; gap: 2px; flex: 1; }
+.uf-app { display: flex; align-items: center; gap: 6px; padding: 6px 12px; border-radius: 7px; cursor: pointer;
+  font-size: 13px; color: #aab3c0; }
+.uf-app:hover { background: #16202c; color: #fff; }
+.uf-app.active { background: #0559ff; color: #fff; }
+.uf-app .ico { font-size: 13px; }
+#uf-body { flex: 1; display: flex; min-height: 0; }
+#uf-brand { padding: 14px 16px 8px; font-weight: 600; color: #fff; font-size: 15px; }
+/* Protect / Access panels reuse the light content area */
+.uf-camgrid { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px,1fr)); gap: 10px; }
+.uf-camcard { background: #10131a; border: 1px solid #222c3a; border-radius: 8px; overflow: hidden; color: #cfd6de; }
+.uf-camcard .thumb { height: 84px; background: linear-gradient(135deg,#1b2735,#0e141c); display: grid; place-items: center; color: #46566a; font-size: 22px; }
+.uf-camcard .cap { padding: 7px 9px; font-size: 12px; }
+.uf-camcard .cap .sub { color: #7d8794; font-size: 11px; }
+#uf-shell.dark #uf-page, #uf-page { }
+
 </style>
 </head>
 <body>
@@ -738,12 +759,15 @@ select:focus, input:focus { border-color: var(--accent); }
 
   <div id="unifi" class="hidden">
     <div id="uf-shell">
-      <div id="uf-side">
-        <div id="uf-brand"><span class="uf-logo">Ui</span><span id="uf-appname">Network</span>
-          <button id="uf-close" title="Close console">×</button></div>
-        <div id="uf-nav"></div>
+      <div id="uf-apptop"><span class="uf-logo">Ui</span><div id="uf-apps"></div>
+        <button id="uf-close" title="Close console">×</button></div>
+      <div id="uf-body">
+        <div id="uf-side">
+          <div id="uf-brand"><span id="uf-appname">Network</span></div>
+          <div id="uf-nav"></div>
+        </div>
+        <div id="uf-main"><div id="uf-topbar"></div><div id="uf-page"></div></div>
       </div>
-      <div id="uf-main"><div id="uf-topbar"></div><div id="uf-page"></div></div>
     </div>
   </div>
 
@@ -6102,7 +6126,7 @@ const WAN_PACK = {
   // serves many circuits, so it has several handoff ports (a campus with
   // several buildings, or several tenants, each draws its own circuit here).
   internet: {
-    label: 'Internet (ISP)', short: 'WAN', uh: 0, ports: 8, rows: 1, depth: 0,
+    label: 'Internet (ISP)', short: 'WAN', uh: 0, ports: 24, rows: 2, depth: 0,
     color: 0x2f6fdb, field: true, mounts: ['desk'], shape: 'cloud',
     isInternet: true, cat: 'WAN'
   },
@@ -6113,7 +6137,7 @@ const WAN_PACK = {
   // fibre uplink plus up to four GE handoffs: port 1 is the fibre/service side,
   // 2-5 are the Ethernet outs.
   ont: {
-    label: 'Fiber ONT (demarc)', short: 'ONT', uh: 0, ports: 5, rows: 1, depth: 0,
+    label: 'Fiber ONT (demarc)', short: 'ONT', uh: 0, ports: 9, rows: 1, depth: 0,
     color: 0xe8ebef, field: true, mounts: ['wall', 'desk'], shape: 'box',
     roleMap: { 1: 'WAN' },   // port 1 = fibre/service in
     isCpeTerm: true, isDemarc: true, service: 'fiber', cat: 'WAN'
@@ -6121,7 +6145,7 @@ const WAN_PACK = {
   // Coax: DOCSIS modem. Same job, different medium and also the demarc — coax in
   // on port 1, up to four Ethernet handoffs out.
   modem: {
-    label: 'Cable modem (demarc)', short: 'Modem', uh: 0, ports: 5, rows: 1, depth: 0,
+    label: 'Cable modem (demarc)', short: 'Modem', uh: 0, ports: 9, rows: 1, depth: 0,
     color: 0x22262c, field: true, mounts: ['desk', 'wall'], shape: 'deskbox',
     roleMap: { 1: 'WAN' },   // port 1 = coax/service in
     isCpeTerm: true, isDemarc: true, service: 'cable', cat: 'WAN'
@@ -7128,7 +7152,15 @@ function makeSlabTexture() {
   t.repeat.set(2, 2);
   return t;
 }
-const slabMat = new THREE.MeshStandardMaterial({ color: 0xb9bec7, map: makeSlabTexture(), roughness: 0.93, metalness: 0.02, envMapIntensity: 0.3 });
+// polygonOffset pulls the slab a hair toward the camera in DEPTH ONLY, without
+// moving it in space. A slab drawn at grade sits in exactly the same plane as
+// the infinite ground, and two coplanar surfaces fight for the depth buffer —
+// that is the flickering/striping through the floor. Offsetting the slab makes
+// it win cleanly at every angle and distance, which nudging the geometry up by
+// a fraction of an inch does not (the fight comes back as the camera pulls out).
+const slabMat = new THREE.MeshStandardMaterial({ color: 0xb9bec7, map: makeSlabTexture(),
+  roughness: 0.93, metalness: 0.02, envMapIntensity: 0.3,
+  polygonOffset: true, polygonOffsetFactor: -2, polygonOffsetUnits: -4 });
 
 // The underside of a slab is a room's ceiling, and in every commercial building
 // that means a 24"×24" lay-in grid — fissured mineral tile in a white tee bar.
@@ -10143,6 +10175,19 @@ function deviceInterfaces(dev) {
   for (const [v, addr] of Object.entries(dev.svi || {})) {
     const ip = parseIp(addr);
     if (ip) out.push({ name: `Vlan${v}`, vlan: +v, ip, kind: 'svi' });
+  }
+  // A managed switch's address lives in dev.ip — that is its MANAGEMENT
+  // interface, the real box's Vlan1/me0. Leaving it out made a switch look like
+  // it had no IP stack at all: it could not be pinged, could not ping, and did
+  // not appear in `show ip int brief`, even though the map clearly gave it an
+  // address. Routers/gateways carry their addresses on ports and SVIs, so this
+  // only fills the gap for a device whose sole address is dev.ip.
+  const cls = netClass(dev);
+  if ((cls === 'switch' || cls === 'router') && dev.ip && dev.ip !== 'dhcp') {
+    const ip = parseIp(dev.ip);
+    if (ip && !out.some(i => i.ip.int === ip.int)) {
+      out.push({ name: 'Management', mgmt: true, ip, kind: 'mgmt' });
+    }
   }
   return out;
 }
@@ -15217,15 +15262,32 @@ function unifiRole(dev) {
   return def.label || 'Device';
 }
 
+// UniFiOS hosts several apps under one shell. Network is the working one;
+// Protect and Access are real device-management surfaces driven by the cameras
+// and door hardware actually placed in the model — no fabricated events. Talk
+// and Connect appear in the switcher as the real console shows them but are not
+// modelled yet, and say so plainly rather than faking a screen.
+const UF_APPS = [
+  { id: 'Network', ico: '⧉' },
+  { id: 'Protect', ico: '◉' },
+  { id: 'Access',  ico: '⊟' },
+  { id: 'Talk',    ico: '☎' },
+];
 let _uf = null;   // { dev, app, page }
 function openUnifi(dev) {
   _uf = { dev, app: 'Network', page: 'dashboard' };
-  const box = document.getElementById('unifi');
-  document.getElementById('uf-appname').textContent = 'Network';
-  box.classList.remove('hidden');
+  document.getElementById('unifi').classList.remove('hidden');
   ufRender();
 }
 function ufClose() { const b = document.getElementById('unifi'); if (b) b.classList.add('hidden'); _uf = null; }
+function ufSetApp(app) {
+  _uf.app = app;
+  _uf.page = app === 'Network' ? 'dashboard' : (app === 'Protect' ? 'cameras' : (app === 'Access' ? 'doors' : null));
+  ufRender();
+}
+// Devices flagged by catalog category
+function unifiCameras() { return state.devices.filter(d => isPlaced(d) && /UniFi Cameras/.test((DEVICE_TYPES[d.type] || {}).cat || '')); }
+function unifiDoorGear() { return state.devices.filter(d => isPlaced(d) && /Door Access/.test((DEVICE_TYPES[d.type] || {}).cat || '')); }
 
 const UF_NAV = [
   { sep: 'MONITOR' },
@@ -15239,20 +15301,85 @@ const UF_NAV = [
   { id: 'internet', ico: '🌐', label: 'Internet' }
 ];
 
+const UF_NAV_PROTECT = [
+  { sep: 'PROTECT' },
+  { id: 'cameras', ico: '◉', label: 'Cameras' },
+  { id: 'recordings', ico: '▤', label: 'Recordings' },
+];
+const UF_NAV_ACCESS = [
+  { sep: 'ACCESS' },
+  { id: 'doors', ico: '⊟', label: 'Doors' },
+  { id: 'readers', ico: '⌸', label: 'Readers' },
+];
 function ufRender() {
   if (!_uf) return;
+  // app switcher across the top, like the real UniFiOS shell
+  const apps = document.getElementById('uf-apps');
+  if (apps) {
+    apps.innerHTML = UF_APPS.map(a =>
+      `<div class="uf-app ${_uf.app === a.id ? 'active' : ''}" data-ufapp="${a.id}"><span class="ico">${a.ico}</span>${a.id}</div>`).join('');
+    for (const el of apps.querySelectorAll('[data-ufapp]')) el.onclick = () => ufSetApp(el.dataset.ufapp);
+  }
+  const appName = document.getElementById('uf-appname');
+  if (appName) appName.textContent = _uf.app;
+  const navDef = _uf.app === 'Protect' ? UF_NAV_PROTECT : _uf.app === 'Access' ? UF_NAV_ACCESS : UF_NAV;
   const nav = document.getElementById('uf-nav');
-  nav.innerHTML = UF_NAV.map(n => n.sep
+  nav.innerHTML = navDef.map(n => n.sep
     ? `<div class="uf-navsep">${n.sep}</div>`
     : `<div class="uf-navitem ${_uf.page === n.id ? 'active' : ''}" data-uf="${n.id}"><span class="ico">${n.ico}</span>${n.label}</div>`).join('');
   for (const el of nav.querySelectorAll('[data-uf]')) el.onclick = () => { _uf.page = el.dataset.uf; ufRender(); };
   const page = document.getElementById('uf-page');
   const top = document.getElementById('uf-topbar');
   const R = { dashboard: ufDashboard, devices: ufDeviceList, clients: ufClients,
-    ports: ufPorts, networks: ufNetworks, wifi: ufWifi, internet: ufInternet }[_uf.page] || ufDashboard;
-  top.textContent = (UF_NAV.find(n => n.id === _uf.page) || {}).label || 'Dashboard';
-  page.innerHTML = R();
+    ports: ufPorts, networks: ufNetworks, wifi: ufWifi, internet: ufInternet,
+    cameras: ufCameras, recordings: ufRecordings, doors: ufDoors, readers: ufReaders }[_uf.page];
+  top.textContent = (navDef.find(n => n.id === _uf.page) || {}).label || _uf.app;
+  page.innerHTML = R ? R() : ufNotModelled();
   ufWire(page);
+}
+function ufNotModelled() {
+  return `<div class="uf-net"><h4>${esc(_uf.app)}</h4>
+    <p style="color:#8a9099;font-size:13px">UniFi ${esc(_uf.app)} is part of UniFiOS but is not modelled in the simulation yet.
+    Place UniFi ${_uf.app === 'Talk' ? 'phones' : 'devices'} and it will appear here once the device model is built.</p></div>`;
+}
+// ---- Protect ----
+function ufCameras() {
+  const cams = unifiCameras();
+  if (!cams.length) return `<p style="color:#8a9099">No UniFi cameras placed. Add one from the UniFi Cameras category.</p>`;
+  const res = { u_g6bullet: '4K', u_g6turret: '4K', u_g6dome: '4K', u_g6ptz: '4K', u_aipro: '4K', u_ai360: '5MP', u_g5flex: '2K', u_g6instant: '2K' };
+  return `<div class="uf-cards">
+    <div class="uf-card"><div class="lbl">Cameras</div><div class="big">${cams.length}</div><div class="sub">adopted</div></div>
+    <div class="uf-card"><div class="lbl">Recording</div><div class="big">${cams.filter(c=>hostIp(c)).length}</div><div class="sub">online</div></div>
+    </div>
+    <div class="uf-camgrid">${cams.map(c => {
+      const conn = hopThroughPatches(c, hostPort(c), FRONT);
+      return `<div class="uf-camcard"><div class="thumb">▣</div>
+        <div class="cap">${esc(c.name)}<div class="sub">${res[c.type] || 'HD'} · ${conn ? esc(conn.dev.name) : 'not connected'}</div></div></div>`;
+    }).join('')}</div>`;
+}
+function ufRecordings() {
+  const cams = unifiCameras();
+  return `<p style="color:#8a9099;font-size:13px;margin-bottom:10px">Retention and storage are device properties that are not modelled yet — this lists what each camera is attached to and whether it can reach the network.</p>
+  <table class="sim-table"><tr><th>Camera</th><th>IP</th><th>Switch port</th><th>Status</th></tr>
+  ${cams.map(c => { const conn = hopThroughPatches(c, hostPort(c), FRONT);
+    return `<tr><td>${esc(c.name)}</td><td>${hostAddr(c)}</td>
+      <td>${conn ? esc(conn.dev.name) + ' · ' + conn.port : '—'}</td>
+      <td>${conn ? '<span class="uf-dot up"></span>Online' : '<span class="uf-dot down"></span>Offline'}</td></tr>`; }).join('')}</table>`;
+}
+// ---- Access ----
+function ufDoors() {
+  const gear = unifiDoorGear();
+  if (!gear.length) return `<p style="color:#8a9099">No UniFi Access hardware placed. Add a doorbell, reader or Access Hub from the UniFi Door Access category.</p>`;
+  return `<div class="uf-cards">
+    <div class="uf-card"><div class="lbl">Access devices</div><div class="big">${gear.length}</div><div class="sub">placed</div></div>
+    </div>
+    <table class="sim-table"><tr><th>Device</th><th>Model</th><th>IP</th><th>Connected to</th></tr>
+    ${gear.map(g => { const conn = hopThroughPatches(g, hostPort(g), FRONT);
+      return `<tr><td>${esc(g.name)}</td><td>${esc(DEVICE_TYPES[g.type].label)}</td><td>${hostAddr(g)}</td>
+        <td>${conn ? esc(conn.dev.name) + ' · ' + conn.port : 'not connected'}</td></tr>`; }).join('')}</table>`;
+}
+function ufReaders() {
+  return `<p style="color:#8a9099;font-size:13px">Credentials, schedules and unlock policy are an Access device model that is not built yet — specced in ROADMAP before it ships. The hardware inventory is on the Doors page and is real.</p>`;
 }
 
 function ufDashboard() {
@@ -16395,15 +16522,58 @@ function iosTraceroute(dev, target) {
 }
 
 // A ping from the device's own CLI, rendered the way IOS prints it.
+// Can THIS device reach that address? Uses the real engine, not a proxy for it.
+// The first version asked "does a routing table entry exist", which is not the
+// same question: a switch has no routing table at all, so pinging from a switch
+// always failed even when the two boxes were plainly on the same wire. Real
+// reachability is an L2 walk when the target is on our subnet, and a forwarding
+// path when it is not.
+function deviceReach(srcDev, dstInt) {
+  const owner = deviceHoldingAddr(dstInt);
+  if (!owner) return { ok: false, why: `nothing answers at ${ipStr(dstInt)}` };
+  if (owner.dev.id === srcDev.id) return { ok: true };            // our own address
+  const ifaces = deviceInterfaces(srcDev);
+  if (!ifaces.length) return { ok: false, why: `${srcDev.name} has no IP address configured` };
+  // Prefer an interface whose subnet contains the target — that is the one a
+  // real box would source from.
+  const local = ifaces.find(i => ipInSubnet(dstInt, i.ip));
+  if (local) {
+    // Same subnet: it is an ARP-and-switch question. Walk L2 from every data
+    // port and see whether the owning device is reached.
+    const def = DEVICE_TYPES[srcDev.type] || {};
+    const vlan = local.kind === 'svi' ? local.vlan : undefined;
+    for (let p = 1; p <= (def.ports || 1); p++) {
+      if (portRole(def, p) === 'PWR') continue;
+      const walk = l2Walk(srcDev, { startPort: p, vlan, ignoreVlan: vlan === undefined });
+      if (walk.hosts.has(owner.dev.id) || walk.routers.has(owner.dev.id)) return { ok: true, local: true };
+      // the far end may be the neighbour itself (direct link)
+      const nb = hopThroughPatches(srcDev, p, FRONT);
+      if (nb && nb.dev.id === owner.dev.id) return { ok: true, local: true };
+    }
+    return { ok: false, why: `${ipStr(dstInt)} is on this subnet but no L2 path reaches it` };
+  }
+  // Off-subnet: this device must route, or hand off to a gateway.
+  if (netClass(srcDev) === 'router') {
+    const f = forwardPath(srcDev.id, dstInt);
+    return f.error ? { ok: false, why: f.error } : { ok: true };
+  }
+  // A switch/host with only a management address needs a default gateway.
+  const gwStr = srcDev.gateway;
+  const gw = gwStr ? parseIp(gwStr) : null;
+  if (!gw) return { ok: false, why: `${srcDev.name} has no default gateway for off-subnet traffic` };
+  const holder = deviceHoldingAddr(gw.int);
+  if (!holder) return { ok: false, why: `default gateway ${gwStr} does not answer` };
+  const f = forwardPath(holder.dev.id, dstInt);
+  return f.error ? { ok: false, why: f.error } : { ok: true };
+}
+
 function iosPing(dev, target) {
   const ip = parseIp(target);
   if (!ip) return `% Unrecognized host or address, or protocol not running.`;
-  const owner = deviceHoldingAddr(ip.int);
-  // A router pings from itself: reachable if it has a route and the target answers.
-  const route = lookupRoute(dev, ip.int) || deviceInterfaces(dev).find(i => sameSubnet(i.ip, ip));
-  const ok = !!owner && !!route;
+  const r = deviceReach(dev, ip.int);
   return `Type escape sequence to abort.\nSending 5, 100-byte ICMP Echos to ${target}, timeout is 2 seconds:\n` +
-    (ok ? '!!!!!\nSuccess rate is 100 percent (5/5)' : '.....\nSuccess rate is 0 percent (0/5)');
+    (r.ok ? '!!!!!\nSuccess rate is 100 percent (5/5), round-trip min/avg/max = 1/1/2 ms'
+          : `.....\nSuccess rate is 0 percent (0/5)${r.why ? '\n% ' + r.why : ''}`);
 }
 
 //////////////////// Cable physics (verlet ropes) ////////////////////

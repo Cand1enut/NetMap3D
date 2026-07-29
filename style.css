@@ -570,3 +570,24 @@ select:focus, input:focus { border-color: var(--accent); }
 #props .cta:hover { background: var(--accent-hi); }
 #props .cta .kbd { font-size: 11px; opacity: .8; border: 1px solid rgba(255,255,255,.5);
   border-radius: 4px; padding: 0 5px; line-height: 1.5; }
+
+/* UniFiOS app-switcher shell */
+#uf-shell { flex-direction: column; }
+#uf-apptop { display: flex; align-items: center; gap: 10px; padding: 8px 12px; background: #0b0d10;
+  border-bottom: 1px solid #1c2634; }
+#uf-apptop .uf-logo { width: 24px; height: 24px; font-size: 11px; }
+#uf-apps { display: flex; gap: 2px; flex: 1; }
+.uf-app { display: flex; align-items: center; gap: 6px; padding: 6px 12px; border-radius: 7px; cursor: pointer;
+  font-size: 13px; color: #aab3c0; }
+.uf-app:hover { background: #16202c; color: #fff; }
+.uf-app.active { background: #0559ff; color: #fff; }
+.uf-app .ico { font-size: 13px; }
+#uf-body { flex: 1; display: flex; min-height: 0; }
+#uf-brand { padding: 14px 16px 8px; font-weight: 600; color: #fff; font-size: 15px; }
+/* Protect / Access panels reuse the light content area */
+.uf-camgrid { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px,1fr)); gap: 10px; }
+.uf-camcard { background: #10131a; border: 1px solid #222c3a; border-radius: 8px; overflow: hidden; color: #cfd6de; }
+.uf-camcard .thumb { height: 84px; background: linear-gradient(135deg,#1b2735,#0e141c); display: grid; place-items: center; color: #46566a; font-size: 22px; }
+.uf-camcard .cap { padding: 7px 9px; font-size: 12px; }
+.uf-camcard .cap .sub { color: #7d8794; font-size: 11px; }
+#uf-shell.dark #uf-page, #uf-page { }
