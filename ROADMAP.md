@@ -804,6 +804,25 @@ instead of the small reference site. It must function 100% correctly.
 Owner: "insane level security from doors to cameras, go all out, no holds
 barred. Anything you can think of needs to be there and function true to life."
 
+**SCALE (owner): hundreds of fully filled racks.** That is roughly 200-400 racks
+x ~35 devices = 7,000-14,000 devices, plus tens of thousands of cables. The
+current renderer builds a THREE.Group of many meshes per device and one tube
+mesh per cable, and several sim paths are O(n^2) (the reachability matrix is
+n^2 pings; rope colliders are rebuilt globally). **This will not run as-is** —
+it needs real work before the example can be built at that size:
+- Instanced rendering for repeated geometry (rack frames, chassis, jacks,
+  connectors), and merged/batched static geometry per rack.
+- LOD: a rack at distance is a box with a faceplate texture, not 35 modelled
+  devices with 48 modelled jacks each. Build detail only near the camera.
+- Frustum + distance culling, and per-room visibility.
+- Cables: instanced or merged tubes, LOD to a line at distance, and cap the
+  relaxation passes; do not re-run collider rebuilds for the whole site on
+  every edit.
+- Sim: make the reachability matrix sampled/on-demand rather than all-pairs at
+  this size, and index device lookups (deviceById is a linear scan today).
+- Save format: keep it JSON but expect multi-MB; consider a compact device row.
+Do this BEFORE building the full-size example, or the example will not open.
+
 Scope to build (each part must actually work in the sim, not be scenery):
 - **Network**: core/distribution/access layers, redundant core with STP blocking
   a real loop, MLAG-style dual uplinks, spine-leaf where it fits, out-of-band
