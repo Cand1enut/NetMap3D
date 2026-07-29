@@ -998,11 +998,22 @@ How to do it so it actually finds things (do not hand-write 1,000 sites):
   useless; a 4-device one is a fix.
 - Keep every reduced repro as a permanent test so fixed bugs stay fixed.
 
-Prerequisite: this needs the build to be fast (see the instanced render layer) or
-it must run headless against the model only, skipping mesh building entirely —
-which is probably the right answer, since these tests are about the simulation,
-not the picture. A `buildDeviceGroup`-free "model only" mode would let 1,000
-sites run in seconds.
+**Owner wants this run before EVERY GitHub push, at the largest count feasible
+(asked for 100,000, then 1,000,000).** Be honest about the arithmetic rather
+than claiming a number:
+- A full site build today is ~35 ms (25 racks, mesh building included).
+  1,000 sites = ~35 s. 100,000 = ~1 hour. 1,000,000 = ~10 hours. Not per-push.
+- **The fix is a headless model-only mode**: skip `buildDeviceGroup`,
+  `buildCableMesh`, colliders and shadows entirely, and generate `state` plus
+  run the invariants. These tests are about the SIMULATION, not the picture.
+  Model-only generation of a small random site should be well under 1 ms, which
+  puts 100,000 in the low minutes and makes 1,000,000 an overnight/CI run.
+- **Tiered gate, which is what actually keeps the repo green:**
+  - every push: a fast set (~1,000 randomised sites) + every saved minimal repro
+  - nightly/CI: 100,000
+  - 1,000,000 as a soak run, not a blocker on a commit
+- Seed the RNG and print the seed on failure, so any run is exactly reproducible.
+Build the headless mode FIRST — without it the numbers above are fantasy.
 
 ## Definition of done — the data centre build
 
