@@ -1776,12 +1776,38 @@ function pullIntoRaceway(cable, rw) {
 // Guide points that carry a cable through every raceway it's pulled into, in
 // its own slot. Entry and exit are separate points so the run enters the mouth
 // of the pathway rather than teleporting to the middle of it.
-function racewayGuide(cable) {
+// `from` is where the run starts, so the guide can be ordered the way the cable
+// is actually pulled. Without it each raceway contributed its endpoints in
+// DECLARATION order, so a run crossing two pathways doubled back on itself —
+// a rack uplink listed as tray cable still drew the hypotenuse across the room.
+function racewayGuide(cable, from) {
   const pts = [];
-  for (const id of cable.raceways || []) {
-    const rw = (state.raceways || []).find(r => r.id === id);
-    if (!rw) continue;
-    const [a, b] = racewayPath(rw);
+  let cur = from ? from.clone() : null;
+  let list = (cable.raceways || [])
+    .map(id => (state.raceways || []).find(r => r.id === id)).filter(Boolean);
+  if (cur) {
+    // visit the pathways nearest-first, and enter each at its near end
+    const remaining = list.slice(); list = [];
+    while (remaining.length) {
+      let best = 0, bestD = Infinity;
+      for (let i = 0; i < remaining.length; i++) {
+        const [p, q] = racewayPath(remaining[i]);
+        const d = Math.min(cur.distanceToSquared(p), cur.distanceToSquared(q));
+        if (d < bestD) { bestD = d; best = i; }
+      }
+      const rw = remaining.splice(best, 1)[0];
+      const [p, q] = racewayPath(rw);
+      cur = cur.distanceToSquared(p) <= cur.distanceToSquared(q) ? q.clone() : p.clone();
+      list.push(rw);
+    }
+    cur = from.clone();
+  }
+  for (const rw of list) {
+    let [a, b] = racewayPath(rw);
+    if (cur) {
+      if (cur.distanceToSquared(b) < cur.distanceToSquared(a)) { const t = a; a = b; b = t; }
+      cur = b.clone();
+    }
     const dir = b.clone().sub(a).normalize();
     const u = Math.abs(dir.y) > 0.9 ? new THREE.Vector3(1, 0, 0) : new THREE.Vector3(0, 1, 0);
     const ax = new THREE.Vector3().crossVectors(dir, u).normalize();
@@ -3245,8 +3271,18 @@ function plenumRoute(a, b) {
   const y = (deck !== null ? deck : WALL_H) - 4;
   // both ends already up at height? then a straight cross is the real path
   if (y <= Math.max(a.pos.y, b.pos.y) + 3) return [];
+  // Overhead runs follow building lines, not the hypotenuse. A puller works
+  // along the joists and the tray, so the crossing is two orthogonal legs, not
+  // one diagonal — a hall full of diagonals is the signature of cable nobody
+  // supported. Break on the longer axis first so the run reads as one clean
+  // pull down the aisle followed by a short jog into the destination.
+  const dx = b.pos.x - a.pos.x, dz = b.pos.z - a.pos.z;
+  const corner = Math.abs(dx) >= Math.abs(dz)
+    ? new THREE.Vector3(b.pos.x, y, a.pos.z)
+    : new THREE.Vector3(a.pos.x, y, b.pos.z);
   return [
     new THREE.Vector3(a.pos.x, y, a.pos.z),
+    corner,
     new THREE.Vector3(b.pos.x, y, b.pos.z)
   ];
 }
@@ -3433,11 +3469,20 @@ function cableCurve(cable) {
   const bLead = b.pos.clone().addScaledVector(b.normal, lead);
   // Precedence: a raceway physically carries the cable (overrides everything);
   // then the user's own waypoints; then automatic dressing.
-  const rwGuide = racewayGuide(cable);
+  const rwGuide = racewayGuide(cable, a.pos);
   let mid = [], orth = true;
   if (rwGuide.length) {
     mid = rwGuide.map(w => (w.clone ? w.clone() : new THREE.Vector3(w.x, w.y, w.z)));
-    orth = false;                                  // inside a pipe the path is the pipe
+    // Inside a pipe the path IS the pipe, so a sloped conduit must not be
+    // squared off. But when every pathway on the run is axis-aligned — a ladder
+    // rack, a wall raceway — the legs getting TO it should still turn square
+    // corners, or the cable leaves the cabinet on a diagonal to meet the tray.
+    orth = (cable.raceways || []).every(id => {
+      const rw = (state.raceways || []).find(r => r.id === id);
+      if (!rw) return true;
+      const dx = Math.abs(rw.x2 - rw.x1), dy = Math.abs(rw.y2 - rw.y1), dz = Math.abs(rw.z2 - rw.z1);
+      return (dx < 0.5 && dy < 0.5) || (dx < 0.5 && dz < 0.5) || (dy < 0.5 && dz < 0.5);
+    });
   } else if (cable.waypoints && cable.waypoints.length) {
     mid = cable.waypoints.map(w => new THREE.Vector3(w.x, w.y, w.z));
   } else if (cable.autoRoute !== false) {
@@ -4555,6 +4600,21 @@ function deviceInterfaces(dev) {
     const ip = parseIp(dev.ip);
     if (ip && !out.some(i => i.ip.int === ip.int)) {
       out.push({ name: 'Management', mgmt: true, ip, kind: 'mgmt' });
+    }
+  }
+  // An endpoint's addresses live on its NICs. dev.ip is only shorthand for the
+  // primary one, and a second NIC lives in dev.nics — neither is a portCfg or an
+  // SVI, so this list came back EMPTY for every statically addressed PC, server
+  // and camera. deviceHoldingAddr() already walked hostNics(), so such a device
+  // could be pinged TO but never FROM: the reachability engine answered every
+  // ping it sourced with "has no IP address configured". Exactly the switch
+  // management-address bug, one device class over.
+  if (cls === 'host') {
+    for (const n of hostNics(dev)) {
+      const ip = nicIp(dev, n.port);
+      if (ip && !out.some(i => i.ip.int === ip.int)) {
+        out.push({ name: n.label || `Port ${n.port}`, port: n.port, ip, kind: 'nic' });
+      }
     }
   }
   return out;
@@ -13258,9 +13318,23 @@ function buildDataCentre(opts = {}) {
   const inRack = (r, type, u, extra = {}) =>
     put({ id: uid(), type, rackId: r.id, u, name: extra.name || deviceLabelCounter(type), ...extra });
   const field = (type, extra = {}) => put({ id: uid(), type, name: extra.name || deviceLabelCounter(type), ...extra });
+  // Assigned once the ladder rack exists, further down. Declared here because
+  // link() closes over it and every inter-cabinet run has to ride the runway.
+  let trayRoute = null;
   const link = (da, pa, db, pb, color) => {
     const c = { id: uid(), a: { deviceId: da.id, port: pa, side: FRONT },
       b: { deviceId: db.id, port: pb, side: FRONT }, color: color || 0x2f81f7, waypoints: [] };
+    const path = trayRoute ? trayRoute(da, db) : null;
+    if (path && path.length) {
+      c.raceways = path.map(rw => rw.id);
+      for (const rw of path) rw.cables.push(c.id);
+      // Membership in a raceway records WHICH runway carries the run; it does not
+      // by itself bend the drawn cable, so without these waypoints the uplinks
+      // were listed as tray cable while still flying the hypotenuse across the
+      // hall. The waypoints are the actual pull: up the cabinet, along the row
+      // runway to the cross aisle, across, then down the far row.
+      c.waypoints = trayWaypoints(da, db);
+    }
     state.cables.push(c); buildCableMesh(c); C.push(c); return c;
   };
   const wall = (x1, z1, x2, z2, material, openings) => {
@@ -13381,13 +13455,79 @@ function buildDataCentre(opts = {}) {
   const mdfUps = inRack(mdf, 'ups', 1, { name: 'UPS-MDF' });
   for (const [d, o] of [[edgeA,1],[edgeB,2],[coreA,3],[coreB,7],[oob,4],[nvr,5],[acHub,6]]) link(d, 'PWR', mdfUps, o, 0xe5534b);
 
+  // ---- overhead ladder rack ----
+  // TIA-942 practice: no copper crosses a data hall unsupported. Every cabinet
+  // waterfalls onto a runway above its own row; the runways are tied together by
+  // a cross-aisle runway at the head of the hall, so any rack-to-rack pull is
+  // row runway -> cross runway -> row runway. That is why the ladder rack is
+  // built before the racks — the link() helper drops each inter-rack run into it
+  // as the run is created.
+  const rowX = (row) => -HALL_X/2 + 200 + row * 130;
+  const rackZ = (i) => -HALL_Z/2 + 120 + i * 46;
+  const TRAY_Y = RACK_BASE + 42 * U + 11;      // ~10-12" above the cabinet tops
+  const CROSS_Z = rackZ(0) - 40;               // head-of-row cross aisle
+  const tray = (x1, z1, x2, z2, name) => {
+    const rw = { id: uid(), type: 'tray24', name,
+      x1, y1: TRAY_Y, z1, x2, y2: TRAY_Y, z2, cables: [] };
+    state.raceways.push(rw); buildRaceway(rw); return rw;
+  };
+  const rowTray = [];
+  for (let row = 0; row < ROWS; row++)
+    rowTray.push(tray(rowX(row), CROSS_Z, rowX(row), rackZ(PER_ROW - 1) + 24, `RUNWAY-R${row + 1}`));
+  // The cross aisle has to reach every cabinet in the hall, not just the rows —
+  // the MDF and core cabinets sit off to the side and carry the uplinks, which
+  // are precisely the longest runs. A runway that stops short of them is how the
+  // uplinks ended up crossing the hall unsupported.
+  const xs = state.racks.map(r => r.x).concat(rowTray.map(t => t.x1));
+  const crossTray = tray(Math.min(...xs) - 24, CROSS_Z, Math.max(...xs) + 24, CROSS_Z, 'RUNWAY-CROSS');
+  // rackId -> the row runway serving it; null means the cabinet sits on the
+  // cross aisle itself and drops straight onto it.
+  const runwayOf = new Map();
+  for (const r of state.racks) runwayOf.set(r.id, null);   // MDF, core, UPS
+
+  // Any run between two different cabinets rides the ladder rack. Same-cabinet
+  // jumpers stay in the cabinet's own vertical manager, which is where a patch
+  // lead belongs — putting a 12" jumper on the overhead runway would be absurd.
+  // The pull an installer would actually make, as waypoints on the runway
+  // centreline. Every leg is axis-aligned: cable on a ladder rack turns square
+  // corners because the rack does.
+  const trayWaypoints = (da, db) => {
+    const ra = state.racks.find(r => r.id === da.rackId);
+    const rb = state.racks.find(r => r.id === db.rackId);
+    if (!ra || !rb) return [];
+    const rwA = runwayOf.get(ra.id), rwB = runwayOf.get(rb.id);
+    const w = [], at = (x, z) => w.push({ x, y: TRAY_Y, z });
+    at(ra.x, ra.z);                                   // waterfall up out of cabinet A
+    if (rwA) at(rwA.x1, ra.z);                        // step onto the row runway
+    at(rwA ? rwA.x1 : ra.x, CROSS_Z);                 // ride the row down to the cross aisle
+    at(rwB ? rwB.x1 : rb.x, CROSS_Z);                 // across the cross aisle
+    if (rwB) at(rwB.x1, rb.z);                        // up the far row
+    at(rb.x, rb.z);                                   // drop into cabinet B
+    // drop any zero-length leg: a duplicate control point makes the curve NaN
+    return w.filter((p, i) => i === 0 ||
+      Math.hypot(p.x - w[i - 1].x, p.z - w[i - 1].z) > 0.5);
+  };
+
+  trayRoute = (da, db) => {
+    if (!da.rackId || !db.rackId || da.rackId === db.rackId) return null;
+    if (!runwayOf.has(da.rackId) || !runwayOf.has(db.rackId)) return null;
+    const ra = runwayOf.get(da.rackId), rb = runwayOf.get(db.rackId);
+    if (ra && rb && ra === rb) return [ra];                // same row, one runway
+    const path = [];
+    if (ra) path.push(ra);
+    path.push(crossTray);
+    if (rb) path.push(rb);
+    return path;
+  };
+
   // ---- data hall: rows of racks, each with a top-of-rack switch ----
   const tors = [];
   for (let row = 0; row < ROWS; row++) {
     for (let i = 0; i < PER_ROW; i++) {
-      const x = -HALL_X/2 + 200 + row * 130;
-      const z = -HALL_Z/2 + 120 + i * 46;
+      const x = rowX(row);
+      const z = rackZ(i);
       const r = rack(x, z, `R${row + 1}-${String(i + 1).padStart(2, '0')}`);
+      runwayOf.set(r.id, rowTray[row]);
       inRack(r, 'vcm', 0, { side: 'R' });
       const patch = inRack(r, 'patch24', 42);
       inRack(r, 'hcm', 41);
@@ -13496,6 +13636,10 @@ function buildDataCentre(opts = {}) {
   applyLevelVisibility();
   setStatus(`Data centre: ${state.racks.length} racks, ${state.devices.length} devices, ${state.cables.length} cables. ` +
     `7 VLANs, dual carriers, mantrap, cameras and readers on isolated VLANs.`);
+  // The runway labels report fill, and fill is only known once every run has
+  // been pulled — so rebuild them now rather than leaving a loaded tray
+  // captioned "0 cables".
+  for (const rw of state.raceways) rebuildRaceway(rw);
   return { racks: state.racks.length, devices: state.devices.length, cables: state.cables.length };
 }
 
