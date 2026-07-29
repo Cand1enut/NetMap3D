@@ -804,6 +804,52 @@ instead of the small reference site. It must function 100% correctly.
 Owner: "insane level security from doors to cameras, go all out, no holds
 barred. Anything you can think of needs to be there and function true to life."
 
+## ARCHITECTURE DECISION: instanced rendering (proven, Jul 2026)
+
+The owner said the current model will not reach data-centre size and approved
+changing anything, including the engine. **We are NOT changing engines** — a
+prototype proved the engine was never the limit. The per-device
+`THREE.Group`-of-meshes architecture was.
+
+Measured, same machine, same renderer:
+
+| | current (per-device meshes) | instanced prototype |
+|---|---|---|
+| devices | 800 | **12,000** |
+| draw calls | 33,952 | **5** |
+| frame | 81 ms | **<1 ms** |
+| build | 2.3 s (34 s projected at 300 racks) | **6 ms** |
+
+A data centre is massively repetitive: ~12,000 devices but only ~50 distinct
+product types. That is exactly what GPU instancing is for. Moving to another
+engine would have carried the same broken architecture across.
+
+**The rebuild (render layer only — the simulation model does not change):**
+1. **Instance registry**: one `InstancedMesh` per (geometry, material) pair,
+   shared across the whole site. All `switch48` chassis in the building are one
+   draw call, however many there are.
+2. **Faceplates via atlas**: faceplate art differs per device (its name), so
+   bake them into a texture atlas and give each instance a UV offset through an
+   `InstancedBufferAttribute`. One draw call for every faceplate on site.
+3. **Ports instanced + LOD-gated**: RJ45 bezel/jack/gold/LED become instanced
+   attributes, populated only for racks near the camera (the v0.51.0 LOD
+   distance already decides this).
+4. **Positions become analytic, not scene-graph-derived.** `getPortWorld`
+   currently traverses for port meshes; it must compute from `portGrid(def)` +
+   the rack transform. This is better regardless — it decouples cable routing
+   from render detail and removes a traverse per lookup.
+5. **Picking without per-object meshes**: ray → rack → U slot → port index by
+   arithmetic (or GPU picking). No mesh needed to click a port.
+6. **Cables**: one merged/instanced geometry rebuilt on change rather than a
+   tube mesh each; LOD to a line at distance.
+7. **Sim scale**: indexed `deviceById` (linear scan today), and an on-demand /
+   sampled reachability matrix instead of all-pairs at 12k devices.
+
+Non-negotiable through all of it: **no loss of realism or accuracy.** Near the
+camera it must look exactly as it does now — the modelled jacks, the real
+faceplates, the dressed cable. Instancing changes how it is submitted to the
+GPU, not what it looks like or what the simulation knows.
+
 **SCALE — measured, in progress.** Baseline at 20 fully filled racks (800
 devices): 146,842 meshes, 33,952 draw calls, 81 ms/frame. After v0.51.0 (device
 LOD + on-demand shadow map): near view 2,727 calls / 25 ms (12x fewer calls,
