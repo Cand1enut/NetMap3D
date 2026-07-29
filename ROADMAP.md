@@ -751,7 +751,43 @@ preview before release. Same "point at the thing" brief as item C.
 **I. Floor textures + floor z-fighting (owner).** Floors need real material
 choices like walls got (carpet tile, VCT, polished concrete, hardwood, tile).
 The z-fighting where a slab sits coplanar with the ground plane is FIXED in
-v0.48.0 via polygonOffset on the slab material; floor MATERIALS are still to do.
+v0.48.0 via polygonOffset on the slab material. Floor MATERIALS done v0.49.0
+(sealed concrete with saw-cut joints, carpet tile, VCT, hardwood) with a Floor
+picker on the Floor tool.
+
+## NEXT MAJOR PHASE (owner, Jul 2026): self-hosted server + real accounts
+
+After the current bug-fixing pass, the next build is a **double-clickable
+executable that hosts a server**, with logins, so several people work on one
+site together the way they would in Google Docs — later ported to the cloud.
+The owner will test it and re-plan the roadmap from there.
+
+This is the point where the collaboration constraints already recorded above
+stop being theoretical, so build in this order:
+
+1. **Fix the identified sync debt FIRST** (see the collaboration section):
+   `uid()` is `nextId++` and WILL collide across clients — move to
+   client-prefixed or UUID ids; convert the ~15 direct `state.*.push()` edits
+   into an operation log that can be applied/inverted/merged/broadcast (this is
+   also a better undo than the current snapshot stack); make the sim clock
+   session state, not `Date.now()` per client.
+2. **Server**: a small Node/Express + WebSocket host packaged as an executable
+   (pkg/Electron), serving the app and holding the authoritative document.
+   Must stay double-click simple — no install steps for the end user.
+3. **Accounts**: real login (hashed passwords — argon2/bcrypt, never plaintext,
+   never rolled by hand), sessions, and per-site permissions (owner / editor /
+   viewer). Read-only share links.
+4. **Realtime**: broadcast ops, presence (cursors, selection, who is looking at
+   what), and per-object-type conflict rules — last-write-wins for a cable
+   waypoint, but a hard REJECT for two people claiming the same switch port,
+   rack U or conduit capacity, because the physical world cannot merge those.
+5. **Persistence + history**: server-side save, version history, autosave.
+6. **Cloud port** after the local server is solid. Only then do the things the
+   no-backend constraint blocked become possible (live BOM pricing, server-side
+   config push).
+
+Local-first stays: the portable single file must keep working with no account,
+no server and no connection.
 
 ## Definition of done — the data centre build
 

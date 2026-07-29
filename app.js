@@ -1288,6 +1288,132 @@ const slabMat = new THREE.MeshStandardMaterial({ color: 0xb9bec7, map: makeSlabT
   roughness: 0.93, metalness: 0.02, envMapIntensity: 0.3,
   polygonOffset: true, polygonOffsetFactor: -2, polygonOffsetUnits: -4 });
 
+
+// ---- Floor material library ----
+// Real floors are carpet tile, VCT, polished concrete, hardwood or ceramic —
+// not one grey slab. Same pattern as the wall library: procedural albedo plus a
+// height field turned into a normal map, cached per material, chosen per slab
+// (`slab.material`). Concrete stays the default so existing maps are unchanged.
+const FLOOR_TEX_IN = 96;                       // one tile covers 8 ft of floor
+function carpetCanvas(mode) {
+  const S = 512, c = canvas2d(S), g = c.getContext('2d');
+  const tile = S / 4;                          // 24" carpet tiles across an 8 ft span
+  for (let ty = 0; ty < 4; ty++) for (let tx = 0; tx < 4; tx++) {
+    if (mode === 'albedo') {
+      const v = (Math.random() - 0.5) * 10;
+      g.fillStyle = `rgb(${74 + v},${80 + v},${88 + v})`;
+      g.fillRect(tx * tile, ty * tile, tile, tile);
+      // loop-pile speckle, and quarter-turn tiles read slightly differently
+      g.fillStyle = 'rgba(255,255,255,0.05)';
+      for (let k = 0; k < 500; k++) g.fillRect(tx * tile + Math.random() * tile, ty * tile + Math.random() * tile, 1.5, 1.5);
+      g.fillStyle = 'rgba(0,0,0,0.06)';
+      for (let k = 0; k < 400; k++) g.fillRect(tx * tile + Math.random() * tile, ty * tile + Math.random() * tile, 1.5, 1.5);
+    } else {
+      g.drawImage(fbmCanvas(tile, [10, 4], 0.45, 0.55), tx * tile, ty * tile, tile, tile);
+    }
+    // seam between tiles
+    g.strokeStyle = mode === 'albedo' ? 'rgba(0,0,0,0.18)' : '#5a5a5a';
+    g.lineWidth = mode === 'albedo' ? 1 : 3;
+    g.strokeRect(tx * tile, ty * tile, tile, tile);
+  }
+  return c;
+}
+function vctCanvas(mode) {
+  const S = 512, c = canvas2d(S), g = c.getContext('2d');
+  const tile = S / 8;                          // 12" VCT
+  for (let ty = 0; ty < 8; ty++) for (let tx = 0; tx < 8; tx++) {
+    if (mode === 'albedo') {
+      const base = 196 + (Math.random() - 0.5) * 10;
+      g.fillStyle = `rgb(${base},${base - 3},${base - 8})`;
+      g.fillRect(tx * tile, ty * tile, tile, tile);
+      // the chip/vein pattern VCT actually has
+      for (let k = 0; k < 90; k++) {
+        g.fillStyle = Math.random() > 0.5 ? 'rgba(120,120,125,0.35)' : 'rgba(255,255,255,0.4)';
+        g.fillRect(tx * tile + Math.random() * tile, ty * tile + Math.random() * tile, 2.2, 1.4);
+      }
+    } else { g.fillStyle = '#b0b0b0'; g.fillRect(tx * tile, ty * tile, tile, tile); }
+    g.strokeStyle = mode === 'albedo' ? 'rgba(0,0,0,0.22)' : '#4a4a4a';
+    g.lineWidth = mode === 'albedo' ? 1 : 3;
+    g.strokeRect(tx * tile, ty * tile, tile, tile);
+  }
+  return c;
+}
+function hardwoodCanvas(mode) {
+  const S = 512, c = canvas2d(S), g = c.getContext('2d');
+  const plank = S / 8;                          // ~12" wide boards
+  for (let i = 0; i < 8; i++) {
+    if (mode === 'albedo') {
+      const v = (Math.random() - 0.5) * 24;
+      g.fillStyle = `rgb(${146 + v},${103 + v},${62 + v})`;
+      g.fillRect(0, i * plank, S, plank);
+      g.strokeStyle = 'rgba(80,52,28,0.30)'; g.lineWidth = 1;
+      for (let k = 0; k < 7; k++) { const gy = i * plank + 4 + Math.random() * (plank - 8);
+        g.beginPath(); g.moveTo(0, gy); for (let x = 0; x < S; x += 24) g.lineTo(x, gy + Math.sin(x * 0.04 + i) * 1.6); g.stroke(); }
+      // butt joints staggered down the run
+      g.strokeStyle = 'rgba(0,0,0,0.35)'; g.lineWidth = 1.6;
+      const bx = (i % 3) * (S / 3) + 40;
+      g.beginPath(); g.moveTo(bx, i * plank); g.lineTo(bx, (i + 1) * plank); g.stroke();
+    } else { g.fillStyle = '#9a9a9a'; g.fillRect(0, i * plank, S, plank); }
+    g.strokeStyle = mode === 'albedo' ? 'rgba(0,0,0,0.4)' : '#3a3a3a';
+    g.lineWidth = mode === 'albedo' ? 2 : 5;
+    g.beginPath(); g.moveTo(0, i * plank); g.lineTo(S, i * plank); g.stroke();
+  }
+  return c;
+}
+function polishedConcreteCanvas(mode) {
+  const S = 512, c = canvas2d(S), g = c.getContext('2d');
+  if (mode === 'albedo') {
+    g.drawImage(fbmCanvas(S, [3, 7], 0.46, 0.56), 0, 0);
+    g.globalCompositeOperation = 'multiply'; g.fillStyle = '#9fa3a8'; g.fillRect(0, 0, S, S);
+    g.globalCompositeOperation = 'source-over';
+    // saw-cut control joints on a 4 ft grid
+    g.strokeStyle = 'rgba(0,0,0,0.30)'; g.lineWidth = 2;
+    for (const p of [S / 2]) { g.beginPath(); g.moveTo(p, 0); g.lineTo(p, S); g.moveTo(0, p); g.lineTo(S, p); g.stroke(); }
+  } else {
+    g.drawImage(fbmCanvas(S, [3, 7], 0.48, 0.52), 0, 0);
+    g.strokeStyle = '#404040'; g.lineWidth = 5;
+    for (const p of [S / 2]) { g.beginPath(); g.moveTo(p, 0); g.lineTo(p, S); g.moveTo(0, p); g.lineTo(S, p); g.stroke(); }
+  }
+  return c;
+}
+const FLOOR_MATERIALS = {
+  concrete:  { label: 'Sealed concrete', color: 0xb9bec7, rough: 0.93, env: 0.3,  nrm: 0.5, tile: FLOOR_TEX_IN,
+               albedo: () => polishedConcreteCanvas('albedo'), height: () => polishedConcreteCanvas('height') },
+  carpet:    { label: 'Carpet tile',     color: 0xffffff, rough: 0.99, env: 0.05, nrm: 0.7, tile: FLOOR_TEX_IN,
+               albedo: () => carpetCanvas('albedo'), height: () => carpetCanvas('height') },
+  vct:       { label: 'VCT tile',        color: 0xffffff, rough: 0.35, env: 0.7,  nrm: 0.35, tile: FLOOR_TEX_IN,
+               albedo: () => vctCanvas('albedo'), height: () => vctCanvas('height') },
+  hardwood:  { label: 'Hardwood',        color: 0xffffff, rough: 0.5,  env: 0.5,  nrm: 0.5, tile: FLOOR_TEX_IN,
+               albedo: () => hardwoodCanvas('albedo'), height: () => hardwoodCanvas('height') },
+};
+const _floorMatCache = {};
+function floorMatAssets(key) {
+  const def = FLOOR_MATERIALS[key] || FLOOR_MATERIALS.concrete;
+  if (_floorMatCache[key]) return _floorMatCache[key];
+  const albedo = new THREE.CanvasTexture(def.albedo());
+  albedo.colorSpace = THREE.SRGBColorSpace; albedo.wrapS = albedo.wrapT = THREE.RepeatWrapping; albedo.anisotropy = 16;
+  const normal = normalFromHeight(def.height(), def.nrm);
+  normal.wrapS = normal.wrapT = THREE.RepeatWrapping;
+  return (_floorMatCache[key] = { def, albedo, normal });
+}
+// Top-face material for one slab, sized so the pattern is the same scale on a
+// small closet floor and a big open plan.
+function makeFloorMaterial(key, wX, wZ) {
+  const { def, albedo, normal } = floorMatAssets(FLOOR_MATERIALS[key] ? key : 'concrete');
+  const m = new THREE.MeshStandardMaterial({
+    color: def.color, map: albedo.clone(), normalMap: normal.clone(),
+    normalScale: new THREE.Vector2(1, 1), roughness: def.rough, metalness: 0.02,
+    envMapIntensity: def.env,
+    polygonOffset: true, polygonOffsetFactor: -2, polygonOffsetUnits: -4
+  });
+  m.map.needsUpdate = true; m.normalMap.needsUpdate = true;
+  for (const t of [m.map, m.normalMap]) {
+    t.wrapS = t.wrapT = THREE.RepeatWrapping;
+    t.repeat.set(Math.max(wX, 1) / def.tile, Math.max(wZ, 1) / def.tile);
+  }
+  return m;
+}
+
 // The underside of a slab is a room's ceiling, and in every commercial building
 // that means a 24"×24" lay-in grid — fissured mineral tile in a white tee bar.
 // Modelling it is what stops the "floating concrete lid" look from below.
@@ -1392,7 +1518,8 @@ function buildSlab(s) {
     t.needsUpdate = true;
     t.repeat.set(Math.max(wX, 1) / (CEIL_TILE_IN * 2), Math.max(wZ, 1) / (CEIL_TILE_IN * 2));
   }
-  const faces = [slabMat, slabMat, slabMat, ceil, slabMat, slabMat];
+  const top = makeFloorMaterial(s.material, wX, wZ);
+  const faces = [slabMat, slabMat, top, ceil, slabMat, slabMat];   // +x,-x,+y(top),-y(ceiling),+z,-z
   const m = new THREE.Mesh(new THREE.BoxGeometry(Math.max(wX, 1), 6, Math.max(wZ, 1)), faces);
   m.position.set((s.x1 + s.x2) / 2, s.y - 3, (s.z1 + s.z2) / 2);
   m.castShadow = true;
@@ -7406,7 +7533,7 @@ function handleClick() {
       setStatus('Corner set — click the opposite corner of the slab.');
     } else if (Math.abs(hoverInfo.x - slabStart.x) > 6 && Math.abs(hoverInfo.z - slabStart.z) > 6) {
       undoPush();
-      const s = { id: uid(), x1: slabStart.x, z1: slabStart.z, x2: hoverInfo.x, z2: hoverInfo.z, y: hoverInfo.y };
+      const s = { id: uid(), x1: slabStart.x, z1: slabStart.z, x2: hoverInfo.x, z2: hoverInfo.z, y: hoverInfo.y, material: pendingFloorMaterial };
       state.slabs.push(s);
       buildSlab(s);
       slabStart = null;
@@ -8501,6 +8628,7 @@ const toolButtons = {
 };
 let wallStart = null;
 let pendingWallMaterial = 'drywall';   // finish chosen in the toolbar before drawing
+let pendingFloorMaterial = 'concrete'; // floor finish for new slabs
 let racewayStart = null;
 
 // Option bar: show only the controls that belong to the active tool. Anything
@@ -8598,6 +8726,14 @@ function currentBitDiameter() {
   }
   const mt = document.getElementById('rack-mount-sel');
   if (mt) mt.onchange = () => { pendingRackMount = mt.value; };
+})();
+
+(function initFloorMatUI() {
+  const sel = document.getElementById('floor-mat-sel');
+  if (!sel) return;
+  sel.innerHTML = Object.entries(FLOOR_MATERIALS).map(([k, d]) =>
+    `<option value="${k}" ${k === 'concrete' ? 'selected' : ''}>${d.label}</option>`).join('');
+  sel.onchange = () => { pendingFloorMaterial = sel.value; };
 })();
 
 (function initWallMatUI() {
