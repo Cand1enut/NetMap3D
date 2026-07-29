@@ -6406,6 +6406,11 @@ renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
 renderer.toneMapping = THREE.AgXToneMapping;
 renderer.toneMappingExposure = 1.0;
 renderer.shadowMap.enabled = true;
+// The scene is static between edits, so re-rendering the shadow map every frame
+// is pure waste — at 800 devices it measured ~4 ms/frame of pointless work, and
+// it scales with device count. The map is refreshed on demand instead:
+// `markShadowsDirty()` after anything moves, is built, or is deleted.
+renderer.shadowMap.autoUpdate = false;
 // r185 deprecated PCFSoftShadowMap in WebGLShadowMap — setting it silently
 // downgrades to hard PCF, which is why shadow edges looked harder than intended.
 // VSM (variance shadow maps) is the modern soft path and honours the light's
@@ -7801,6 +7806,7 @@ function applyLevelVisibility() {
 // re-scan every object once per wall.
 let _levelVisQueued = false;
 function scheduleLevelVis() {
+  markShadowsDirty();
   if (_levelVisQueued) return;
   _levelVisQueued = true;
   Promise.resolve().then(() => { _levelVisQueued = false; applyLevelVisibility(); });
@@ -8734,9 +8740,56 @@ function buildDeviceGroup(dev) {
 
   rackG.add(g);
   deviceGroups.set(dev.id, g);
+  lodPackDevice(g);
   refreshPortTints();
   collidersDirty = true;
+  markShadowsDirty();
   return g;
+}
+
+// ---- Level of detail ----
+// A 48-port switch is ~150 meshes, nearly all of it port jewellery: bezel,
+// jack, gold contacts, link LED per port. Twenty filled racks measured 146,842
+// meshes and 33,952 draw calls at 81 ms/frame; hundreds of racks is impossible
+// that way. But the faceplate TEXTURE already draws the ports, so from more
+// than a few feet away the modelled jacks add nothing you can see.
+//
+// So the detail is reparented into one child group per device and that group's
+// visibility is driven by camera distance. Crucially this HIDES rather than
+// deletes: three.js skips an invisible subtree entirely when rendering, while
+// getWorldPosition still returns correct transforms — so cable endpoints,
+// which resolve through port meshes, keep working at any distance.
+// Refresh the shadow map once, on the next frame. Everything that changes the
+// scene calls this; the render loop clears the flag after one pass.
+let _shadowDirty = true;
+function markShadowsDirty() { _shadowDirty = true; }
+const LOD_DETAIL_IN = 260;          // ~22 ft: past this the texture is enough
+const _lodTmp = new THREE.Vector3();
+function lodPackDevice(g) {
+  const detail = new THREE.Group();
+  detail.name = '__detail';
+  for (const child of [...g.children]) {
+    const u = child.userData || {};
+    if (u.isPort || u.portLed || child.userData.__detail) { detail.add(child); continue; }
+    // bezels/contacts carry no flags — identify them by shared detail geometry
+    if (child.isMesh && (child.geometry === GEO_RJ_BEZEL || child.geometry === GEO_SFP_BEZEL ||
+        child.geometry === GEO_GOLD || child.geometry === GEO_LED)) detail.add(child);
+  }
+  if (detail.children.length) { g.add(detail); g.userData.detail = detail; }
+}
+let _lodLast = 0;
+function updateDeviceLOD(force) {
+  const now = performance.now();
+  if (!force && now - _lodLast < 120) return;      // 8 Hz is plenty for distance
+  _lodLast = now;
+  const near2 = LOD_DETAIL_IN * LOD_DETAIL_IN;
+  for (const g of deviceGroups.values()) {
+    const d = g.userData.detail;
+    if (!d) continue;
+    g.getWorldPosition(_lodTmp);
+    const want = _lodTmp.distanceToSquared(camera.position) < near2;
+    if (d.visible !== want) d.visible = want;
+  }
 }
 
 //////////////////// Cables ////////////////////
@@ -19198,6 +19251,8 @@ const frameTimer = new THREE.Timer();
   requestAnimationFrame(animate);
   frameTimer.update();
   const dt = Math.min(frameTimer.getDelta(), 0.1);
+  updateDeviceLOD();
+  if (_shadowDirty) { renderer.shadowMap.needsUpdate = true; _shadowDirty = false; }
   if (walkActive) {
     const speed = (walkKeys['ShiftLeft'] || walkKeys['ShiftRight']) ? 190 : 68;
     const fwd = new THREE.Vector3(-Math.sin(walkYaw), 0, -Math.cos(walkYaw));

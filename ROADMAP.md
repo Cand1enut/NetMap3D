@@ -804,6 +804,28 @@ instead of the small reference site. It must function 100% correctly.
 Owner: "insane level security from doors to cameras, go all out, no holds
 barred. Anything you can think of needs to be there and function true to life."
 
+**SCALE — measured, in progress.** Baseline at 20 fully filled racks (800
+devices): 146,842 meshes, 33,952 draw calls, 81 ms/frame. After v0.51.0 (device
+LOD + on-demand shadow map): near view 2,727 calls / 25 ms (12x fewer calls,
+3.2x faster), far view 11,402 calls / 49 ms. Cables still resolve and the
+reference site is unchanged.
+
+**Still not enough for 300 racks, and the reason is now precisely known:** the
+far view is draw-call bound at ~14 calls per device (chassis, faceplate, rear
+plate, rails). 12,000 devices would be ~170,000 calls; three.js does ~2-5k at
+60 fps. The next step is the one that actually closes it:
+- **Bake a faceplate texture ATLAS per rack** (all ~40 device faceplates into
+  one texture) and **merge each rack's static chassis geometry into one mesh**.
+  That takes a rack from ~560 draw calls to 1-2, i.e. 300 racks in ~600 calls.
+  The per-device detail group already exists and stays for the near view.
+- Keep the LOD split: merged+atlas rack for distance, real per-device meshes
+  only for the handful of racks near the camera.
+- Then: instanced cables (or LOD to lines at distance), indexed `deviceById`
+  (linear scan today), and an on-demand/sampled reachability matrix instead of
+  all-pairs.
+If that still does not carry it, the fallback the owner has approved is moving
+to an engine that can — with no loss of realism or accuracy.
+
 **SCALE (owner): hundreds of fully filled racks.** That is roughly 200-400 racks
 x ~35 devices = 7,000-14,000 devices, plus tens of thousands of cables. The
 current renderer builds a THREE.Group of many meshes per device and one tube
