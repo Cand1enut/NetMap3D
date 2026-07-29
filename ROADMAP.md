@@ -964,6 +964,46 @@ their pod's range.
 layer (ARCHITECTURE DECISION above), and it must land before the full-size
 example is usable.
 
+## NEXT CHALLENGE (owner): 1,000 networks, 1,000 ways — fuzz to 1:1
+
+Once the current bugs are closed: **generate 1,000 networks built 1,000 different
+ways, as complex as possible, and fix every bug they surface.** This is fuzzing
+the simulator against itself, and the data-centre work already proved the method
+— testing at 100 racks found three real design bugs that 13 racks never showed.
+
+How to do it so it actually finds things (do not hand-write 1,000 sites):
+- **Randomised topology generator**: vary layer count (flat / collapsed core /
+  three-tier / pod / spine-leaf), vendor mix (Cisco IOS, UniFi, Meraki, Omada,
+  MikroTik, Aruba), VLAN counts and prefix sizes (/16 through /30), routing
+  (static only, OSPF areas, floating statics, default routes, no route at all),
+  NAT modes (overload, static, port-forward, none), ACL depth, DHCP (scopes,
+  relay, reservations, exhaustion), redundancy (loops for STP to block, dual
+  uplinks, dual homing), and physical faults (over-length runs, wrong patch
+  port, unplugged, admin-down, speed/duplex mismatch).
+- **Invariants to assert on every generated site** — these are the oracle, and
+  they must hold without hand-checking each site:
+  1. Every host with an address either reaches its declared gateway or the
+     engine names WHY, and the reason must be true.
+  2. No host reaches a subnet an ACL forbids (segmentation never leaks).
+  3. DHCP never issues a duplicate, out-of-scope or out-of-subnet address.
+  4. Reachability is symmetric unless something asymmetric is configured — if
+     A reaches B, B reaches A, or there is a stated reason.
+  5. Every VLAN with an SVI has exactly one gateway holder.
+  6. STP leaves exactly one active path per VLAN — no loop, no partition.
+  7. `show running-config` re-imported reproduces the same model (round trip).
+  8. save → load → re-run gives identical results.
+  9. Nothing throws, and no device is left with an invalid/duplicate address.
+- **Shrink failures**: when a site fails, cut it down to the smallest topology
+  that still fails and record THAT as a regression test. A 400-device repro is
+  useless; a 4-device one is a fix.
+- Keep every reduced repro as a permanent test so fixed bugs stay fixed.
+
+Prerequisite: this needs the build to be fast (see the instanced render layer) or
+it must run headless against the model only, skipping mesh building entirely —
+which is probably the right answer, since these tests are about the simulation,
+not the picture. A `buildDeviceGroup`-free "model only" mode would let 1,000
+sites run in seconds.
+
 ## Definition of done — the data centre build
 
 Owner-set acceptance test for the whole simulation: **build an entire data
