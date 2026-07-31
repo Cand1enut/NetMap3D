@@ -2386,8 +2386,14 @@ function updateDeviceFaceplate(devId) {
 
 function isPlaced(dev) {
   const def = DEVICE_TYPES[dev.type];
+  // A rack is a home for anything. Plenty of real gear mounts either way -- an
+  // Access Hub, a small switch, an injector -- and testing only for wall/field
+  // coordinates meant a rack-mounted unit of a field-capable type counted as
+  // unplaced, so it dropped out of the network entirely and nothing answered at
+  // its address.
+  if (dev.rackId !== undefined && dev.rackId !== null) return true;
   if (def.field) return dev.mount === 'wall' || dev.x !== undefined;
-  return dev.rackId !== undefined && dev.rackId !== null;
+  return false;
 }
 
 function buildDeviceGroup(dev) {
@@ -4523,6 +4529,25 @@ function dhcpRelease(hostId, port) {
 
 // A specific NIC's address. Leases are keyed per NIC because each NIC DHCPs
 // separately with its own MAC — a dual-homed host really does get two leases.
+// The default gateway a host would actually use. A DHCP client learns it from
+// option 3 in its lease, not from anything typed into the device -- so reading
+// only the static field left EVERY DHCP endpoint looking gateway-less, which is
+// most endpoints in a real network. Static wins, then the lease, then the
+// device-level fallback.
+function hostGateway(dev, port) {
+  const nics = hostNics(dev);
+  const fromLease = (nic) => {
+    if (!nic || nic.ip !== 'dhcp') return null;
+    const l = _dhcpLeases.get(leaseKey(dev.id, nic.port));
+    return (l && l.options && l.options[DHCP_OPT.router]) || null;
+  };
+  const pick = port === undefined ? (nics.find(x => x.primary) || nics[0])
+                                  : nics.find(x => x.port === port);
+  if (pick) { if (pick.gateway) return pick.gateway; const g = fromLease(pick); if (g) return g; }
+  for (const n of nics) { if (n.gateway) return n.gateway; const g = fromLease(n); if (g) return g; }
+  return dev.gateway || null;
+}
+
 function nicIp(dev, port) {
   const nics = hostNics(dev);
   const n = port === undefined ? nics[0] : nics.find(x => x.port === port);
@@ -4771,15 +4796,22 @@ function l2Walk(startDev, opts = {}) {
   const vlan = opts.vlan;
   const fromPort = opts.startPort || hostPort(startDev);
   const reachedHosts = new Set(), reachedRouters = new Map(); // routerId -> jack it was reached on
+  // Every device the frame actually reaches, whatever its class. A plain L2
+  // switch is neither a host nor a router, so it landed in NEITHER set above and
+  // was invisible to any caller asking "did we get there" -- which made pinging
+  // a managed switch by its management address fail even though the frame
+  // demonstrably arrived. A switch whose port admits the VLAN answers ARP for
+  // its own management address, so reaching the device IS reaching that address.
+  const reachedDevs = new Set();
   const prev = new Map();                                     // "devId:port:side" -> previous key
   const seen = new Set();
   const start = hopThroughPatches(startDev, fromPort, FRONT);
-  if (!start) return { hosts: reachedHosts, routers: reachedRouters, prev, start: null };
+  if (!start) return { hosts: reachedHosts, routers: reachedRouters, devs: reachedDevs, prev, start: null };
   // The first hop is a cable too. Checking length only when spreading from a
   // switch missed the most common case of all — an over-length drop cable on
   // the host itself, which passed as if it were fine.
   if (!opts.ignoreLength && start.cable && (start.cable.lengthIn || 0) / 12 > COPPER_LIMIT_FT) {
-    return { hosts: reachedHosts, routers: reachedRouters, prev, start: null, overLength: true };
+    return { hosts: reachedHosts, routers: reachedRouters, devs: reachedDevs, prev, start: null, overLength: true };
   }
   const startKey = `${start.dev.id}:${start.port}:${start.side}`;
   const q = [{ dev: start.dev, port: start.port, side: start.side, key: startKey }];
@@ -4789,7 +4821,11 @@ function l2Walk(startDev, opts = {}) {
     if (seen.has(cur.key)) continue;
     seen.add(cur.key);
     const cls = netClass(cur.dev);
-    if (cls === 'router') { if (!reachedRouters.has(cur.dev.id)) reachedRouters.set(cur.dev.id, cur); continue; }
+    if (cls === 'router') {
+      reachedDevs.add(cur.dev.id);
+      if (!reachedRouters.has(cur.dev.id)) reachedRouters.set(cur.dev.id, cur);
+      continue;
+    }
     // An L3 switch both SWITCHES and ROUTES. It keeps forwarding frames at layer
     // 2 (so the walk continues through it), but it is also a gateway/DHCP-server
     // candidate for any VLAN it holds an SVI on. Treating it as switch-only made
@@ -4798,7 +4834,7 @@ function l2Walk(startDev, opts = {}) {
         deviceInterfaces(cur.dev).some(i => i.kind === 'svi')) {
       reachedRouters.set(cur.dev.id, cur);
     }
-    if (cls === 'host') { reachedHosts.add(cur.dev.id); continue; }
+    if (cls === 'host') { reachedDevs.add(cur.dev.id); reachedHosts.add(cur.dev.id); continue; }
     // switch (or multi-port bridge): spread to every other port on this VLAN,
     // then hop each to its neighbour through any patch panels
     if (cls === 'switch' || cls === 'patch') {
@@ -4806,6 +4842,8 @@ function l2Walk(startDev, opts = {}) {
       // on one end only drops it right here, which is a real misconfiguration
       // this walk needs to reproduce rather than paper over
       if (!opts.ignoreVlan && vlan !== undefined && !portCarries(cur.dev, cur.port, vlan)) continue;
+      // admitted at the ingress port, so this box is genuinely on the segment
+      reachedDevs.add(cur.dev.id);
       const def = DEVICE_TYPES[cur.dev.type];
       const nports = def.ports || 0;
       // a blocked port drops the frame — that's the whole point of STP, and it
@@ -4824,7 +4862,7 @@ function l2Walk(startDev, opts = {}) {
       }
     }
   }
-  return { hosts: reachedHosts, routers: reachedRouters, prev, start };
+  return { hosts: reachedHosts, routers: reachedRouters, devs: reachedDevs, prev, start };
 }
 
 
@@ -10989,7 +11027,8 @@ function deviceReach(srcDev, dstInt) {
     for (let p = 1; p <= (def.ports || 1); p++) {
       if (portRole(def, p) === 'PWR') continue;
       const walk = l2Walk(srcDev, { startPort: p, vlan, ignoreVlan: vlan === undefined });
-      if (walk.hosts.has(owner.dev.id) || walk.routers.has(owner.dev.id)) return { ok: true, local: true };
+      if (walk.hosts.has(owner.dev.id) || walk.routers.has(owner.dev.id) ||
+          (walk.devs && walk.devs.has(owner.dev.id))) return { ok: true, local: true };
       // the far end may be the neighbour itself (direct link)
       const nb = hopThroughPatches(srcDev, p, FRONT);
       if (nb && nb.dev.id === owner.dev.id) return { ok: true, local: true };
@@ -11002,7 +11041,12 @@ function deviceReach(srcDev, dstInt) {
     return f.error ? { ok: false, why: f.error } : { ok: true };
   }
   // A switch/host with only a management address needs a default gateway.
-  const gwStr = srcDev.gateway;
+  // On a host the gateway belongs to the NIC, not the device: a multi-homed
+  // server carries dev.nics[p].gateway and leaves dev.gateway unset, so reading
+  // only dev.gateway declared a server with two configured gateways to have
+  // none. Prefer the NIC that would source the traffic, then the primary.
+  let gwStr = srcDev.gateway;
+  if (!gwStr && netClass(srcDev) === 'host') gwStr = hostGateway(srcDev);
   const gw = gwStr ? parseIp(gwStr) : null;
   if (!gw) return { ok: false, why: `${srcDev.name} has no default gateway for off-subnet traffic` };
   const holder = deviceHoldingAddr(gw.int);
@@ -13321,7 +13365,16 @@ function buildDataCentre(opts = {}) {
   // Assigned once the ladder rack exists, further down. Declared here because
   // link() closes over it and every inter-cabinet run has to ride the runway.
   let trayRoute = null;
+  const taken = new Set();
   const link = (da, pa, db, pb, color) => {
+    // One jack, one cable. Two cables on one port is physically impossible, and
+    // the L2 walk silently follows only one of them -- so a typo here strands
+    // whole branches of the network with no visible error. Fail loudly instead.
+    for (const [d, pt] of [[da, pa], [db, pb]]) {
+      const k = `${d.id}/${pt}`;
+      if (taken.has(k)) console.error(`data centre: ${d.name} port ${pt} already has a cable`);
+      taken.add(k);
+    }
     const c = { id: uid(), a: { deviceId: da.id, port: pa, side: FRONT },
       b: { deviceId: db.id, port: pb, side: FRONT }, color: color || 0x2f81f7, waypoints: [] };
     const path = trayRoute ? trayRoute(da, db) : null;
@@ -13446,8 +13499,13 @@ function buildDataCentre(opts = {}) {
   // Services switch joins the SAME layer-2 fabric as the racks. Hanging it off
   // the core instead put the NVR in a different L2 island from the cameras even
   // though both were "VLAN 50" — a router does not bridge a VLAN.
-  agg.portCfg[47] = { mode: 'trunk', native: '10', tagged: DC_VLANS.map(v => v.id).join(',') };
-  link(oob, 24, agg, 47, 0x3fb950);
+  // Port 45, not 47: 46 is the pair cross-link and 47/48 are the two core
+  // uplinks. Landing the services switch on 47 put two cables in one jack, so
+  // the walk followed only one of them and the OOB switch -- with the NVR, NOC,
+  // jump host, badge readers and every security camera behind it -- was stranded
+  // off the fabric.
+  agg.portCfg[45] = { mode: 'trunk', native: '10', tagged: DC_VLANS.map(v => v.id).join(',') };
+  link(oob, 24, agg, 45, 0x3fb950);
   const nvr = inRack(mdf, 'u_unvrpro', 31, { name: 'NVR-01', ip: '10.50.0.10/16', gateway: '10.50.0.1' });
   const acHub = inRack(mdf, 'u_accesshub', 29, { name: 'ACCESS-HUB', ip: '10.60.0.10/24', gateway: '10.60.0.1' });
   const mdfPatch = inRack(mdf, 'patch24', 42);
@@ -13605,13 +13663,27 @@ function buildDataCentre(opts = {}) {
   coreA.acls = parseAclText([
     'ip access-list extended CAMERA-ISOLATION',
     ' 10 remark cameras talk to the NVR and nothing else',
+    ' 15 permit ip host 10.50.0.10 10.70.0.0 0.0.0.255',
     ' 20 permit ip 10.50.0.0 0.0.255.255 host 10.50.0.10',
     ' 30 deny ip 10.50.0.0 0.0.255.255 any',
     ' 40 permit ip any any',
     'ip access-list extended ACCESS-ISOLATION',
     ' 10 remark door hardware talks only to the access controller',
+    ' 15 permit ip host 10.60.0.10 10.70.0.0 0.0.0.255',
     ' 20 permit ip 10.60.0.0 0.0.0.255 host 10.60.0.10',
     ' 30 deny ip 10.60.0.0 0.0.0.255 any',
+    ' 40 permit ip any any',
+    'ip access-list extended CAMERA-PROTECT',
+    ' 10 remark the NOC reaches the recorder, the recorder reaches the cameras',
+    ' 20 permit ip host 10.50.0.10 10.50.0.0 0.0.255.255',
+    ' 25 permit ip 10.70.0.0 0.0.0.255 host 10.50.0.10',
+    ' 30 deny ip any 10.50.0.0 0.0.255.255',
+    ' 40 permit ip any any',
+    'ip access-list extended ACCESS-PROTECT',
+    ' 10 remark the NOC reaches the controller, the controller reaches the doors',
+    ' 20 permit ip host 10.60.0.10 10.60.0.0 0.0.0.255',
+    ' 25 permit ip 10.70.0.0 0.0.0.255 host 10.60.0.10',
+    ' 30 deny ip any 10.60.0.0 0.0.0.255',
     ' 40 permit ip any any',
     'ip access-list extended OOB-LOCKDOWN',
     ' 10 remark only the jump host reaches out-of-band management',
@@ -13620,13 +13692,20 @@ function buildDataCentre(opts = {}) {
     ' 40 deny ip any 10.10.0.0 0.0.255.255',
     ' 50 permit ip any any',
   ].join('\n')).acls;
-  coreA.aclApply = { 'Vlan50': { in: 'CAMERA-ISOLATION' }, 'Vlan60': { in: 'ACCESS-ISOLATION' },
-                     'Vlan70': { in: 'OOB-LOCKDOWN' } };
+  // Isolation needs BOTH directions. An `in` list on Vlan50 only filters traffic
+  // a camera sources; it says nothing about a production server dialling INTO
+  // the camera VLAN, which is the direction an attacker actually uses. That gap
+  // was invisible until hosts could resolve a gateway at all.
+  coreA.aclApply = {
+    'Vlan50': { in: 'CAMERA-ISOLATION', out: 'CAMERA-PROTECT' },
+    'Vlan60': { in: 'ACCESS-ISOLATION', out: 'ACCESS-PROTECT' },
+    'Vlan70': { in: 'OOB-LOCKDOWN' } };
   // Both cores carry the SAME policy and the same translation. Anything less
   // means the redundant path silently bypasses security — which is exactly what
   // happened the first time this was wired: camera isolation leaked via CORE-B.
   coreB.acls = coreA.acls.map(a => ({ ...a, rules: a.rules.map(r => ({ ...r })) }));
-  coreB.aclApply = { ...coreA.aclApply };
+  coreB.aclApply = Object.fromEntries(
+    Object.entries(coreA.aclApply).map(([k, v]) => [k, { ...v }]));
   coreB.nat = { enabled: true, insideGlobal: '198.51.100.2', overload: true };
   coreB.routes = [{ prefix: '0.0.0.0/0', via: '192.168.255.2' }];
   coreB.portCfg[1] = { ip: '192.168.255.4/29' };
