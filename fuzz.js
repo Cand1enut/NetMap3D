@@ -210,6 +210,13 @@ if (require.main === module) {
   try { env = loadEngine(); }
   catch (e) { console.error('FATAL: could not load engine headlessly.'); process.exit(2); }
   const api = env.__api || {};
+  // The rejection gate runs once — it is about the CLI's rules, not a topology.
+  const rejectFails = checkRejects(api);
+  if (rejectFails.length) {
+    console.log('REJECTION GATE FAILURES:');
+    for (const f of rejectFails) console.log('  ' + f);
+  } else console.log('rejection gate: ok');
+
   const t0 = Date.now();
   const buckets = new Map();       // failure signature -> {count, seed, example}
   let built = 0, skipped = 0, crashed = 0;
@@ -224,7 +231,7 @@ if (require.main === module) {
     if (!site && !fails.length) { skipped++; continue; }
     if (site) {
       built++;
-      try { fails = checkSite(api, site); }
+      try { fails = checkSite(api, site).concat(checkRealism(api, site)); }
       catch (e) { crashed++; fails = ['oracle threw: ' + e.message + ' @ ' + (e.stack || '').split('\n')[1]]; }
     }
     for (const f of fails) {
@@ -240,7 +247,8 @@ if (require.main === module) {
   console.log(`\n=== fuzz: ${iterations} iterations in ${(ms / 1000).toFixed(1)}s ` +
     `(${(ms / Math.max(1, iterations)).toFixed(2)} ms/site) ===`);
   console.log(`built ${built}, skipped ${skipped}, harness crashes ${crashed}`);
-  if (!buckets.size) { console.log('NO FAILURES'); process.exit(0); }
+  if (!buckets.size && !rejectFails.length) { console.log('NO FAILURES'); process.exit(0); }
+  if (!buckets.size) { console.log('no topology failures'); process.exit(1); }
   const sorted = [...buckets.entries()].sort((a, b) => b[1].count - a[1].count);
   console.log(`\n${sorted.length} distinct failure signatures:`);
   for (const [sig, b] of sorted)
@@ -303,17 +311,23 @@ function genSite(api, rnd) {
     const id = 10 + i * 10;
     const oct2 = 20 + i;
     const base = cidr >= 24 ? `10.${oct2}.${i}.0` : `10.${oct2}.0.0`;
-    const gw = cidr >= 24 ? `10.${oct2}.${i}.1` : `10.${oct2}.0.1`;
     // host capacity of the prefix, minus network+broadcast, capped at what we build
     const cap = Math.max(1, Math.pow(2, 32 - cidr) - 3);
+    // the gateway takes the first usable address, the way almost every real
+    // network is numbered
+    const np = api.parseIp(`${base}/${cidr}`);
+    const gw = api.ipStr((np.network >>> 0) + (cidr >= 31 ? 0 : 1));
     vlans.push({ id, name: `V${id}`, base, gw, cidr, cap, n: 1 });
   }
+  // Walk the prefix arithmetically so a host is never handed the network or the
+  // broadcast address, whatever the mask is.
   const hostIp = (v) => {
-    if (v.n >= v.cap) return null;
-    const n = ++v.n + 1;
-    const a = cidr >= 24 ? `10.${20 + (v.id - 10) / 10}.${(v.id - 10) / 10}.${n}`
-                         : `10.${20 + (v.id - 10) / 10}.${Math.floor(n / 250)}.${n % 250}`;
-    return `${a}/${cidr}`;
+    const net = api.parseIp(`${v.base}/${cidr}`);
+    const size = Math.pow(2, 32 - cidr);
+    const usable = cidr >= 31 ? size : size - 2;         // RFC 3021 for /31
+    if (v.n >= usable) return null;
+    const base = (net.network >>> 0) + (cidr >= 31 ? 0 : 1);
+    return `${api.ipStr(base + v.n++)}/${cidr}`;
   };
 
   const rtType = pick(byClass.router);
@@ -323,10 +337,18 @@ function genSite(api, rnd) {
 
   const dhcpOn = rnd() < 0.6;
   if (dhcpOn) {
+    // Pool bounds are computed from the prefix, not pasted into the last octet.
+    // A /26 has 62 usable addresses, so a range ending .200 is not a tight pool
+    // -- it is outside the network, and a real router rejects it outright.
     router.dhcp = { enabled: true, pools: vlans.map(v => {
-      const hi = cidr >= 24 ? v.base.replace(/\.0$/, '.200') : v.base.replace(/\.0\.0$/, '.250.200');
-      const lo = cidr >= 24 ? v.base.replace(/\.0$/, '.150') : v.base.replace(/\.0\.0$/, '.200.10');
-      return { name: v.name, network: `${v.base}/${cidr}`, poolStart: lo, poolEnd: hi,
+      const net = api.parseIp(`${v.base}/${cidr}`);
+      const size = Math.pow(2, 32 - cidr);
+      const first = (net.network >>> 0) + 1;             // .0 is the network
+      const last = (net.network >>> 0) + size - 2;       // and the top is broadcast
+      const lo = Math.min(first + 9, last);              // leave room for statics
+      const hi = Math.min(lo + 89, last);
+      return { name: v.name, network: `${v.base}/${cidr}`,
+        poolStart: api.ipStr(lo), poolEnd: api.ipStr(hi),
         lease: { days: 1 }, defaultRouter: v.gw, dns: [], domain: 'f.local', reservations: [] };
     })};
   }
@@ -463,4 +485,201 @@ function checkSite(api, site) {
     } catch (e) { say('io', 'round trip threw ' + e.message); }
   }
   return fails;
+}
+
+//////////////////// Realism invariants ////////////////////
+// Not "is the model self-consistent" but "would a real network behave this
+// way". Each check cites the standard or the vendor behaviour it enforces, so a
+// failure is arguable against a primary source rather than against taste.
+
+function checkRealism(api, site) {
+  const bad = [];
+  const { state } = api;
+  const say = (rule, m) => bad.push(`${rule}: ${m}`);
+
+  // RFC 1918 / IEEE: VLAN IDs are 1-4094, and Cisco reserves 1002-1005 for
+  // FDDI/Token Ring defaults -- they cannot be used or deleted.
+  for (const d of state.devices) {
+    for (const v of d.vlans || []) {
+      const id = +v.id;
+      if (!(id >= 1 && id <= 4094)) say('vlan-range', `${d.name} has VLAN ${id}, outside 1-4094`);
+      if (id >= 1002 && id <= 1005) say('vlan-reserved', `${d.name} uses reserved VLAN ${id}`);
+    }
+  }
+
+  // A host address may not be the network or the broadcast address of its own
+  // prefix. /31 is the exception -- RFC 3021 gives point-to-point links both
+  // addresses -- and /32 is a single host.
+  for (const d of state.devices) {
+    for (const i of api.deviceInterfaces(d)) {
+      const ip = i.ip;
+      if (!ip || ip.cidr >= 31) continue;
+      const net = ip.network >>> 0, bcast = (net | (~ip.mask >>> 0)) >>> 0;
+      if ((ip.int >>> 0) === net) say('net-addr', `${d.name} ${api.ipStr(ip.int)}/${ip.cidr} is the network address`);
+      if ((ip.int >>> 0) === bcast) say('bcast-addr', `${d.name} ${api.ipStr(ip.int)}/${ip.cidr} is the broadcast address`);
+    }
+  }
+
+  // Two devices answering the same address in one broadcast domain is a
+  // duplicate-IP conflict; real stacks log it and one of them stops working.
+  const byAddr = new Map();
+  for (const d of state.devices) {
+    for (const i of api.deviceInterfaces(d)) {
+      const k = i.ip.int >>> 0;
+      if (byAddr.has(k) && byAddr.get(k) !== d.name)
+        say('dup-ip', `${api.ipStr(k)} answered by both ${byAddr.get(k)} and ${d.name}`);
+      byAddr.set(k, d.name);
+    }
+  }
+
+  // A default gateway must live inside the subnet it serves, or the host can
+  // never ARP for it.
+  for (const { dev, vlan } of site.hosts) {
+    const gwStr = api.hostGateway ? api.hostGateway(dev) : dev.gateway;
+    if (!gwStr) continue;
+    const gw = api.parseIp(gwStr);
+    const ip = api.deviceInterfaces(dev)[0];
+    if (!gw || !ip) continue;
+    if (!api.ipInSubnet(gw.int, ip.ip))
+      say('gw-offsubnet', `${dev.name} gateway ${gwStr} is outside its own ${api.ipStr(ip.ip.network)}/${ip.ip.cidr}`);
+  }
+
+  // RFC 2131 s4.4.5: renewal at T1 = 0.5 x lease, rebinding at T2 = 0.875 x
+  // lease. Pool ranges must lie inside the pool's own network.
+  for (const d of state.devices) {
+    for (const p of (d.dhcp && d.dhcp.pools) || []) {
+      const net = api.parseIp(p.network);
+      if (!net) { say('pool-net', `${d.name} pool ${p.name} has an unparseable network`); continue; }
+      for (const [lbl, a] of [['start', p.poolStart], ['end', p.poolEnd]]) {
+        const v = a && api.parseIp(a);
+        if (!v) continue;
+        if (!api.ipInSubnet(v.int, net))
+          say('pool-range', `${d.name} pool ${p.name} ${lbl} ${a} is outside ${p.network}`);
+      }
+      if (p.defaultRouter) {
+        const r = api.parseIp(p.defaultRouter);
+        if (r && !api.ipInSubnet(r.int, net))
+          say('pool-router', `${d.name} pool ${p.name} default-router ${p.defaultRouter} is outside ${p.network}`);
+      }
+    }
+  }
+  for (const b of (api._dhcpBindings ? api._dhcpBindings.values() : [])) {
+    if (!isFinite(b.leaseSecs)) continue;
+    const ms = b.leaseSecs * 1000;
+    const t1 = (b.t1At - b.boundAt) / ms, t2 = (b.t2At - b.boundAt) / ms;
+    if (Math.abs(t1 - 0.5) > 0.01) say('dhcp-t1', `T1 is ${t1.toFixed(3)} of the lease, RFC 2131 says 0.5`);
+    if (Math.abs(t2 - 0.875) > 0.01) say('dhcp-t2', `T2 is ${t2.toFixed(3)} of the lease, RFC 2131 says 0.875`);
+  }
+
+  // IEEE 802.1t: with the extended system ID the configurable part of the
+  // bridge priority moves in steps of 4096.
+  for (const d of state.devices) {
+    if (d.stpPriority === undefined || d.stpPriority === '') continue;
+    const pr = +d.stpPriority;
+    if (!isFinite(pr) || pr % 4096 !== 0)
+      say('stp-priority', `${d.name} bridge priority ${d.stpPriority} is not a multiple of 4096`);
+  }
+
+  // RFC 5517: a primary private VLAN has at most ONE isolated secondary.
+  for (const d of state.devices) {
+    const pv = d.pvlan || {};
+    for (const [id, def] of Object.entries(pv)) {
+      if (def.type !== 'primary') continue;
+      const iso = (def.assoc || []).filter(v => pv[v] && pv[v].type === 'isolated');
+      if (iso.length > 1)
+        say('pvlan-isolated', `${d.name} primary VLAN ${id} has ${iso.length} isolated secondaries; only one is legal`);
+      for (const v of def.assoc || [])
+        if (!pv[v]) say('pvlan-assoc', `${d.name} VLAN ${id} associates undefined secondary ${v}`);
+    }
+    // a secondary may belong to only one primary
+    const owner = new Map();
+    for (const [id, def] of Object.entries(pv)) {
+      if (def.type !== 'primary') continue;
+      for (const v of def.assoc || []) {
+        if (owner.has(v)) say('pvlan-shared', `${d.name} secondary ${v} is associated with primaries ${owner.get(v)} and ${id}`);
+        owner.set(v, id);
+      }
+    }
+  }
+
+  // A port is access or trunk, never both, and one jack takes one cable.
+  for (const d of state.devices) {
+    for (const [p, c] of Object.entries(d.portCfg || {})) {
+      if (c.mode === 'access' && c.tagged) say('port-mode', `${d.name} port ${p} is access but carries a tagged list`);
+      if (c.pvMode === 'host' && c.pvSecondary === undefined)
+        say('pvlan-host', `${d.name} port ${p} is a private-VLAN host port with no secondary`);
+    }
+  }
+
+  // TIA-568: 100 m channel for balanced twisted pair. Anything longer is not a
+  // link, it is a fault, and must be reported as one.
+  for (const c of state.cables) {
+    const ft = (c.lengthIn || 0) / 12;
+    if (ft > 328 && !c.fiber) say('copper-limit', `a ${Math.round(ft)} ft copper run exceeds the 328 ft channel limit`);
+  }
+
+  return bad;
+}
+
+//////////////////// Rejection gate ////////////////////
+// A realism oracle over generated-valid configs passes trivially. The sharper
+// question is whether the app REFUSES what real gear refuses, so these feed
+// impossible configuration through the CLI -- the same surface a user types at
+// -- and require a `%` rejection. Each line cites the real behaviour.
+function checkRejects(api) {
+  const bad = [];
+  const { state } = api;
+  state.racks.length = 0; state.devices.length = 0; state.cables.length = 0;
+  const rack = { id: api.uid(), x: 0, z: 0, y0: 0, rotY: 0, units: 42, mount: 'floor', name: 'R' };
+  state.racks.push(rack);
+  const sw = { id: api.uid(), type: 'c_c9300l48', name: 'SW1', rackId: rack.id, u: 10,
+    ip: '10.0.0.2/24', vlans: [{ id: 10, name: 'A' }], portCfg: {}, pvlan: {} };
+  state.devices.push(sw);
+  const sess = { dev: sw, mode: 'priv', name: 'SW1' };
+  const run = (cmd) => {
+    try {
+      const r = api.iosExec(sess, cmd);
+      const out = (r && r.out) || '';
+      // A configuration command that succeeds prints nothing at all. Any output
+      // is a diagnostic -- and not all of them start with '%': IOS answers a
+      // network address with a bare "Bad mask /24 for address 10.9.9.0".
+      return out.trim() ? out.replace(/\s+/g, ' ').trim() : null;
+    } catch (e) { return 'THREW ' + e.message; }
+  };
+  run('configure terminal');
+
+  const mustReject = [
+    ['vlan 4095', 'VLAN IDs stop at 4094'],
+    ['vlan 0', 'VLAN 0 is not assignable'],
+    ['no vlan 1', 'VLAN 1 exists by default and cannot be deleted'],
+    ['no vlan 1002', 'VLANs 1002-1005 are Cisco defaults and cannot be deleted'],
+    ['interface gi0/99', 'a 48-port switch has no port 99'],
+    ['interface vlan 5000', 'VLAN 5000 is out of range'],
+  ];
+  const mustRejectOnIf = [
+    ['ip address 10.9.9.0 255.255.255.0', 'that is the network address'],
+    ['ip address 10.9.9.255 255.255.255.0', 'that is the broadcast address'],
+    ['ip address 10.9.9.1 255.255.255.999', 'not a valid mask'],
+    ['switchport access vlan 4095', 'VLAN out of range'],
+    ['switchport access vlan 1002', 'a Token Ring/FDDI VLAN cannot carry Ethernet'],
+    ['switchport private-vlan host-association 10 999', '999 is not a secondary private VLAN'],
+  ];
+  // and things real gear ACCEPTS, so the gate cannot be passed by rejecting all
+  const mustAccept = [
+    ['vlan 1002', 'the reserved VLANs exist and are enterable on real IOS'],
+    ['vlan 20', 'an ordinary VLAN'],
+  ];
+
+  for (const [cmd, why] of mustReject) if (!run(cmd)) bad.push(`accepted "${cmd}" — ${why}`);
+  run('interface gi0/1');
+  for (const [cmd, why] of mustRejectOnIf) if (!run(cmd)) bad.push(`accepted "${cmd}" — ${why}`);
+  run('exit');
+  if (!run('spanning-tree vlan 10 priority 1000'))
+    bad.push('accepted "spanning-tree vlan 10 priority 1000" — 802.1t priority steps by 4096');
+  for (const [cmd, why] of mustAccept) {
+    const e = run(cmd);
+    if (e) bad.push(`rejected "${cmd}" — ${why} (${e})`);
+    run('exit');
+  }
+  return bad;
 }

@@ -3855,6 +3855,89 @@ function carriedVlans(dev, port) {
   if (portMode(dev, port) === 'trunk') for (const v of allowedVlans(dev, port)) s.add(v);
   return s;
 }
+//////////////////// Port isolation: protected ports and private VLANs ////////////////////
+// Two real features that both stop devices on the SAME VLAN from talking, which
+// no ACL can do -- a router ACL never sees intra-VLAN traffic.
+//
+// PROTECTED PORTS (Cisco "switchport protected", also called PVLAN edge):
+//   No traffic of any kind is forwarded between two protected ports on the same
+//   switch. Protected-to-unprotected is unaffected. It is strictly LOCAL to one
+//   switch and is not carried over a trunk, so two protected ports on different
+//   switches can still reach each other -- a real and frequently-missed caveat.
+//
+// PRIVATE VLANs (RFC 5517):
+//   A primary VLAN with secondary VLANs under it. An ISOLATED secondary lets its
+//   ports talk to promiscuous ports only -- never to each other. A COMMUNITY
+//   secondary lets its ports talk to each other and to promiscuous ports, but
+//   not to another community or to isolated ports. A promiscuous port (normally
+//   the gateway) talks to everything it maps.
+//   One isolated secondary per primary; any number of communities.
+const PVLAN_KINDS = { primary: 'primary', isolated: 'isolated', community: 'community' };
+
+// The private-VLAN table on a switch: { <vlanId>: { type, assoc: [secondaryIds] } }
+function pvlanDefs(dev) { return (dev && dev.pvlan) || {}; }
+function pvlanKind(dev, v) {
+  const d = pvlanDefs(dev)[v];
+  return d ? d.type : null;
+}
+
+// What a port is, for isolation purposes.
+function portIsolation(dev, port) {
+  const pc = (dev.portCfg && dev.portCfg[port]) || {};
+  const mode = pc.pvMode === 'promiscuous' ? 'promiscuous'
+             : pc.pvMode === 'host' ? 'host' : 'none';
+  const secondary = mode === 'host' && pc.pvSecondary !== undefined && pc.pvSecondary !== ''
+    ? +pc.pvSecondary : null;
+  return {
+    protected: !!pc.protected,
+    mode, secondary,
+    kind: secondary !== null ? pvlanKind(dev, secondary) : null,
+    trunk: portMode(dev, port) === 'trunk',
+  };
+}
+
+// May this switch forward a frame that arrived on `inPort` out of `outPort`?
+// `sec` is the secondary VLAN the frame is travelling in, carried across trunks
+// so isolation survives the hop to the next switch -- which is how a real
+// private VLAN keeps working when the secondaries are trunked between switches.
+// Returns { ok } or { ok:false, why } naming the rule, so a failed ping can say
+// what stopped it instead of "no path".
+function isolationAllows(dev, inPort, outPort, sec) {
+  const a = portIsolation(dev, inPort), b = portIsolation(dev, outPort);
+  // switch-local, and it beats everything else
+  if (a.protected && b.protected) {
+    return { ok: false, why: `both ports are protected on ${dev.name} — a protected port never forwards to another protected port on the same switch` };
+  }
+  // the secondary the frame is in: an access/host port stamps it, a trunk carries it
+  const inSec = a.mode === 'host' ? a.secondary : (a.trunk ? (sec === undefined ? null : sec) : null);
+  if (inSec === null || inSec === undefined) return { ok: true, sec: null };
+  const inKind = pvlanKind(dev, inSec);
+  if (!inKind || inKind === PVLAN_KINDS.primary) return { ok: true, sec: inSec };
+  // promiscuous ports and trunks are always a valid exit
+  if (b.mode === 'promiscuous' || b.trunk) return { ok: true, sec: inSec };
+  if (b.mode === 'host') {
+    if (inKind === PVLAN_KINDS.isolated) {
+      return { ok: false, why: `VLAN ${inSec} is an isolated private VLAN on ${dev.name} — its ports reach promiscuous ports only, never each other` };
+    }
+    if (inKind === PVLAN_KINDS.community) {
+      if (b.secondary === inSec) return { ok: true, sec: inSec };
+      return { ok: false, why: `${dev.name} port ${outPort} is in private VLAN ${b.secondary === null ? 'none' : b.secondary}, not community ${inSec}` };
+    }
+  }
+  return { ok: true, sec: inSec };
+}
+
+// Cisco creates VLAN 1 and VLANs 1002-1005 on every switch and will not let you
+// delete them. 1002-1005 are the Token Ring and FDDI defaults -- they exist for
+// media this simulator does not model, and they cannot carry Ethernet, so they
+// must never be assignable to an Ethernet access port.
+const RESERVED_VLAN_NAMES = {
+  1002: 'fddi-default', 1003: 'token-ring-default',
+  1004: 'fddinet-default', 1005: 'trnet-default',
+};
+function isReservedVlan(id) { return id >= 1002 && id <= 1005; }
+function vlanDefaultName(id) { return RESERVED_VLAN_NAMES[id] || `VLAN${String(id).padStart(4, '0')}`; }
+
 function portCarries(dev, port, v) {
   const c = carriedVlans(dev, port);
   return c === 'ALL' || c.has(v);
@@ -4815,15 +4898,16 @@ function l2Walk(startDev, opts = {}) {
   // demonstrably arrived. A switch whose port admits the VLAN answers ARP for
   // its own management address, so reaching the device IS reaching that address.
   const reachedDevs = new Set();
+  const isolationBlocks = [];        // why a port isolation rule dropped the frame
   const prev = new Map();                                     // "devId:port:side" -> previous key
   const seen = new Set();
   const start = hopThroughPatches(startDev, fromPort, FRONT);
-  if (!start) return { hosts: reachedHosts, routers: reachedRouters, devs: reachedDevs, prev, start: null };
+  if (!start) return { hosts: reachedHosts, routers: reachedRouters, devs: reachedDevs, prev, start: null, isolationBlocks };
   // The first hop is a cable too. Checking length only when spreading from a
   // switch missed the most common case of all — an over-length drop cable on
   // the host itself, which passed as if it were fine.
   if (!opts.ignoreLength && start.cable && (start.cable.lengthIn || 0) / 12 > COPPER_LIMIT_FT) {
-    return { hosts: reachedHosts, routers: reachedRouters, devs: reachedDevs, prev, start: null, overLength: true };
+    return { hosts: reachedHosts, routers: reachedRouters, devs: reachedDevs, prev, start: null, overLength: true, isolationBlocks };
   }
   const startKey = `${start.dev.id}:${start.port}:${start.side}`;
   const q = [{ dev: start.dev, port: start.port, side: start.side, key: startKey }];
@@ -4865,16 +4949,24 @@ function l2Walk(startDev, opts = {}) {
         if (q2 === cur.port) continue;
         if (!opts.ignoreVlan && vlan !== undefined && !portCarries(cur.dev, q2, vlan)) continue;
         if (!opts.ignoreStp && cls === 'switch' && stpBlocked(cur.dev.id, q2, vlan)) continue;
+        // Protected ports and private VLANs stop traffic between ports that are
+        // on the SAME VLAN, which is the one thing an ACL can never do.
+        let carry = cur.sec;
+        if (!opts.ignoreIsolation && cls === 'switch') {
+          const iso = isolationAllows(cur.dev, cur.port, q2, cur.sec);
+          if (!iso.ok) { isolationBlocks.push(iso.why); continue; }
+          carry = iso.sec;
+        }
         const nb = hopThroughPatches(cur.dev, q2, FRONT);
         if (!nb) continue;
         if (!opts.ignoreLength && ((nb.cable && (nb.cable.lengthIn || 0) / 12) > COPPER_LIMIT_FT)) continue;
         const k = `${nb.dev.id}:${nb.port}:${nb.side}`;
         if (!prev.has(k)) prev.set(k, cur.key);
-        q.push({ dev: nb.dev, port: nb.port, side: nb.side, key: k });
+        q.push({ dev: nb.dev, port: nb.port, side: nb.side, key: k, sec: carry });
       }
     }
   }
-  return { hosts: reachedHosts, routers: reachedRouters, devs: reachedDevs, prev, start };
+  return { hosts: reachedHosts, routers: reachedRouters, devs: reachedDevs, prev, start, isolationBlocks };
 }
 
 
@@ -6223,6 +6315,18 @@ function l2Reachable(a, b, srcPort, dstPort) {
   // relax length: a too-long copper run is the only thing stopping it?
   if (got(walk({ vlan: v, ignoreLength: true })))
     return { ok: false, reason: `a cable on the path exceeds the ${COPPER_LIMIT_FT} ft copper limit`, routers: strict.routers };
+  // relax isolation: same VLAN and physically fine, but a protected port or a
+  // private VLAN is deliberately keeping these two apart. That is a configured
+  // decision, not a fault, so it has to be named rather than reported as "no
+  // path" — an installer chasing a dead camera needs to know it was policy.
+  const noIso = walk({ vlan: v, ignoreIsolation: true });
+  if (got(noIso)) {
+    const strictRun = l2Walk(a, { vlan: v, startPort: startPorts[0] });
+    const why = (strictRun.isolationBlocks && strictRun.isolationBlocks[0])
+      || (noIso.isolationBlocks && noIso.isolationBlocks[0])
+      || `port isolation on the path keeps ${a.name} and ${b.name} apart`;
+    return { ok: false, reason: why, routers: strict.routers };
+  }
   // relax VLAN: physically connected but on a different VLAN / trunk gap
   if (got(walk({ ignoreVlan: true, ignoreLength: true })))
     return { ok: false, reason: `VLAN mismatch — ${a.name} is on VLAN ${v}, ${b.name} is on VLAN ${hostVlan(b, dstPort)} (or a trunk between them doesn't carry it)`, routers: strict.routers };
@@ -10534,7 +10638,24 @@ function iosRunningConfig(dev) {
   const db = vlanDb(dev);
   const named = [...db.values()].filter(v => !v.builtin);
   if (named.length) {
-    for (const v of named) { L.push(`vlan ${v.id}`, ` name ${v.name}`); }
+    for (const v of named) {
+      const body = [` name ${v.name}`];
+      const pv = pvlanDefs(dev)[+v.id];
+      if (pv) {
+        body.push(` private-vlan ${pv.type}`);
+        if (pv.type === 'primary' && (pv.assoc || []).length)
+          body.push(` private-vlan association ${[...pv.assoc].sort((a, b) => a - b).join(',')}`);
+      }
+      L.push(`vlan ${v.id}`, ...body);
+    }
+    // a private VLAN declared without a name still has to appear
+    for (const [id, pv] of Object.entries(pvlanDefs(dev))) {
+      if (named.some(v => +v.id === +id)) continue;
+      const body = [` private-vlan ${pv.type}`];
+      if (pv.type === 'primary' && (pv.assoc || []).length)
+        body.push(` private-vlan association ${[...pv.assoc].sort((a, b) => a - b).join(',')}`);
+      L.push(`vlan ${id}`, ...body);
+    }
     L.push('!');
   }
   // DHCP
@@ -10571,7 +10692,17 @@ function iosRunningConfig(dev) {
         const al = allowedVlans(dev, p);
         if (al.size) body.push(` switchport trunk allowed vlan ${[...al].sort((a, b) => a - b).join(',')}`);
       } else if (cfg.vlan) {
-        body.push(' switchport mode access', ` switchport access vlan ${nativeVlanOf(dev, p)}`);
+        const pc0 = (dev.portCfg && dev.portCfg[p]) || {};
+        if (pc0.pvMode === 'host' && pc0.pvSecondary !== undefined) {
+          body.push(' switchport mode private-vlan host',
+            ` switchport private-vlan host-association ${pc0.pvPrimary} ${pc0.pvSecondary}`);
+        } else if (pc0.pvMode === 'promiscuous') {
+          body.push(' switchport mode private-vlan promiscuous',
+            ` switchport private-vlan mapping ${pc0.pvPrimary}${pc0.pvMap ? ' ' + pc0.pvMap : ''}`);
+        } else {
+          body.push(' switchport mode access', ` switchport access vlan ${nativeVlanOf(dev, p)}`);
+        }
+        if (pc0.protected) body.push(' switchport protected');
       }
     }
     if (cfg.speed) body.push(` speed ${cfg.speed < 1 ? Math.round(cfg.speed * 1000) : cfg.speed * 1000}`);
@@ -10786,8 +10917,15 @@ function iosApply(sess, line) {
       const id = +t[1];
       if (!id || id < 1 || id > 4094) return { err: 'invalid', idx: 1 };
       dev.vlans = dev.vlans || [];
-      if (no) { dev.vlans = dev.vlans.filter(v => +v.id !== id); commit(); return {}; }
-      if (!dev.vlans.some(v => +v.id === id)) dev.vlans.push({ id, name: `VLAN${id}` });
+      if (no) {
+        // VLAN 1 and the four Token Ring / FDDI VLANs exist by default on Cisco
+        // and cannot be removed. Letting them be deleted models a switch that
+        // does not exist.
+        if (id === 1) return { err: '% Default VLAN 1 may not be deleted.' };
+        if (isReservedVlan(id)) return { err: `% Default VLAN ${id} may not be deleted.` };
+        dev.vlans = dev.vlans.filter(v => +v.id !== id); commit(); return {};
+      }
+      if (!dev.vlans.some(v => +v.id === id)) dev.vlans.push({ id, name: vlanDefaultName(id) });
       sess.mode = 'vlan'; sess.vlan = id; commit(); return {};
     }
     if (head === 'ip' && match((t[1] || '').toLowerCase(), 'route')) {
@@ -10850,7 +10988,20 @@ function iosApply(sess, line) {
     if (head === 'ip' && match((t[1] || '').toLowerCase(), 'address')) {
       const ip = parseIp(t[2]), mask = t[3];
       if (!ip || !mask) return { err: 'incomplete' };
-      const addr = `${ipStr(ip.int)}/${maskToCidr(mask)}`;
+      const cidr = maskToCidr(mask);
+      // a mask has to be contiguous ones followed by zeros; 255.255.255.999 is
+      // not an address at all, let alone a mask
+      const mp = parseIp(mask);
+      if (!mp || cidr === null || cidr === undefined || !isFinite(cidr)) return { err: 'invalid', idx: 3 };
+      const mi = mp.int >>> 0;
+      if ((((~mi >>> 0) + 1) & (~mi >>> 0)) !== 0) return { err: 'invalid', idx: 3 };
+      // /31 (RFC 3021) and /32 have no network or broadcast address to collide with
+      if (cidr < 31) {
+        const net = (ip.int & mi) >>> 0, bcast = (net | (~mi >>> 0)) >>> 0;
+        if ((ip.int >>> 0) === net || (ip.int >>> 0) === bcast)
+          return { err: `Bad mask /${cidr} for address ${ipStr(ip.int)}` };
+      }
+      const addr = `${ipStr(ip.int)}/${cidr}`;
       if (isSvi) { dev.svi = dev.svi || {}; if (no) delete dev.svi[sess.iface.vlan]; else dev.svi[sess.iface.vlan] = addr; }
       else { const c = ensureCfg(); if (no) delete c.ip; else c.ip = addr; }
       commit(); return {};
@@ -10875,7 +11026,52 @@ function iosApply(sess, line) {
       const c = ensureCfg();
       const sub = (t[1] || '').toLowerCase();
       if (match(sub, 'mode')) { c.mode = (t[2] || '').toLowerCase(); if (c.mode === 'access') c.tagged = ''; commit(); return {}; }
-      if (match(sub, 'access') && match((t[2] || '').toLowerCase(), 'vlan')) { c.vlan = t[3]; c.mode = 'access'; commit(); return {}; }
+      if (match(sub, 'access') && match((t[2] || '').toLowerCase(), 'vlan')) {
+        const av = +t[3];
+        if (!(av >= 1 && av <= 4094)) return { err: 'invalid', idx: 3 };
+        if (isReservedVlan(av))
+          return { err: `% VLAN ${av} is a ${RESERVED_VLAN_NAMES[av]} VLAN and cannot be assigned to an Ethernet port.` };
+        c.vlan = t[3]; c.mode = 'access'; commit(); return {};
+      }
+      // switchport protected — PVLAN edge. Switch-local, no argument.
+      if (match(sub, 'protected')) {
+        if (no) delete c.protected; else c.protected = true;
+        commit(); return {};
+      }
+      // switchport mode private-vlan {host|promiscuous}
+      if (match(sub, 'mode') && match((t[2] || '').toLowerCase(), 'private-vlan')) {
+        const w = (t[3] || '').toLowerCase();
+        if (!match(w, 'host') && !match(w, 'promiscuous')) return { err: 'invalid', idx: 3 };
+        c.pvMode = match(w, 'host') ? 'host' : 'promiscuous';
+        commit(); return {};
+      }
+      if (match(sub, 'private-vlan')) {
+        const w = (t[2] || '').toLowerCase();
+        // switchport private-vlan host-association <primary> <secondary>
+        if (match(w, 'host-association')) {
+          if (no) { delete c.pvPrimary; delete c.pvSecondary; commit(); return {}; }
+          const pri = +t[3], sec = +t[4];
+          if (!(pri >= 1 && pri <= 4094) || !(sec >= 1 && sec <= 4094)) return { err: 'invalid', idx: 3 };
+          if (pvlanKind(dev, pri) !== 'primary') return { err: `% VLAN ${pri} is not a primary private VLAN` };
+          const kind = pvlanKind(dev, sec);
+          if (kind !== 'isolated' && kind !== 'community')
+            return { err: `% VLAN ${sec} is not an isolated or community private VLAN` };
+          c.pvMode = 'host'; c.pvPrimary = pri; c.pvSecondary = sec;
+          c.vlan = String(sec);           // the port lives in its secondary
+          commit(); return {};
+        }
+        // switchport private-vlan mapping <primary> <secondary-list>
+        if (match(w, 'mapping')) {
+          if (no) { delete c.pvMap; commit(); return {}; }
+          const pri = +t[3];
+          if (pvlanKind(dev, pri) !== 'primary') return { err: `% VLAN ${pri} is not a primary private VLAN` };
+          c.pvMode = 'promiscuous'; c.pvPrimary = pri;
+          c.pvMap = (t[4] || '').replace(/[^\d,\-]/g, '');
+          c.vlan = String(pri);
+          commit(); return {};
+        }
+        return { err: 'invalid', idx: 2 };
+      }
       if (match(sub, 'trunk')) {
         const w = (t[2] || '').toLowerCase();
         if (match(w, 'native')) { c.native = t[4]; c.mode = 'trunk'; commit(); return {}; }
@@ -10900,6 +11096,40 @@ function iosApply(sess, line) {
   // --- vlan / ospf / dhcp / acl sub-modes ---
   if (sess.mode === 'vlan') {
     if (match(head, 'name')) { const v = (dev.vlans || []).find(x => +x.id === sess.vlan); if (v) v.name = t[1]; commit(); return {}; }
+    // private-vlan {primary | isolated | community}
+    // private-vlan association [add|remove] <secondary-list>
+    if (match(head, 'private-vlan')) {
+      dev.pvlan = dev.pvlan || {};
+      const w = (t[1] || '').toLowerCase();
+      if (no && !w) { delete dev.pvlan[sess.vlan]; commit(); return {}; }
+      if (match(w, 'primary') || match(w, 'isolated') || match(w, 'community')) {
+        const type = match(w, 'primary') ? 'primary' : match(w, 'isolated') ? 'isolated' : 'community';
+        // A primary may have exactly one isolated secondary — that is the rule on
+        // real gear, and silently allowing two would model something unbuildable.
+        if (type === 'isolated') {
+          for (const [pv, d] of Object.entries(dev.pvlan)) {
+            if (d.type !== 'primary' || !(d.assoc || []).includes(sess.vlan)) continue;
+            const other = (d.assoc || []).find(x => x !== sess.vlan && pvlanKind(dev, x) === 'isolated');
+            if (other) return { err: `% Primary VLAN ${pv} already has isolated VLAN ${other}` };
+          }
+        }
+        dev.pvlan[sess.vlan] = { ...(dev.pvlan[sess.vlan] || {}), type, assoc: dev.pvlan[sess.vlan]?.assoc || [] };
+        commit(); return {};
+      }
+      if (match(w, 'association')) {
+        const d = dev.pvlan[sess.vlan];
+        if (!d || d.type !== 'primary') return { err: `% VLAN ${sess.vlan} is not a primary private VLAN` };
+        const listTok = t[t.length - 1] || '';
+        const list = listTok.split(',').map(x => +x).filter(x => x >= 1 && x <= 4094);
+        const bad = list.find(v => { const k = pvlanKind(dev, v); return k !== 'isolated' && k !== 'community'; });
+        if (bad !== undefined) return { err: `% VLAN ${bad} is not an isolated or community private VLAN` };
+        if (no || t.includes('remove')) d.assoc = (d.assoc || []).filter(v => !list.includes(v));
+        else if (t.includes('add')) d.assoc = [...new Set([...(d.assoc || []), ...list])];
+        else d.assoc = list;
+        commit(); return {};
+      }
+      return { err: 'invalid', idx: 1 };
+    }
     if (match(head, 'exit')) { sess.mode = 'config'; return {}; }
     return { err: 'invalid', idx: 0 };
   }
@@ -11010,6 +11240,10 @@ function iosResult(r, line) {
   if (r.err === 'incomplete') return { out: '% Incomplete command.' };
   if (r.err === 'ambiguous') return { out: '% Ambiguous command:  "' + line + '"' };
   if (r.err === 'invalid') return { out: iosInvalid(line, r.idx || 0) };
+  // Any other err is a specific message the parser wrote. Falling through to
+  // r.out swallowed it: the command was rejected internally and the user saw a
+  // blank line, which reads exactly like success.
+  if (r.err) return { out: String(r.err) };
   return { out: r.out || '' };
 }
 // Traceroute from the device's CLI, rendered from the same hop-by-hop
@@ -13775,6 +14009,41 @@ function buildDataCentre(opts = {}) {
   // been pulled — so rebuild them now rather than leaving a loaded tray
   // captioned "0 cables".
   for (const d of state.devices) if (netClass(d) === 'switch' && d.mgmtVlan === undefined) d.mgmtVlan = 10;
+
+  // ---- port isolation ----
+  // An ACL cannot separate two cameras: they are in one VLAN, so the router
+  // never sees the traffic. A compromised camera reaching every other camera is
+  // the standard way a surveillance network is pivoted through, and the real fix
+  // is a private VLAN. Cameras go in an isolated secondary of VLAN 50, so each
+  // one reaches the recorder and nothing else. Door readers get the same
+  // treatment on VLAN 60.
+  for (const d of state.devices) {
+    if (netClass(d) !== 'switch') continue;
+    d.pvlan = d.pvlan || {};
+    d.pvlan[50] = { type: 'primary', assoc: [501] };
+    d.pvlan[501] = { type: 'isolated', assoc: [] };
+    d.pvlan[60] = { type: 'primary', assoc: [601] };
+    d.pvlan[601] = { type: 'isolated', assoc: [] };
+    d.vlans = d.vlans || [];
+    for (const [id, nm] of [[501, 'CAMERA-ISO'], [601, 'ACCESS-ISO']])
+      if (!d.vlans.some(v => +v.id === id)) d.vlans.push({ id, name: nm });
+    for (const [port, pc] of Object.entries(d.portCfg || {})) {
+      const v = +pc.vlan;
+      if (v === 50) { pc.pvMode = 'host'; pc.pvPrimary = 50; pc.pvSecondary = 501; }
+      else if (v === 60) { pc.pvMode = 'host'; pc.pvPrimary = 60; pc.pvSecondary = 601; }
+    }
+  }
+  // The recorder and the door controller are the promiscuous ports — the one
+  // station in each isolated VLAN everything else is allowed to reach.
+  const promisc = (dev, port, primary, secondary) => {
+    if (!dev || !dev.portCfg || !dev.portCfg[port]) return;
+    const pc = dev.portCfg[port];
+    pc.pvMode = 'promiscuous'; pc.pvPrimary = primary; pc.pvMap = String(secondary);
+    delete pc.pvSecondary;
+  };
+  promisc(oob, 23, 50, 501);        // NVR
+  promisc(oob, 19, 60, 601);        // access hub
+
   for (const rw of state.raceways) rebuildRaceway(rw);
   return { racks: state.racks.length, devices: state.devices.length, cables: state.cables.length };
 }
