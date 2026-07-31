@@ -18915,7 +18915,7 @@ bmenuEl.addEventListener('mousedown', e => { if (e.target === bmenuEl) closeBuil
 const THEMES = {
   studio: {
     bg: 0xc7cfd8, fog: [0xc7cfd8, 620, 1900], hemi: [0xdae6ff, 0x9c9184, 0.7],
-    sun: [0xfff4e2, 2.6], rim: 0.5, exposure: 0.82,
+    sun: [0xfff4e2, 2.6], rim: 0.5, exposure: 0.95,
     floor: ['#c2c7ce', '#b3b9c1', '#a6acb5', 'rgba(38,44,54,0.42)'],
     gridC: [0x8d959f, 0xa2a9b3], wall: 0xe7e3dc, slab: 0xc2c6cc
   },
@@ -19271,8 +19271,8 @@ function buildDataCentre(opts = {}) {
     const w = { id: uid(), x1, z1, x2, z2, h: WALL_H, y0: 0, material, openings: openings || [] };
     state.walls.push(w); buildWall(w); return w;
   };
-  const slab = (x1, z1, x2, z2, material) => {
-    const sl = { id: uid(), x1, z1, x2, z2, y: 0, material };
+  const slab = (x1, z1, x2, z2, material, y) => {
+    const sl = { id: uid(), x1, z1, x2, z2, y: y || 0, material };
     state.slabs.push(sl); buildSlab(sl); return sl;
   };
   const svi = {}, pools = [];
@@ -19290,6 +19290,11 @@ function buildDataCentre(opts = {}) {
   // ---- the building: data hall, MDF, UPS room, and a mantrap vestibule ----
   const HALL_X = ROWS * 130 + 120, HALL_Z = PER_ROW * 46 + 120;
   slab(-HALL_X/2, -HALL_Z/2, HALL_X/2, HALL_Z/2, 'concrete');
+  // A data hall has a real deck overhead with continuous fixtures above the
+  // aisles. Without one the hall was lit by sky and sun only, which is exactly
+  // why every interior view measured dark and colourless -- interior light in
+  // this app hangs off the ceiling slab.
+  slab(-HALL_X/2, -HALL_Z/2, HALL_X/2, HALL_Z/2, 'concrete', WALL_H);
   // perimeter, with the only way in through the vestibule
   wall(-HALL_X/2, -HALL_Z/2,  HALL_X/2, -HALL_Z/2, 'concrete');
   wall(-HALL_X/2,  HALL_Z/2,  HALL_X/2,  HALL_Z/2, 'concrete');
