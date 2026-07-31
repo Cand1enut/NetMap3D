@@ -4624,7 +4624,7 @@ function deviceInterfaces(dev) {
   if ((cls === 'switch' || cls === 'router') && dev.ip && dev.ip !== 'dhcp') {
     const ip = parseIp(dev.ip);
     if (ip && !out.some(i => i.ip.int === ip.int)) {
-      out.push({ name: 'Management', mgmt: true, ip, kind: 'mgmt' });
+      out.push({ name: `Vlan${mgmtVlan(dev)}`, mgmt: true, ip, kind: 'mgmt', vlan: mgmtVlan(dev) });
     }
   }
   // An endpoint's addresses live on its NICs. dev.ip is only shorthand for the
@@ -4782,7 +4782,19 @@ function hopThroughPatches(dev, port, side) {
 }
 
 // The VLAN a host lives in = the access VLAN of the switch/router port it lands on.
+// A switch's management address lives IN a VLAN -- `interface Vlan10` on IOS,
+// "Management VLAN" in UniFi and Meraki. Real gear defaults it to VLAN 1, and so
+// does this. Without the concept a managed switch's own traffic was assumed to
+// be VLAN 1, which trunks carrying 10-70 correctly refuse to forward, so every
+// switch-to-switch management ping failed with a VLAN mismatch.
+function mgmtVlan(dev) {
+  const v = dev && dev.mgmtVlan !== undefined && dev.mgmtVlan !== '' ? +dev.mgmtVlan : NaN;
+  return (isFinite(v) && v >= 1 && v <= 4094) ? v : DEFAULT_VLAN;
+}
+
 function hostVlan(dev, port) {
+  // A switch sources from its management interface, not from an access port.
+  if (netClass(dev) === 'switch') return mgmtVlan(dev);
   const p = port === undefined ? hostPort(dev) : port;
   const n = hopThroughPatches(dev, p, FRONT);
   return n ? accessVlanOf(n.dev, n.port) : accessVlanOf(dev, p);
@@ -6184,13 +6196,35 @@ function stpVlans() {
 // Layer-2 reachable? Plus the reason it isn't, discovered by relaxing rules.
 function l2Reachable(a, b, srcPort, dstPort) {
   const v = hostVlan(a, srcPort);
-  const strict = l2Walk(a, { vlan: v, startPort: srcPort });
-  if (strict.hosts.has(b.id)) return { ok: true, routers: strict.routers };
+  // The destination may be a switch answering on its own management address, so
+  // asking only "is it in reachedHosts" declared a perfectly good path dead --
+  // switches are not hosts. `devs` is every device the frame actually reached.
+  const got = (w) => w.hosts.has(b.id) || (w.devs && w.devs.has(b.id));
+  // A switch has no "host port" to source from. Its management traffic leaves by
+  // whichever port leads to the destination, so every data port is a candidate —
+  // starting only at port 1 reported a live switch-to-switch path as "no
+  // physical cable path", which is the most common management ping there is.
+  const def = DEVICE_TYPES[a.type] || {};
+  const startPorts = netClass(a) === 'switch'
+    ? Array.from({ length: def.ports || 1 }, (_, i) => i + 1)
+        .filter(p => portRole(def, p) !== 'PWR')
+    : [srcPort];
+  const walk = (opts) => {
+    let last = null;
+    for (const p of startPorts) {
+      const w = l2Walk(a, { startPort: p, ...opts });
+      last = w;
+      if (got(w)) return w;
+    }
+    return last;
+  };
+  const strict = walk({ vlan: v });
+  if (got(strict)) return { ok: true, routers: strict.routers };
   // relax length: a too-long copper run is the only thing stopping it?
-  if (l2Walk(a, { vlan: v, startPort: srcPort, ignoreLength: true }).hosts.has(b.id))
+  if (got(walk({ vlan: v, ignoreLength: true })))
     return { ok: false, reason: `a cable on the path exceeds the ${COPPER_LIMIT_FT} ft copper limit`, routers: strict.routers };
   // relax VLAN: physically connected but on a different VLAN / trunk gap
-  if (l2Walk(a, { startPort: srcPort, ignoreVlan: true, ignoreLength: true }).hosts.has(b.id))
+  if (got(walk({ ignoreVlan: true, ignoreLength: true })))
     return { ok: false, reason: `VLAN mismatch — ${a.name} is on VLAN ${v}, ${b.name} is on VLAN ${hostVlan(b, dstPort)} (or a trunk between them doesn't carry it)`, routers: strict.routers };
   return { ok: false, reason: 'no physical cable path between them', routers: strict.routers };
 }
@@ -11058,7 +11092,18 @@ function deviceReach(srcDev, dstInt) {
 function iosPing(dev, target) {
   const ip = parseIp(target);
   if (!ip) return `% Unrecognized host or address, or protocol not running.`;
-  const r = deviceReach(dev, ip.int);
+  // Use the packet engine whenever the target is a device we know. deviceReach
+  // only asks whether a path EXISTS -- it never consults an ACL -- so the CLI
+  // was reporting "Success rate is 100 percent" for traffic the firewall drops.
+  // A simulated switch that lies about a blocked path is worse than no switch.
+  let r;
+  const owner = deviceHoldingAddr(ip.int);
+  if (owner && owner.dev.id !== dev.id) {
+    const p = pingHosts(dev.id, owner.dev.id);
+    r = { ok: !!p.ok, why: p.reason || p.why || null };
+  } else {
+    r = deviceReach(dev, ip.int);
+  }
   return `Type escape sequence to abort.\nSending 5, 100-byte ICMP Echos to ${target}, timeout is 2 seconds:\n` +
     (r.ok ? '!!!!!\nSuccess rate is 100 percent (5/5), round-trip min/avg/max = 1/1/2 ms'
           : `.....\nSuccess rate is 0 percent (0/5)${r.why ? '\n% ' + r.why : ''}`);
@@ -13518,6 +13563,12 @@ function buildDataCentre(opts = {}) {
   const mdfUps = inRack(mdf, 'ups', 1, { name: 'UPS-MDF' });
   for (const [d, o] of [[edgeA,1],[edgeB,2],[coreA,3],[coreB,7],[oob,4],[nvr,5],[acHub,6]]) link(d, 'PWR', mdfUps, o, 0xe5534b);
 
+  // Every managed box in the hall keeps its address in MGMT-OOB (VLAN 10), the
+  // same as `interface Vlan10` on the real switches. Left at the VLAN 1 default
+  // the trunks -- which carry 10 through 70 -- would refuse to forward their
+  // management traffic, exactly as real trunks do.
+  for (const d of state.devices) if (netClass(d) === 'switch') d.mgmtVlan = 10;
+
   // ---- overhead ladder rack ----
   // TIA-942 practice: no copper crosses a data hall unsupported. Every cabinet
   // waterfalls onto a runway above its own row; the runways are tied together by
@@ -13723,6 +13774,7 @@ function buildDataCentre(opts = {}) {
   // The runway labels report fill, and fill is only known once every run has
   // been pulled — so rebuild them now rather than leaving a loaded tray
   // captioned "0 cables".
+  for (const d of state.devices) if (netClass(d) === 'switch' && d.mgmtVlan === undefined) d.mgmtVlan = 10;
   for (const rw of state.raceways) rebuildRaceway(rw);
   return { racks: state.racks.length, devices: state.devices.length, cables: state.cables.length };
 }
