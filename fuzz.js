@@ -655,19 +655,39 @@ function checkRejects(api) {
     ['no vlan 1002', 'VLANs 1002-1005 are Cisco defaults and cannot be deleted'],
     ['interface gi0/99', 'a 48-port switch has no port 99'],
     ['interface vlan 5000', 'VLAN 5000 is out of range'],
+    ['ip route 10.0.0.0 255.0.0.0', 'no next hop given'],
+    ['ip route 10.0.0.0 255.255.255.999 10.0.0.1', 'not a valid mask'],
+    ['spanning-tree vlan 4095 priority 4096', 'VLAN out of range'],
+    ['spanning-tree vlan 10 priority 61441', 'priority tops out at 61440'],
+    ['spanning-tree vlan 10 priority -4096', 'priority cannot be negative'],
   ];
   const mustRejectOnIf = [
     ['ip address 10.9.9.0 255.255.255.0', 'that is the network address'],
     ['ip address 10.9.9.255 255.255.255.0', 'that is the broadcast address'],
     ['ip address 10.9.9.1 255.255.255.999', 'not a valid mask'],
+    ['ip address 10.9.9.1 255.0.255.0', 'a mask must be contiguous ones then zeros'],
     ['switchport access vlan 4095', 'VLAN out of range'],
     ['switchport access vlan 1002', 'a Token Ring/FDDI VLAN cannot carry Ethernet'],
     ['switchport private-vlan host-association 10 999', '999 is not a secondary private VLAN'],
+    ['switchport trunk native vlan 4095', 'VLAN out of range'],
+    ['switchport trunk allowed vlan 4095', 'VLAN out of range'],
+    ['speed 40', 'not a speed this interface supports'],
+    ['duplex banana', 'duplex is auto, full or half'],
   ];
   // and things real gear ACCEPTS, so the gate cannot be passed by rejecting all
   const mustAccept = [
     ['vlan 1002', 'the reserved VLANs exist and are enterable on real IOS'],
     ['vlan 20', 'an ordinary VLAN'],
+    ['vlan 4094', 'the top of the range is valid'],
+  ];
+  const mustAcceptOnIf = [
+    ['ip address 10.9.9.1 255.255.255.0', 'an ordinary host address'],
+    ['ip address 10.9.9.0 255.255.255.254', '/31 has no network address — RFC 3021'],
+    ['ip address 10.9.9.1 255.255.255.255', 'a /32 host address'],
+    ['switchport access vlan 20', 'an ordinary access VLAN'],
+    ['switchport trunk allowed vlan 10,20,30', 'an ordinary allowed list'],
+    ['speed auto', 'autonegotiation'],
+    ['duplex full', 'a real duplex setting'],
   ];
 
   for (const [cmd, why] of mustReject) if (!run(cmd)) bad.push(`accepted "${cmd}" — ${why}`);
@@ -681,5 +701,11 @@ function checkRejects(api) {
     if (e) bad.push(`rejected "${cmd}" — ${why} (${e})`);
     run('exit');
   }
+  run('interface gi0/2');
+  for (const [cmd, why] of mustAcceptOnIf) {
+    const e = run(cmd);
+    if (e) bad.push(`rejected "${cmd}" — ${why} (${e})`);
+  }
+  run('exit');
   return bad;
 }

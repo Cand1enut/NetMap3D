@@ -9813,6 +9813,19 @@ const RESERVED_VLAN_NAMES = {
   1004: 'fddinet-default', 1005: 'trnet-default',
 };
 function isReservedVlan(id) { return id >= 1002 && id <= 1005; }
+// A subnet mask is contiguous ones followed by contiguous zeros. 255.0.255.0
+// parses as an address but is not a mask, and real gear refuses it.
+function validMask(str) {
+  const m = parseIp(str);
+  if (!m) return null;
+  const mi = m.int >>> 0, host = (~mi) >>> 0;
+  if (((host + 1) & host) !== 0) return null;
+  return maskToCidr(str);
+}
+// IEEE 802.3 rates an Ethernet port can be forced to. Anything else is not a
+// speed, it is a typo.
+const ETH_SPEEDS = [10, 100, 1000, 2500, 5000, 10000, 25000, 40000, 100000];
+function vlanIdOk(v) { return Number.isInteger(v) && v >= 1 && v <= 4094; }
 function vlanDefaultName(id) { return RESERVED_VLAN_NAMES[id] || `VLAN${String(id).padStart(4, '0')}`; }
 
 function portCarries(dev, port, v) {
@@ -16808,7 +16821,9 @@ function iosApply(sess, line) {
     if (head === 'ip' && match((t[1] || '').toLowerCase(), 'route')) {
       const net = parseIp(t[2]), mask = t[3], via = t[4];
       if (!net || !mask || !via) return { err: 'incomplete' };
-      const cidr = maskToCidr(mask);
+      const cidr = validMask(mask);
+      if (cidr === null || cidr === undefined) return { err: 'invalid', idx: 3 };
+      if (!parseIp(via)) return { err: 'invalid', idx: 4 };
       dev.routes = dev.routes || [];
       const prefix = `${ipStr(net.network)}/${cidr}`;
       dev.routes = dev.routes.filter(r => r.prefix !== prefix || (t[5] && +r.ad !== +t[5]));
@@ -16865,13 +16880,9 @@ function iosApply(sess, line) {
     if (head === 'ip' && match((t[1] || '').toLowerCase(), 'address')) {
       const ip = parseIp(t[2]), mask = t[3];
       if (!ip || !mask) return { err: 'incomplete' };
-      const cidr = maskToCidr(mask);
-      // a mask has to be contiguous ones followed by zeros; 255.255.255.999 is
-      // not an address at all, let alone a mask
-      const mp = parseIp(mask);
-      if (!mp || cidr === null || cidr === undefined || !isFinite(cidr)) return { err: 'invalid', idx: 3 };
-      const mi = mp.int >>> 0;
-      if ((((~mi >>> 0) + 1) & (~mi >>> 0)) !== 0) return { err: 'invalid', idx: 3 };
+      const cidr = validMask(mask);
+      if (cidr === null || cidr === undefined) return { err: 'invalid', idx: 3 };
+      const mi = parseIp(mask).int >>> 0;
       // /31 (RFC 3021) and /32 have no network or broadcast address to collide with
       if (cidr < 31) {
         const net = (ip.int & mi) >>> 0, bcast = (net | (~mi >>> 0)) >>> 0;
@@ -16951,8 +16962,18 @@ function iosApply(sess, line) {
       }
       if (match(sub, 'trunk')) {
         const w = (t[2] || '').toLowerCase();
-        if (match(w, 'native')) { c.native = t[4]; c.mode = 'trunk'; commit(); return {}; }
+        if (match(w, 'native')) {
+          const nv = +t[4];
+          if (!vlanIdOk(nv)) return { err: 'invalid', idx: 4 };
+          c.native = t[4]; c.mode = 'trunk'; commit(); return {};
+        }
         if (match(w, 'allowed')) {
+          const listCheck = (t[t.length - 1] || '').replace(/[^\d,\-]/g, '');
+          for (const part of listCheck.split(',').filter(Boolean)) {
+            for (const n of part.split('-').filter(Boolean)) {
+              if (!vlanIdOk(+n)) return { err: 'invalid', idx: t.length - 1 };
+            }
+          }
           c.mode = 'trunk';
           const vlans = t.slice(t.indexOf(t.find(x => /^\d/.test(x))) ).join('').replace(/[^\d,]/g, '');
           const list = (t[t.length - 1] || '').replace(/[^\d,]/g, '');
@@ -16963,8 +16984,20 @@ function iosApply(sess, line) {
       }
       return { err: 'invalid', idx: 1 };
     }
-    if (match(head, 'speed')) { ensureCfg().speed = t[1] === 'auto' ? '' : (+t[1] || 1000) / 1000; commit(); return {}; }
-    if (match(head, 'duplex')) { ensureCfg().duplex = t[1] === 'auto' ? '' : t[1]; commit(); return {}; }
+    if (match(head, 'speed')) {
+      const w = (t[1] || '').toLowerCase();
+      if (!w) return { err: 'incomplete' };
+      if (w !== 'auto' && !ETH_SPEEDS.includes(+w)) return { err: 'invalid', idx: 1 };
+      ensureCfg().speed = w === 'auto' ? '' : +w / 1000;
+      commit(); return {};
+    }
+    if (match(head, 'duplex')) {
+      const w = (t[1] || '').toLowerCase();
+      if (!w) return { err: 'incomplete' };
+      if (!['auto', 'full', 'half'].includes(w)) return { err: 'invalid', idx: 1 };
+      ensureCfg().duplex = w === 'auto' ? '' : w;
+      commit(); return {};
+    }
     if (head === 'spanning-tree' && match((t[1] || '').toLowerCase(), 'portfast')) { ensureCfg().portfast = !no; commit(); return {}; }
     if (match(head, 'description')) { ensureCfg().description = t.slice(1).join(' '); return {}; }
     return { err: 'invalid', idx: 0 };

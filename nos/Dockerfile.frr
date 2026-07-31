@@ -1,0 +1,45 @@
+# A real switch/router: FRRouting on Ubuntu Server.
+#
+# Built from ubuntu rather than pulled from frrouting/frr because that image is
+# amd64-only, and this has to build natively on Apple Silicon here AND on x86
+# Ubuntu Server in the homelab. Same Dockerfile, right architecture either way.
+FROM ubuntu:24.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# frr        — zebra, ospfd, bgpd, isisd, ripd, staticd, the real daemons
+# frr-pythontools — frr-reload, so config can be applied without a restart
+# iproute2   — ip link/addr/route, netns, veth: the actual dataplane plumbing
+# the rest   — what you reach for on a switch you have just SSH'd into
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        frr frr-pythontools \
+        iproute2 iputils-ping traceroute tcpdump iperf3 \
+        bridge-utils ethtool net-tools mtr-tiny dnsutils \
+        ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# Turn on the daemons NetMap3D drives. FRR ships with everything off.
+RUN sed -i \
+      -e 's/^zebra=no/zebra=yes/' \
+      -e 's/^ospfd=no/ospfd=yes/' \
+      -e 's/^ospf6d=no/ospf6d=yes/' \
+      -e 's/^bgpd=no/bgpd=yes/' \
+      -e 's/^isisd=no/isisd=yes/' \
+      -e 's/^ripd=no/ripd=yes/' \
+      -e 's/^staticd=no/staticd=yes/' \
+      -e 's/^pimd=no/pimd=yes/' \
+      -e 's/^vrrpd=no/vrrpd=yes/' \
+      /etc/frr/daemons
+
+# vtysh talks to every daemon at once, which is what makes it feel like one CLI
+RUN printf 'service integrated-vtysh-config\n' > /etc/frr/vtysh.conf \
+    && touch /etc/frr/frr.conf && chown frr:frr /etc/frr/frr.conf
+
+# Forwarding is the entire point of the box.
+RUN printf 'net.ipv4.ip_forward=1\nnet.ipv6.conf.all.forwarding=1\n' \
+      > /etc/sysctl.d/99-routing.conf
+
+COPY entrypoint.sh /usr/local/bin/netmap3d-entrypoint
+RUN chmod +x /usr/local/bin/netmap3d-entrypoint
+
+CMD ["/usr/local/bin/netmap3d-entrypoint"]

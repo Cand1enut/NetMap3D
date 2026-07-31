@@ -1,0 +1,35 @@
+# Recommended on a homelab box: run NetMap3D directly on the host, so the docker
+# socket is never handed to a container.
+#
+#   sudo cp deploy/netmap3d.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now netmap3d
+#   journalctl -u netmap3d -f
+[Unit]
+Description=NetMap3D — 3D network design and simulation
+Documentation=https://github.com/Cand1enut/NetMap3D
+After=network-online.target docker.service
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=simple
+WorkingDirectory=/srv/netmap3d
+ExecStart=/usr/bin/node server/server.js
+Environment=PORT=8080
+Environment=HOST=0.0.0.0
+# real FRR instances; needs docker group membership below
+Environment=NETMAP3D_NOS=1
+# The manager runs `ip` on the host to move veths between namespaces, and talks
+# to docker. Both need privilege — this is the reason it is a system service.
+User=root
+Restart=on-failure
+RestartSec=3
+
+# Keep the blast radius small even though it runs as root.
+NoNewPrivileges=false
+ProtectHome=read-only
+ProtectSystem=full
+ReadWritePaths=/srv/netmap3d /var/run/netns /var/run/docker.sock
+
+[Install]
+WantedBy=multi-user.target
