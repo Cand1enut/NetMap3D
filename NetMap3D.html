@@ -13743,7 +13743,128 @@ renderer.domElement.addEventListener('pointerup', e => {
   handleClick();
 });
 
+//////////////////// Doors ////////////////////
+// A door on a security plan is not decoration. It is either open or it is not,
+// it is either locked or it is not, and a mantrap is two doors that are
+// electrically forbidden from being open at the same time. Modelling that is
+// what makes a badge reader mean something.
+
+const DOOR_SWING_RATE = 2.2;              // radians-ish per second, ~0.7 s to swing
+const _doorAnim = new Map();              // "wallId:openingId" -> current 0..1
+
+function doorKey(wallId, openingId) { return `${wallId}:${openingId}`; }
+
+function eachDoor(fn) {
+  for (const w of state.walls || []) {
+    for (const o of w.openings || []) {
+      if (o.kind === 'door' || o.kind === 'storefront') fn(w, o);
+    }
+  }
+}
+
+function findDoor(wallId, openingId) {
+  const w = (state.walls || []).find(x => x.id === wallId);
+  const o = w && (w.openings || []).find(x => x.id === openingId);
+  return o ? { wall: w, opening: o } : null;
+}
+
+// Two doors in the same interlock group cannot both be open. That is a mantrap:
+// the outer door has to shut before the inner one will release.
+function interlockBlocks(wall, opening) {
+  const grp = opening.interlock;
+  if (!grp) return null;
+  let blocker = null;
+  eachDoor((w2, o2) => {
+    if (blocker || o2.id === opening.id || o2.interlock !== grp) return;
+    const cur = _doorAnim.get(doorKey(w2.id, o2.id));
+    if ((cur !== undefined ? cur : (o2.open || 0)) > 0.02 || o2.wantOpen) blocker = o2;
+  });
+  return blocker;
+}
+
+// Returns why it refused, or null when it opened.
+function setDoorOpen(wallId, openingId, want) {
+  const hit = findDoor(wallId, openingId);
+  if (!hit) return 'no such door';
+  const { wall, opening } = hit;
+  if (want) {
+    if (opening.locked) return `${opening.label || 'This door'} is locked — badge in to release it`;
+    const b = interlockBlocks(wall, opening);
+    if (b) return `Interlocked: ${b.label || 'the other door'} must close first`;
+  }
+  opening.wantOpen = !!want;
+  return null;
+}
+
+function toggleDoor(wallId, openingId) {
+  const hit = findDoor(wallId, openingId);
+  if (!hit) return;
+  const cur = _doorAnim.get(doorKey(wallId, openingId));
+  const isOpen = (cur !== undefined ? cur : (hit.opening.open || 0)) > 0.5;
+  const why = setDoorOpen(wallId, openingId, !isOpen);
+  setStatus(why || `${hit.opening.label || 'Door'} ${!isOpen ? 'opening' : 'closing'}.`);
+}
+
+// Ease every door toward what it has been told to do, and rotate the leaf that
+// is already in the scene rather than rebuilding the wall — a door that
+// rebuilds geometry every frame would be unusable.
+function animateDoors(dt) {
+  if (HEADLESS) return;
+  let any = false;
+  eachDoor((w, o) => {
+    const key = doorKey(w.id, o.id);
+    const target = o.wantOpen ? 1 : 0;
+    let cur = _doorAnim.has(key) ? _doorAnim.get(key) : (o.open || 0);
+    if (Math.abs(cur - target) < 0.001) { _doorAnim.set(key, target); return; }
+    const step = DOOR_SWING_RATE * dt;
+    cur = cur < target ? Math.min(target, cur + step) : Math.max(target, cur - step);
+    _doorAnim.set(key, cur);
+    o.open = cur;
+    any = true;
+    const g = wallMeshes.get(w.id);
+    if (!g) return;
+    g.traverse(obj => {
+      if (obj.userData && obj.userData.isDoorLeaf && obj.userData.openingId === o.id) {
+        obj.rotation.y = -cur * Math.PI * 0.5;
+      }
+    });
+  });
+  if (any) markShadowsDirty();
+}
+
+// In walk mode a door you push against opens by itself, the way one does when
+// you have a badge. Locked ones do not, and say so.
+let _doorNagAt = 0;
+function autoDoorsForWalker() {
+  if (!walkActive) return;
+  const p = camera.position;
+  eachDoor((w, o) => {
+    const std = OPENING_SIZES[o.kind] || OPENING_SIZES.door;
+    const len = Math.hypot(w.x2 - w.x1, w.z2 - w.z1) || 1;
+    const t = (o.at !== undefined ? o.at : 0.5);
+    const dx = (w.x2 - w.x1) / len, dz = (w.z2 - w.z1) / len;
+    const cx = w.x1 + dx * len * t, cz = w.z1 + dz * len * t;
+    const near = Math.hypot(p.x - cx, p.z - cz) < (o.w || std.w) * 0.9 + 26;
+    if (near && !o.wantOpen) {
+      const why = setDoorOpen(w.id, o.id, true);
+      if (why && performance.now() - _doorNagAt > 2500) { setStatus(why); _doorNagAt = performance.now(); }
+    } else if (!near && o.wantOpen && o.autoClose !== false) {
+      setDoorOpen(w.id, o.id, false);
+    }
+  });
+}
+
 function handleClick() {
+  // A door is a thing you operate. Clicking one should work it, not select the
+  // wall behind it — so it is picked before anything else.
+  if (mode === 'select') {
+    const hits = raycaster.intersectObjects([...wallMeshes.values()], true);
+    for (const h of hits) {
+      let o = h.object;
+      while (o && !(o.userData && o.userData.isDoorLeaf)) o = o.parent;
+      if (o) { toggleDoor(o.userData.wallId, o.userData.openingId); return; }
+    }
+  }
   if (mode === 'place' && pendingType) {
     if (!hoverInfo) return;
     undoPush();
@@ -20061,9 +20182,16 @@ function buildDataCentre(opts = {}) {
   wall( HALL_X/2, -HALL_Z/2,  HALL_X/2,  HALL_Z/2, 'concrete');
   // MANTRAP: two doors in series, an airlock — you badge in, the outer door must
   // close before the inner opens. Both leaves are real openings.
+  // Both leaves share an interlock group, which is what actually makes it a
+  // mantrap: the engine refuses to open one while the other is off its seat.
+  // Both are locked, so they only release when a badge is presented.
   const vestZ = -HALL_Z/2;
-  wall(-60, vestZ - 90,  60, vestZ - 90, 'concrete', [{ id: uid(), kind: 'door', at: 0.5 }]);   // outer
-  wall(-60, vestZ,       60, vestZ,      'concrete', [{ id: uid(), kind: 'door', at: 0.5 }]);   // inner
+  wall(-60, vestZ - 90,  60, vestZ - 90, 'concrete',
+    [{ id: uid(), kind: 'door', at: 0.5, label: 'Vestibule outer door',
+       locked: true, interlock: 'mantrap-1', reader: 'RDR-OUTER' }]);
+  wall(-60, vestZ,       60, vestZ,      'concrete',
+    [{ id: uid(), kind: 'door', at: 0.5, label: 'Vestibule inner door',
+       locked: true, interlock: 'mantrap-1', reader: 'RDR-INNER' }]);
   wall(-60, vestZ - 90, -60, vestZ,      'concrete');
   wall( 60, vestZ - 90,  60, vestZ,      'concrete');
   slab(-60, vestZ - 90, 60, vestZ, 'vct');
@@ -20444,6 +20572,8 @@ const frameTimer = new THREE.Timer();
   frameTimer.update();
   const dt = Math.min(frameTimer.getDelta(), 0.1);
   updateDeviceLOD();
+  autoDoorsForWalker();
+  animateDoors(dt);
   if (_shadowDirty) { renderer.shadowMap.needsUpdate = true; _shadowDirty = false; }
   if (walkActive) {
     const speed = (walkKeys['ShiftLeft'] || walkKeys['ShiftRight']) ? 190 : 68;
