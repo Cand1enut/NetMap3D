@@ -11964,6 +11964,169 @@ function exportCSV() {
   }
 }
 
+//////////////////// Config and runbook export ////////////////////
+// Two different problems, and conflating them is why "export the config" is
+// usually useless:
+//
+//   * A switch with a CLI takes a config file. You paste it into the console or
+//     drop it on TFTP and the box comes up configured. Export the real syntax.
+//   * A cloud-managed device has no config file to import — a UniFi switch is
+//     adopted and driven from the controller, a Meraki switch from the
+//     dashboard. Pretending otherwise produces a file nobody can use. For those
+//     the honest deliverable is an ORDERED RUNBOOK: what to click, in what
+//     order, with the exact values.
+//
+// Both come out of the same model, so what you build in NetMap3D and what you
+// configure in real life cannot drift.
+
+// Devices whose settings live in a controller, not on the box.
+function isCloudManaged(dev) {
+  const def = DEVICE_TYPES[dev.type] || {};
+  const cat = def.cat || '';
+  return /UniFi|Omada/.test(cat);
+}
+
+// Ordered so a person can follow it: addressing before routing, VLANs before
+// the ports that use them, uplinks last so you do not cut yourself off.
+function runbookSteps(dev) {
+  const steps = [];
+  const cls = netClass(dev);
+  const name = iosHostname(dev);
+  if (isCloudManaged(dev)) {
+    steps.push(`Adopt **${name}** in the controller (Devices → pending → Adopt).`);
+    if (dev.ip && dev.ip !== 'dhcp')
+      steps.push(`Set its management address to \`${dev.ip}\`${dev.gateway ? ` with gateway \`${dev.gateway}\`` : ''} (Device → Settings → Network → Static).`);
+    const vlans = (dev.vlans || []).filter(v => +v.id !== DEFAULT_VLAN);
+    if (vlans.length)
+      steps.push(`Create these networks if they do not exist: ${vlans.map(v => `**${v.name}** (VLAN ${v.id})`).join(', ')}.`);
+    for (const [port, pc] of Object.entries(dev.portCfg || {})) {
+      if (!pc) continue;
+      if (portMode(dev, port) === 'trunk') {
+        const carried = carriedVlans(dev, port);
+        steps.push(`Port ${port}: set the profile to **All** (trunk)${carried !== 'ALL' ? `, tagging ${[...carried].join(', ')}` : ''}.`);
+      } else if (pc.vlan) {
+        steps.push(`Port ${port}: set the network to the VLAN ${pc.vlan} profile.`);
+      }
+      if (pc.protected) steps.push(`Port ${port}: enable client/port isolation.`);
+    }
+    return steps;
+  }
+  steps.push(`Console into **${name}** and enter \`enable\`, then \`configure terminal\`.`);
+  steps.push(`Paste the configuration below, then \`end\` and \`write memory\`.`);
+  if (cls === 'switch' || cls === 'router')
+    steps.push(`Verify with \`show ip interface brief\` — every configured interface should read up/up once its cable is in.`);
+  if (ospfEnabled && ospfEnabled(dev))
+    steps.push(`Verify OSPF with \`show ip ospf neighbor\`. Adjacencies take up to 40 seconds to reach FULL; that wait is normal.`);
+  return steps;
+}
+
+// `show running-config` prints a header before the configuration itself. Those
+// lines are output, not commands, and pasting them at a console throws errors —
+// so the exported file starts at the first real command.
+function pasteableConfig(dev) {
+  return iosRunningConfig(dev)
+    .split('\n')
+    .filter(l => !/^(Building configuration|Current configuration|\s*$)/.test(l) || l.trim() === '!')
+    .join('\n')
+    .replace(/^(!\n)+/, '')
+    .trim();
+}
+
+// A server or workstation is configured in its own OS, not at a switch console.
+function hostRunbookSteps(dev) {
+  const steps = [];
+  const os = hostOs(dev);
+  const nics = hostNics(dev);
+  const label = { windows: 'Windows', macos: 'macOS', linux: 'Linux' }[os] || 'the OS';
+  for (const n of nics) {
+    if (n.ip === 'dhcp') {
+      steps.push(`NIC ${n.port} (${n.label}): leave on DHCP — it should lease from the ${n.gateway || 'gateway'} scope.`);
+    } else if (n.ip) {
+      steps.push(`NIC ${n.port} (${n.label}): set \`${n.ip}\`${n.gateway ? `, gateway \`${n.gateway}\`` : ''} in ${label}.`);
+    }
+  }
+  if (!steps.length) steps.push(`No addressing configured on this device in the map.`);
+  return steps;
+}
+
+function exportRunbook() {
+  const devices = state.devices.filter(d => isPlaced(d) &&
+    ['switch', 'router', 'host'].includes(netClass(d)));
+  if (!devices.length) { setStatus('Nothing to export — the map has no configurable devices.'); return; }
+  const when = new Date().toISOString().slice(0, 10);
+  const L = [];
+  L.push(`# ${currentProject || 'NetMap3D'} — build runbook`, '',
+    `Generated ${when} from the NetMap3D model. ${devices.length} devices.`, '',
+    `Work top to bottom. Addressing and VLANs come before the ports that use`,
+    `them, and uplinks are configured last so you do not cut off your own path.`, '');
+
+  const cli = devices.filter(d => !isCloudManaged(d) && netClass(d) !== 'host');
+  const cloud = devices.filter(d => isCloudManaged(d));
+
+  L.push('## Order of work', '');
+  let n = 1;
+  const hostsFirst = devices.filter(d => netClass(d) === 'host' && !isCloudManaged(d));
+  for (const d of [...cli, ...cloud, ...hostsFirst])
+    L.push(`${n++}. ${iosHostname(d)} — ${(DEVICE_TYPES[d.type] || {}).label || d.type}`);
+  L.push('');
+
+  if (cli.length) {
+    L.push('## Devices with a CLI', '',
+      'These take a configuration file. Paste it at the console, or serve it over',
+      'TFTP and `copy tftp: running-config`.', '');
+    for (const d of cli) {
+      L.push(`### ${iosHostname(d)}`, '');
+      for (const st of runbookSteps(d)) L.push(`- ${st}`);
+      L.push('', '```', pasteableConfig(d), '```', '');
+    }
+  }
+  if (cloud.length) {
+    L.push('## Cloud-managed devices', '',
+      'These have no importable configuration file — they are adopted and driven',
+      'from their controller. Follow the steps.', '');
+    for (const d of cloud) {
+      L.push(`### ${iosHostname(d)}`, '');
+      for (const st of runbookSteps(d)) L.push(`- ${st}`);
+      L.push('');
+    }
+  }
+
+  const hosts = devices.filter(d => netClass(d) === 'host' && !isCloudManaged(d));
+  if (hosts.length) {
+    L.push('## Servers and workstations', '',
+      'Configured in the operating system, not at a switch console.', '');
+    for (const d of hosts) {
+      L.push(`### ${iosHostname(d)}`, '');
+      for (const st of hostRunbookSteps(d)) L.push(`- ${st}`);
+      L.push('');
+    }
+  }
+
+  const cables = state.cables.filter(c => !c.power);
+  if (cables.length) {
+    L.push('## Patching', '',
+      '| From | Port | To | Port |', '| --- | --- | --- | --- |');
+    for (const c of cables) {
+      const A = state.devices.find(x => x.id === c.a.deviceId);
+      const B = state.devices.find(x => x.id === c.b.deviceId);
+      if (!A || !B) continue;
+      L.push(`| ${iosHostname(A)} | ${c.a.port} | ${iosHostname(B)} | ${c.b.port} |`);
+    }
+    L.push('');
+  }
+
+  const md = L.join('\n');
+  const fname = `${(currentProject || 'netmap3d').replace(/\s+/g, '-').toLowerCase()}-runbook.md`;
+  if (window.netmap3d && window.netmap3d.saveFile) {
+    window.netmap3d.saveFile({ defaultName: fname, data: md,
+      filters: [{ name: 'Markdown', extensions: ['md'] }] })
+      .then(r => { if (r.ok) setStatus('Exported ' + r.filePath); });
+  } else {
+    downloadBlob(md, fname, 'text/markdown');
+    setStatus(`Exported ${fname} — ${cli.length} config files, ${cloud.length} controller runbooks.`);
+  }
+}
+
 function downloadBlob(data, name, type) {
   const a = document.createElement('a');
   a.href = URL.createObjectURL(new Blob([data], { type }));
@@ -11973,6 +12136,7 @@ function downloadBlob(data, name, type) {
 }
 
 document.getElementById('btn-save').onclick = () => { currentProject ? saveProject() : saveMap(); };
+{ const b = document.getElementById('btn-runbook'); if (b) b.onclick = exportRunbook; }
 document.getElementById('btn-load').onclick = () => openLauncher();
 document.getElementById('btn-export').onclick = exportCSV;
 
