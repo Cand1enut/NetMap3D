@@ -35,6 +35,7 @@
     <button id="btn-sim" title="Animate traffic flowing through every cable (G)">Sim</button>
     <button id="btn-phys" title="Cable physics: cables hang and drape like real cables (P)">Physics</button>
     <button id="btn-plan" title="2D logical network diagram — plan first, then build in 3D">Plan</button>
+    <button id="btn-lab" title="Back the devices on this map with real switch software (FRRouting + Open vSwitch)">Real</button>
     <span class="sep"></span>
     <button id="btn-save" title="Save project">Save</button>
     <div class="menu-wrap">
@@ -159,7 +160,19 @@
     <div id="ai-out"><p>Analyze finds real problems (cable length limits, VLAN blocks, coverage gaps). Auto-design builds a working starter network from your walls — fully placed and cabled.</p></div>
   </div>
 
-  <div id="term" class="hidden">
+  <div id="lab" class="hidden">
+  <div class="lab-head">
+    <span class="lab-title">Real devices</span>
+    <button id="lab-close" title="Close">×</button>
+  </div>
+  <div id="lab-body"></div>
+  <div class="lab-foot">
+    <input id="lab-filter" type="text" placeholder="name filter, e.g. ^(EDGE-|CORE-)" spellcheck="false">
+    <button id="lab-run" class="cta">Start real devices</button>
+    <button id="lab-stop">Stop</button>
+  </div>
+</div>
+<div id="term" class="hidden">
     <div id="term-bar"><span id="term-title">Console</span><button id="term-close">×</button></div>
     <div id="term-out"></div>
     <div id="term-inrow"><span id="term-prompt"></span><input id="term-in" spellcheck="false" autocomplete="off"></div>

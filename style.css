@@ -591,3 +591,59 @@ select:focus, input:focus { border-color: var(--accent); }
 .uf-camcard .cap { padding: 7px 9px; font-size: 12px; }
 .uf-camcard .cap .sub { color: #7d8794; font-size: 11px; }
 #uf-shell.dark #uf-page, #uf-page { }
+
+/* ---- Real devices panel ---- */
+/* Backed by actual FRRouting/OVS containers on the server, so this panel is
+   deliberately distinct from the simulator chrome — you should never be unsure
+   which one you are looking at. */
+#lab {
+  position: fixed; right: 16px; top: 96px; width: 340px; max-height: 70vh;
+  display: flex; flex-direction: column;
+  background: #10151c; border: 1px solid #2b3542; border-radius: 10px;
+  box-shadow: 0 18px 48px rgba(0,0,0,.55); z-index: 60; overflow: hidden;
+  font-size: 12px; color: #cfd6e0;
+}
+#lab.hidden { display: none; }
+.lab-head {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 9px 12px; background: #141b24; border-bottom: 1px solid #232c38;
+}
+.lab-title { font-weight: 600; letter-spacing: .02em; color: #e8edf4; }
+.lab-head button {
+  background: none; border: none; color: #8b97a6; font-size: 17px;
+  cursor: pointer; line-height: 1; padding: 0 2px;
+}
+.lab-head button:hover { color: #e8edf4; }
+#lab-body { padding: 10px 12px; overflow-y: auto; flex: 1; }
+#lab-body .lab-note { color: #8b97a6; line-height: 1.5; }
+#lab-body .lab-warn { color: #e3a008; }
+#lab-body .lab-err { color: #f0616d; }
+#lab-body .lab-ok { color: #3fb950; }
+.lab-dev {
+  display: flex; align-items: center; gap: 8px; padding: 5px 0;
+  border-bottom: 1px solid #1c2430;
+}
+.lab-dev:last-child { border-bottom: none; }
+.lab-dot { width: 7px; height: 7px; border-radius: 50%; background: #3fb950; flex: none; }
+.lab-dev .n { font-weight: 600; color: #e8edf4; }
+.lab-dev .r { color: #7d8899; margin-left: auto; text-transform: uppercase; font-size: 10px; letter-spacing: .05em; }
+.lab-dev button {
+  background: #1d2632; border: 1px solid #2e3a49; color: #cfd6e0;
+  border-radius: 5px; padding: 2px 8px; cursor: pointer; font-size: 11px;
+}
+.lab-dev button:hover { background: #26313f; border-color: #3d4a5c; }
+.lab-foot {
+  padding: 9px 12px; border-top: 1px solid #232c38; background: #0d1219;
+  display: flex; gap: 6px; flex-wrap: wrap;
+}
+.lab-foot input {
+  flex: 1 1 100%; background: #0a0e14; border: 1px solid #2b3542; color: #cfd6e0;
+  border-radius: 5px; padding: 5px 7px; font: inherit; font-family: ui-monospace, monospace;
+}
+.lab-foot button {
+  flex: 1; background: #1d2632; border: 1px solid #2e3a49; color: #cfd6e0;
+  border-radius: 6px; padding: 6px 10px; cursor: pointer; font: inherit;
+}
+.lab-foot button.cta { background: #2f81f7; border-color: #2f81f7; color: #fff; font-weight: 600; }
+.lab-foot button.cta:hover { background: #4d95ff; }
+.lab-foot button:disabled { opacity: .5; cursor: default; }

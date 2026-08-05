@@ -12945,6 +12945,167 @@ function drawPduTrace(target) {
   showPingPath(shown.map(t => t.devId));
 }
 
+
+//////////////////// Real network operating systems ////////////////////
+// When NetMap3D is served by its own server (see server/server.js) it can back
+// the devices on the map with REAL switch software — FRRouting and Open vSwitch
+// in containers, wired by real veth pairs. The map stops being a drawing of a
+// network and becomes the thing that configures one.
+//
+// Everything degrades quietly when that server is not there: opened from a file
+// or a plain static host, the API simply is not reachable and the app stays the
+// simulator it already was.
+
+const NOS = {
+  available: false,       // did /api/health answer, and is real-NOS mode on
+  devices: [],            // [{ idx, name, role }] currently realized
+  byDeviceId: new Map(),  // NetMap3D device id -> running instance index
+  busy: false,
+};
+
+async function nosApi(path, body) {
+  const res = await fetch(path, body === undefined ? {} : {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  const j = await res.json().catch(() => ({ ok: false, error: `HTTP ${res.status}` }));
+  if (!j.ok) throw new Error(j.error || `HTTP ${res.status}`);
+  return j;
+}
+
+async function nosProbe() {
+  try {
+    const h = await nosApi('/api/health');
+    NOS.available = !!h.nos && !!h.imageBuilt;
+    NOS.reason = !h.nos ? 'server is running without NETMAP3D_NOS=1'
+      : !h.imageBuilt ? `image ${h.image} is not built — run: npm run nos:build` : '';
+  } catch (e) {
+    NOS.available = false;
+    NOS.reason = 'not served by the NetMap3D server — real devices need it';
+  }
+  updateLabPanel();
+  return NOS.available;
+}
+
+// Which map device is this running instance? The server answers with names, and
+// names are what the user sees, so that is the key.
+function nosIndexFor(dev) {
+  if (!dev) return undefined;
+  return NOS.byDeviceId.get(dev.id);
+}
+
+async function nosRefresh() {
+  try {
+    const st = await nosApi('/api/nos/status');
+    NOS.running = st.devices || [];
+  } catch { NOS.running = []; }
+  updateLabPanel();
+}
+
+async function nosRealize(filter) {
+  if (NOS.busy) return;
+  NOS.busy = true; updateLabPanel();
+  try {
+    const r = await nosApi('/api/nos/realize', { state: JSON.parse(serialize()), filter: filter || '' });
+    NOS.devices = r.devices || [];
+    NOS.byDeviceId = new Map();
+    for (const d of NOS.devices) {
+      const dev = state.devices.find(x => (x.name || '') === d.name);
+      if (dev) NOS.byDeviceId.set(dev.id, d.idx);
+    }
+    setStatus(`Real devices up: ${NOS.devices.length} running ${r.links.length} links. ` +
+      `Open a console on one — it is the real CLI now.`);
+    NOS.log = r.log || [];
+  } catch (e) {
+    setStatus(`Could not start real devices: ${e.message}`);
+    NOS.error = e.message;
+  } finally {
+    NOS.busy = false; updateLabPanel(); nosRefresh();
+  }
+}
+
+async function nosDestroy() {
+  if (NOS.busy) return;
+  NOS.busy = true; updateLabPanel();
+  try {
+    await nosApi('/api/nos/destroy', {});
+    NOS.devices = []; NOS.byDeviceId = new Map();
+    setStatus('Real devices stopped.');
+  } catch (e) { setStatus(`Could not stop: ${e.message}`); }
+  finally { NOS.busy = false; updateLabPanel(); nosRefresh(); }
+}
+
+function updateLabPanel() {
+  const body = document.getElementById('lab-body');
+  if (!body) return;
+  const run = document.getElementById('lab-run'), stop = document.getElementById('lab-stop');
+  if (run) { run.disabled = NOS.busy || !NOS.available; run.textContent = NOS.busy ? 'Starting…' : 'Start real devices'; }
+  if (stop) stop.disabled = NOS.busy || !NOS.available;
+
+  if (!NOS.available) {
+    body.innerHTML = `<p class="lab-note">Real devices run actual switch software — FRRouting and
+      Open vSwitch — instead of the simulator, so protocols converge because real daemons
+      exchange real packets.</p>
+      <p class="lab-warn">Unavailable: ${esc(NOS.reason || 'no server')}</p>
+      <p class="lab-note">Serve the app from its own server to enable it:<br>
+      <code>NETMAP3D_NOS=1 npm run serve</code></p>`;
+    return;
+  }
+  if (!NOS.devices.length) {
+    body.innerHTML = `<p class="lab-note">Nothing running yet. Starting a device gives it a real
+      routing daemon and a real bridge; its console becomes the real CLI.</p>
+      <p class="lab-note">A whole data hall is a lot of containers — use the filter to take a
+      slice, e.g. <code>^(EDGE-|CORE-)</code>.</p>
+      ${NOS.error ? `<p class="lab-err">${esc(NOS.error)}</p>` : ''}`;
+    return;
+  }
+  const rows = NOS.devices.map(d => `
+    <div class="lab-dev">
+      <span class="lab-dot"></span>
+      <span class="n">${esc(d.name)}</span>
+      <span class="r">${esc(d.role || '')}</span>
+      <button data-nos-console="${d.idx}">Console</button>
+    </div>`).join('');
+  body.innerHTML = `<p class="lab-ok">${NOS.devices.length} real device${NOS.devices.length === 1 ? '' : 's'} running.</p>
+    ${rows}
+    ${(NOS.log || []).length ? `<p class="lab-note" style="margin-top:8px">${NOS.log.map(esc).join('<br>')}</p>` : ''}
+    <p class="lab-note" style="margin-top:8px">OSPF uses real timers — a first adjacency takes
+    roughly 40 seconds to reach Full, exactly as it does on hardware.</p>`;
+  body.querySelectorAll('[data-nos-console]').forEach(b => {
+    b.onclick = () => {
+      const idx = +b.getAttribute('data-nos-console');
+      const entry = NOS.devices.find(x => x.idx === idx);
+      const dev = entry && state.devices.find(x => (x.name || '') === entry.name);
+      if (dev) openConsole(dev);
+    };
+  });
+}
+
+function openLabPanel() {
+  const box = document.getElementById('lab');
+  if (!box) return;
+  box.classList.remove('hidden');
+  nosProbe().then(() => { if (NOS.available) nosRefresh(); });
+}
+
+(function initLab() {
+  const box = document.getElementById('lab');
+  if (!box) return;
+  const open = document.getElementById('btn-lab');
+  if (open) open.onclick = () => {
+    if (box.classList.contains('hidden')) openLabPanel(); else box.classList.add('hidden');
+  };
+  const close = document.getElementById('lab-close');
+  if (close) close.onclick = () => box.classList.add('hidden');
+  const run = document.getElementById('lab-run');
+  if (run) run.onclick = () => nosRealize((document.getElementById('lab-filter') || {}).value || '');
+  const stop = document.getElementById('lab-stop');
+  if (stop) stop.onclick = () => nosDestroy();
+  // Probe once at startup so the menu can say whether real devices are possible
+  // without the user having to open anything.
+  nosProbe();
+})();
+
 // ---- terminal wiring ----
 // A live console for a device. Lines go into iosExec, output comes back, and any
 // config command has already mutated the model by the time the prompt returns —
@@ -12959,9 +13120,16 @@ function openConsole(dev) {
   if (!box) return;
   _termSess = iosNewSession(dev);
   _termHist = []; _termHistAt = 0;
-  title.textContent = `${iosHostname(dev)} — ${iosVendor(dev) === 'cisco' ? 'Cisco IOS' : 'console'}`;
+  const realIdx = nosIndexFor(dev);
+  title.textContent = realIdx !== undefined
+    ? `${iosHostname(dev)} — REAL device (FRRouting)`
+    : `${iosHostname(dev)} — ${iosVendor(dev) === 'cisco' ? 'Cisco IOS' : 'console'}`;
   out.innerHTML = '';
-  termPrint(out, `${iosHostname(dev)} console — type "enable", then "configure terminal". "?" is not a full help system yet; abbreviations work (sh ru, int gi0/1).`, 'sys');
+  termPrint(out, realIdx !== undefined
+    ? `${iosHostname(dev)} — this is a REAL FRRouting instance, not the simulator.\n` +
+      `vtysh syntax: show ip ospf neighbor, show ip route, show interface brief,\n` +
+      `configure terminal. Everything you type runs on the actual daemon.`
+    : `${iosHostname(dev)} console — type "enable", then "configure terminal". "?" is not a full help system yet; abbreviations work (sh ru, int gi0/1).`, 'sys');
   syncTermPrompt();
   box.classList.remove('hidden');
   setTimeout(() => inp.focus(), 30);
@@ -13014,6 +13182,24 @@ function termPrint(out, text, cls) {
       const isOs = _termSess.osShell;
       termPrint(out, (isOs ? osPromptStr(_termSess) : iosPrompt(_termSess) + ' ') + line, 'cmd');
       if (line.trim()) { _termHist.push(line); _termHistAt = _termHist.length; }
+      // If a real FRR instance is backing this device, the console IS that
+      // device's console. `show ip ospf neighbor` then prints what the real
+      // adjacency state machine believes, not a reimplementation of it.
+      const realIdx = !isOs ? nosIndexFor(_termSess.dev) : undefined;
+      if (realIdx !== undefined) {
+        if (/^\s*(exit|quit|logout)\s*$/i.test(line)) {
+          box.classList.add('hidden'); _termSess = null; return;
+        }
+        if (/^\s*clear\s*$/i.test(line)) { out.innerHTML = ''; syncTermPrompt(); return; }
+        const pending = document.createElement('div');
+        pending.className = 'sys'; pending.textContent = '…';
+        out.appendChild(pending); out.scrollTop = out.scrollHeight;
+        nosApi('/api/nos/vtysh', { idx: realIdx, command: line })
+          .then(r => { pending.remove(); if (r.out) termPrint(out, r.out.replace(/\s+$/, ''), ''); })
+          .catch(err => { pending.remove(); termPrint(out, `% ${err.message}`, 'err'); })
+          .finally(() => syncTermPrompt());
+        return;
+      }
       const res = isOs ? osExec(_termSess, line) : iosExec(_termSess, line);
       if (res.close) { box.classList.add('hidden'); _termSess = null; return; }
       if (res.clear) { out.innerHTML = ''; syncTermPrompt(); return; }
