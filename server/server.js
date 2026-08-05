@@ -14,6 +14,7 @@ const http = require('http');
 const fs = require('fs');
 const path = require('path');
 const nos = require('../nos/manager.js');
+const translate = require('../nos/translate.js');
 
 const ROOT = path.resolve(__dirname, '..');
 const PORT = +(process.env.PORT || 8080);
@@ -63,6 +64,19 @@ function readBody(req, limit = 32 << 20) {
   });
 }
 
+// One headless copy of the app's own engine, loaded on first use. It is the
+// SAME app.js the browser runs, in model-only mode — so the config the server
+// generates comes from the same model the user is looking at, not a second
+// implementation of it that could drift.
+let _engine = null;
+function engine() {
+  if (_engine) return _engine;
+  globalThis.NETMAP3D_HEADLESS = true;
+  const { loadEngine } = require('../fuzz.js');
+  _engine = loadEngine().__api;
+  return _engine;
+}
+
 const routes = {
   'GET /api/health': async () => ({
     ok: true, version: require('../package.json').version,
@@ -74,6 +88,36 @@ const routes = {
     const t = body && body.topology;
     if (!t || !Array.isArray(t.devices)) throw new Error('expected { topology: { devices: [], links: [] } }');
     return { ok: true, ...(await nos.buildLab(t)) };
+  },
+  // Turn the site the user drew into real running network operating systems.
+  // Body: { state, filter } where state is a saved NetMap3D map and filter is an
+  // optional name regex, because a full data hall is a lot of containers and you
+  // usually want a slice.
+  'POST /api/nos/realize': async (body) => {
+    const api = engine();
+    if (!body || !body.state) throw new Error('expected { state }');
+    api.restore(typeof body.state === 'string' ? body.state : JSON.stringify(body.state));
+    const re = body.filter ? new RegExp(body.filter) : null;
+    const plan = translate.realize(api, { filter: d => !re || re.test(d.name || '') });
+    if (!plan.topology.devices.length) throw new Error('nothing in this map matched — check the filter');
+    const built = await nos.buildLab(plan.topology);
+    const applied = [];
+    for (const c of plan.configs) {
+      await nos.applyOvs(c.idx, c.ovs);
+      await nos.applyConfig(c.idx, c.frr);
+      await nos.applyIsolation(c.idx, c.isolation);
+      applied.push({ idx: c.idx, name: c.name, role: c.role });
+    }
+    return { ok: true, devices: applied, links: built.links, log: built.log, ms: built.ms };
+  },
+  // What the config WOULD be, without starting anything. Useful on its own —
+  // this is the export-to-real-hardware path too.
+  'POST /api/nos/plan': async (body) => {
+    const api = engine();
+    if (!body || !body.state) throw new Error('expected { state }');
+    api.restore(typeof body.state === 'string' ? body.state : JSON.stringify(body.state));
+    const re = body.filter ? new RegExp(body.filter) : null;
+    return { ok: true, ...translate.realize(api, { filter: d => !re || re.test(d.name || '') }) };
   },
   'POST /api/nos/destroy': async () => ({ ok: true, ...(await nos.destroyLab()) }),
   'POST /api/nos/config': async (body) => {

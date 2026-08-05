@@ -1145,6 +1145,7 @@ function buildOpeningTrim(w, len, h) {
 }
 
 function buildWall(w) {
+  if (HEADLESS) return null;
   const dx = w.x2 - w.x1, dz = w.z2 - w.z1;
   const len = Math.hypot(dx, dz);
   const h = w.h || WALL_H;
@@ -1178,6 +1179,7 @@ function buildWall(w) {
 }
 
 function buildHole(h) {
+  if (HEADLESS) return null;
   const g = new THREE.Group();
   g.position.set(h.x, h.y, h.z);
   const n = new THREE.Vector3(h.nx || 0, h.ny || 0, h.nz || 0).normalize();
@@ -1224,6 +1226,7 @@ function disposeWallMesh(id) {
 }
 // Rebuild a wall in place after its openings or material change.
 function rebuildWall(id) {
+  if (HEADLESS) return null;
   const w = state.walls.find(x => x.id === id);
   if (!w) return;
   disposeWallMesh(id);
@@ -1513,6 +1516,7 @@ function addTroffers(slabMesh, wX, wZ) {
 }
 
 function buildSlab(s) {
+  if (HEADLESS) return null;
   const wX = Math.abs(s.x2 - s.x1), wZ = Math.abs(s.z2 - s.z1);
   // BoxGeometry material order is +x,-x,+y,-y,+z,-z — index 3 is the underside,
   // the face people actually stand under and look at
@@ -1538,6 +1542,7 @@ function buildSlab(s) {
   return m;
 }
 function buildRoom(x1, z1, x2, z2, y0) {
+  if (HEADLESS) return null;
   undoPush();
   // Wall height comes from the storey being built on, so a crawlspace gets 3 ft
   // of clearance and a basement gets 8'6" — not one hardcoded 9'6" everywhere.
@@ -1678,6 +1683,7 @@ function racewaySlot(rw, i, n) {
 }
 
 function buildRaceway(rw) {
+  if (HEADLESS) return null;
   const g = new THREE.Group();
   const [a, b] = racewayPath(rw);
   const mid = a.clone().add(b).multiplyScalar(0.5);
@@ -1732,6 +1738,7 @@ function buildRaceway(rw) {
 }
 
 function rebuildRaceway(rw) {
+  if (HEADLESS) return null;
   const g = racewayGroups.get(rw.id);
   if (g) {
     scene.remove(g);
@@ -1836,6 +1843,7 @@ function stairGeometry(totalRise) {
 }
 
 function buildStair(st) {
+  if (HEADLESS) return null;
   const g = new THREE.Group();
   g.position.set(st.x, st.y0, st.z);
   g.rotation.y = st.rotY || 0;
@@ -2037,6 +2045,7 @@ function excavatedAt(x, z) {
 }
 
 function buildMeasure(m) {
+  if (HEADLESS) return null;
   const g = new THREE.Group();
   const a = new THREE.Vector3(m.ax, m.ay, m.az), b = new THREE.Vector3(m.bx, m.by, m.bz);
   const dotGeo = new THREE.SphereGeometry(0.9, 10, 10);
@@ -2100,6 +2109,7 @@ function getRailTexture() {
 }
 
 function buildRackGroup(rack) {
+  if (HEADLESS) return null;
   const g = new THREE.Group();
   g.position.set(rack.x, rack.y0 || 0, rack.z);
   g.rotation.y = rack.rotY || 0;
@@ -2384,6 +2394,13 @@ function updateDeviceFaceplate(devId) {
   }
 }
 
+// Model-only mode. The simulation, the config engine and the CLI are all pure
+// model code — they never need a mesh, a collider or a shadow. Set by whatever
+// loads app.js outside a browser (the fuzzer, the config translator, the
+// server), it makes every geometry builder a no-op so a site can be built and
+// reasoned about in milliseconds instead of seconds.
+const HEADLESS = !!(typeof globalThis !== 'undefined' && globalThis.NETMAP3D_HEADLESS);
+
 function isPlaced(dev) {
   const def = DEVICE_TYPES[dev.type];
   // A rack is a home for anything. Plenty of real gear mounts either way -- an
@@ -2397,6 +2414,7 @@ function isPlaced(dev) {
 }
 
 function buildDeviceGroup(dev) {
+  if (HEADLESS) return null;
   if (!isPlaced(dev)) return null; // logical-only device from the 2D plan
   const def = DEVICE_TYPES[dev.type];
   const g = new THREE.Group();
@@ -2917,7 +2935,8 @@ function buildDeviceGroup(dev) {
 // Refresh the shadow map once, on the next frame. Everything that changes the
 // scene calls this; the render loop clears the flag after one pass.
 let _shadowDirty = true;
-function markShadowsDirty() { _shadowDirty = true; }
+function markShadowsDirty() {
+  if (HEADLESS) return; _shadowDirty = true; }
 const LOD_DETAIL_IN = 260;          // ~22 ft: past this the texture is enough
 const _lodTmp = new THREE.Vector3();
 function lodPackDevice(g) {
@@ -2934,6 +2953,7 @@ function lodPackDevice(g) {
 }
 let _lodLast = 0;
 function updateDeviceLOD(force) {
+  if (HEADLESS) return;
   const now = performance.now();
   if (!force && now - _lodLast < 120) return;      // 8 Hz is plenty for distance
   _lodLast = now;
@@ -2992,7 +3012,8 @@ const CABLE_RADIAL = 12;          // round cross-section, no visible facets
 const CONN_LEN = 1.05;            // molded RJ45 plug + strain-relief boot
 const _cv = new THREE.Vector3();
 
-function ensureColliders() { if (collidersDirty) rebuildRopeColliders(); }
+function ensureColliders() {
+  if (HEADLESS) return; if (collidersDirty) rebuildRopeColliders(); }
 
 function cablePorts(cable) {
   const a = getPortWorld(cable.a.deviceId, cable.a.port, epSide(cable.a));
@@ -3573,6 +3594,7 @@ function cableStpBlocked(cable) {
 }
 
 function buildCableMesh(cable) {
+  if (HEADLESS) return null;
   const curve = cableCurve(cable);
   if (!curve) return;
   // segment density from run length — a CurvePath has no fixed point list, and
@@ -3620,6 +3642,7 @@ function disposeCableObj(m) {
 }
 
 function rebuildCable(cable) {
+  if (HEADLESS) return null;
   const old = cableMeshes.get(cable.id);
   if (old) { disposeCableObj(old); cableMeshes.delete(cable.id); }
   buildCableMesh(cable);
@@ -6862,6 +6885,7 @@ function portBaseMat(pm) {
   return mat(0x07090d, { roughness: 0.3 });
 }
 function refreshPortTints() {
+  if (HEADLESS) return;
   for (const pm of portMeshes) {
     if (pm === hoverPort && PORT_GLOW) { pm.material = PORT_GLOW; continue; }
     if (vlanFocus && vlanFocus.ports.has(pm.userData.deviceId + ':' + pm.userData.port)) {
@@ -6932,6 +6956,7 @@ function nearestOnCurve(curve, p, samples = 140) {
 }
 
 function buildTie(tie) {
+  if (HEADLESS) return null;
   const g = new THREE.Group();
   g.position.set(tie.x, tie.y, tie.z);
   const tangent = new THREE.Vector3(tie.tx || 1, tie.ty || 0, tie.tz || 0).normalize();
@@ -7048,6 +7073,7 @@ function deleteDevice(id) {
 // device mounted in it so vertical managers re-fit the new height, and re-dress
 // the cables that touch it. The devices keep their U — only the frame changed.
 function rebuildRack(id) {
+  if (HEADLESS) return null;
   const g = rackGroups.get(id);
   if (g) { scene.remove(g); rackGroups.delete(id);
     removeFromArr(rackPlanes, p => p.userData.rackId === id);
@@ -12066,6 +12092,7 @@ function roundRectPath(x, y, w, h, r) {
 }
 
 function drawPlan() {
+  if (HEADLESS) return;
   const w = planCanvas.width, h = planCanvas.height;
   pctx.clearRect(0, 0, w, h);
   const step = 40 * planCam.s;

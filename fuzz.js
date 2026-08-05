@@ -181,6 +181,9 @@ function loadEngine() {
     fetch: () => Promise.reject(new Error('no network in fuzz')),
     alert: noop, confirm: () => false, prompt: () => null, Image: class {},
   };
+  // model-only: app.js skips every geometry builder
+  sandbox.NETMAP3D_HEADLESS = true;
+  sandbox.window.NETMAP3D_HEADLESS = true;
   sandbox.window.THREE = THREE;
   sandbox.globalThis = sandbox;
   // app.js reads browser globals bare (innerWidth, innerHeight, …) — mirror the
@@ -193,8 +196,11 @@ function loadEngine() {
   const names = new Set();
   for (const m of src.matchAll(/^(?:function|const|let|var|class)\s+([A-Za-z_$][\w$]*)/gm))
     names.add(m[1]);
+  // Getters, not values. `state` is a `let` that clearScene() REASSIGNS, so a
+  // snapshot taken at load time goes stale the moment a new site is built —
+  // which looked exactly like "referenceSite() produced nothing".
   const tail = '\n;globalThis.__api = {' +
-    [...names].map(n => `${n}: (typeof ${n} !== 'undefined' ? ${n} : undefined)`).join(',') + '};\n';
+    [...names].map(n => `get ${n}() { return typeof ${n} !== 'undefined' ? ${n} : undefined; }`).join(',') + '};\n';
   vm.createContext(sandbox);
   try { vm.runInContext(src + tail, sandbox, { filename: 'app.js' }); }
   catch (e) { console.error('engine failed to load:', e.message); console.error(e.stack.split('\n').slice(0,8).join('\n')); throw e; }

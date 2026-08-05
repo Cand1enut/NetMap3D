@@ -11,8 +11,12 @@ ENV DEBIAN_FRONTEND=noninteractive
 # frr-pythontools — frr-reload, so config can be applied without a restart
 # iproute2   — ip link/addr/route, netns, veth: the actual dataplane plumbing
 # the rest   — what you reach for on a switch you have just SSH'd into
+# openvswitch — FRR routes, it does not switch. VLANs, trunks, access ports and
+# RSTP are the switch half of a real box, and OVS is the production
+# implementation of exactly that.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         frr frr-pythontools \
+        openvswitch-switch openvswitch-common \
         iproute2 iputils-ping traceroute tcpdump iperf3 \
         bridge-utils ethtool net-tools mtr-tiny dnsutils \
         ca-certificates \

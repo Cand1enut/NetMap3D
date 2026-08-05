@@ -156,6 +156,27 @@ async function applyConfig(idx, confText) {
     `vtysh -f /etc/frr/frr.conf`]);
 }
 
+// The switch half: create the bridge, add ports, set VLAN tags and trunks. Run
+// before the FRR config, because an SVI is an OVS internal interface and FRR
+// cannot bind an address to something that does not exist yet.
+async function applyOvs(idx, cmds) {
+  if (!cmds || !cmds.length) return { stdout: '' };
+  return docker(['exec', cname(idx), 'sh', '-c', cmds.join('\n')]);
+}
+
+// Port isolation, as the OpenFlow rules it really is. OVS has no "protected
+// port" knob: the switch enforces it by refusing to forward between the pair.
+async function applyIsolation(idx, pairs) {
+  if (!pairs || !pairs.length) return { stdout: '' };
+  const script = [];
+  for (const p of pairs) {
+    script.push(`IN=$(ovs-vsctl get Interface ${p.inIface} ofport 2>/dev/null || echo 0)`,
+      `OUT=$(ovs-vsctl get Interface ${p.outIface} ofport 2>/dev/null || echo 0)`,
+      `[ "$IN" != 0 ] && [ "$OUT" != 0 ] && ovs-ofctl add-flow br0 "priority=200,in_port=$IN,actions=output:$OUT,drop" >/dev/null 2>&1; true`);
+  }
+  return docker(['exec', cname(idx), 'sh', '-c', script.join('\n')]);
+}
+
 // Run a command in the device's own CLI. This is the real vtysh, so `show ip
 // ospf neighbor` prints what the real adjacency state machine believes.
 async function vtysh(idx, command) {
@@ -178,4 +199,4 @@ async function status() {
   });
 }
 
-module.exports = { buildLab, destroyLab, applyConfig, vtysh, sh, status, imagePresent, ifName, cname, IMAGE };
+module.exports = { buildLab, destroyLab, applyConfig, applyOvs, applyIsolation, vtysh, sh, status, imagePresent, ifName, cname, IMAGE };
