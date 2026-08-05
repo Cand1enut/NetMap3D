@@ -49,6 +49,22 @@ function shq(s) { return `'${String(s).replace(/'/g, `'\\''`)}'`; }
 
 async function docker(args, opts) { return run('docker', args, opts); }
 
+// Run `task` over `items` with at most `limit` in flight. Rejects with the FIRST
+// failure rather than a Promise.all aggregate, so the error names the device
+// that actually broke.
+async function pooled(items, limit, task) {
+  const queue = [...items];
+  const out = [];
+  const workers = Array.from({ length: Math.min(limit, queue.length) }, async () => {
+    while (queue.length) {
+      const item = queue.shift();
+      out.push(await task(item));
+    }
+  });
+  await Promise.all(workers);
+  return out;
+}
+
 //////////////////// naming ////////////////////
 // Container and interface names have hard limits — a Linux interface name is 15
 // characters — so devices get a short stable index rather than their UUID.
@@ -88,11 +104,15 @@ async function buildLab(topology, opts = {}) {
   // 1. start every device with NO network — we supply every interface ourselves,
   //    so there is no stray docker0 path that could carry traffic the map does
   //    not have a cable for.
-  for (const d of byId.values()) {
-    await docker(['run', '-d', '--name', d.container, '--hostname', (d.name || d.container).slice(0, 63),
+  //
+  //    In parallel, because `docker run` is ~600 ms of mostly waiting and a data
+  //    hall is hundreds of devices: serially that is minutes before anything is
+  //    on screen. Capped, because an unbounded fan-out just moves the queue into
+  //    the daemon and makes failures harder to attribute.
+  await pooled([...byId.values()], opts.concurrency || 16, (d) =>
+    docker(['run', '-d', '--name', d.container, '--hostname', (d.name || d.container).slice(0, 63),
       '--network', 'none', '--privileged', '--cap-add', 'NET_ADMIN', '--cap-add', 'SYS_ADMIN',
-      '--sysctl', 'net.ipv4.ip_forward=1', IMAGE]);
-  }
+      '--sysctl', 'net.ipv4.ip_forward=1', IMAGE]));
   log.push(`started ${byId.size} containers in ${Date.now() - t0} ms`);
 
   // 2. expose each container's netns to iproute2 on the host
@@ -199,4 +219,4 @@ async function status() {
   });
 }
 
-module.exports = { buildLab, destroyLab, applyConfig, applyOvs, applyIsolation, vtysh, sh, status, imagePresent, ifName, cname, IMAGE };
+module.exports = { pooled, buildLab, destroyLab, applyConfig, applyOvs, applyIsolation, vtysh, sh, status, imagePresent, ifName, cname, IMAGE };

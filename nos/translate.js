@@ -139,18 +139,21 @@ function frrConfig(api, dev, idx, topology) {
     const mv = api.mgmtVlan ? api.mgmtVlan(dev) : 1;
     L.push(`interface ${BR}.${mv}`, ` ip address ${mgmt.addr}/${mgmt.cidr}`, 'exit', '!');
   }
-  if (mgmt && cls === 'host') {
-    // a host's address sits on its own NIC
-    const nics = api.hostNics ? api.hostNics(dev) : [];
-    for (const n of nics) {
+  if (cls === 'host') {
+    // A host's addresses live on its NICs. Gating this on dev.ip meant a
+    // multi-homed server -- which is every server in a real hall, and which
+    // leaves dev.ip unset -- came up with its links up and no address on any of
+    // them. Same mistake the reachability engine made before it learned about
+    // hostNics().
+    for (const n of (api.hostNics ? api.hostNics(dev) : [])) {
       const ip = splitIp(n.ip);
-      if (!ip) continue;
+      if (!ip) continue;                          // 'dhcp' is not ours to assign
       L.push(`interface ${ifName(n.port)}`, ` ip address ${ip.addr}/${ip.cidr}`, 'exit', '!');
     }
   }
 
   // static routes, including the default a host or switch points at its gateway
-  const gw = dev.gateway || (api.hostGateway && cls === 'host' ? api.hostGateway(dev) : null);
+  const gw = (cls === 'host' && api.hostGateway ? api.hostGateway(dev) : null) || dev.gateway;
   if (gw && splitIp(gw)) L.push(`ip route 0.0.0.0/0 ${splitIp(gw).addr}`);
   for (const r of dev.routes || []) {
     if (!r.prefix || !r.via) continue;

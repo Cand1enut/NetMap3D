@@ -101,13 +101,16 @@ const routes = {
     const plan = translate.realize(api, { filter: d => !re || re.test(d.name || '') });
     if (!plan.topology.devices.length) throw new Error('nothing in this map matched — check the filter');
     const built = await nos.buildLab(plan.topology);
+    // Configure in parallel too. Each device is independent — the protocols sort
+    // out the relationships between them afterwards, which is the whole point.
     const applied = [];
-    for (const c of plan.configs) {
+    await nos.pooled(plan.configs, 12, async (c) => {
       await nos.applyOvs(c.idx, c.ovs);
       await nos.applyConfig(c.idx, c.frr);
       await nos.applyIsolation(c.idx, c.isolation);
       applied.push({ idx: c.idx, name: c.name, role: c.role });
-    }
+    });
+    applied.sort((a, b) => a.idx - b.idx);
     return { ok: true, devices: applied, links: built.links, log: built.log, ms: built.ms };
   },
   // What the config WOULD be, without starting anything. Useful on its own —
